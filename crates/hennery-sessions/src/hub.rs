@@ -423,6 +423,14 @@ impl Hub {
     }
 
     /// The host is connected, reconciled and not kicked.
+    pub(crate) fn ready_connection(&self, host_id: &str) -> Option<u64> {
+        self.hosts
+            .lock()
+            .expect("hosts lock")
+            .get(host_id)
+            .filter(|h| h.ready)
+            .map(|h| h.conn_id)
+    }
     pub fn is_ready(&self, host_id: &str) -> bool {
         self.hosts
             .lock()

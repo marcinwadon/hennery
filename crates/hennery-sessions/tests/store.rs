@@ -2978,7 +2978,14 @@ fn has_file(db: &Path, sha256: &str) -> bool {
 /// a foreign key to `sessions`), plus the image tables, each with how many
 /// rows of it they hold: the session's own row, its events, turns and
 /// images by the ids and hashes it had.
-fn rows_of(conn: &Connection, id: &str, events: &[i64], turns: &[String], hashes: &[String]) -> Vec<(String, i64)> {
+fn rows_of(
+    conn: &Connection,
+    id: &str,
+    events: &[i64],
+    turns: &[String],
+    hashes: &[String],
+    uploads: &[String],
+) -> Vec<(String, i64)> {
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .unwrap()
@@ -3015,6 +3022,8 @@ fn rows_of(conn: &Connection, id: &str, events: &[i64], turns: &[String], hashes
             "delegation_budgets" => format!("root_id = '{id}'"),
             "delegation_attention" => format!("child_id = '{id}'"),
             "delegation_notices" => format!("child_id = '{id}' OR parent_id = '{id}' OR root_id = '{id}'"),
+            "external_operations" => format!("session_id = '{id}' OR source_session_id = '{id}'"),
+            "external_upload_chunks" | "external_operation_uploads" => format!("upload_id IN ({})", quoted(uploads)),
             "runtime_catalog" => format!("source_session_id = '{id}' OR defaults_source_session_id = '{id}'"),
             "event_attachments" => format!("event_id IN ({})", list(events.iter().map(i64::to_string).collect())),
             "turn_attachments" => format!("turn_id IN ({})", quoted(turns)),
@@ -3144,6 +3153,14 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
          INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,state,args,created_at)
              SELECT owner_id,'external-op-'||id,'delete-external',1,'key-'||id,'digest','session_prompt',id,'completed','{}',0
              FROM sessions WHERE id IN ('s1','s2');
+         INSERT INTO external_uploads(owner_id,id,client_id,session_id,mime,sha256,size,received,sealed,expires_at)
+             SELECT owner_id,'upload-'||id,'delete-external',id,'image/png',printf('%064d',1),8,8,1,9999999999 FROM sessions WHERE id IN ('s1','s2');
+         INSERT INTO external_upload_chunks(owner_id,upload_id,offset,digest,data)
+             SELECT owner_id,id,0,'fixture-digest',X'89504e470d0a1a0a' FROM external_uploads;
+         INSERT INTO external_operation_uploads(owner_id,operation_id,upload_id)
+             SELECT owner_id,'external-op-'||session_id,id FROM external_uploads;
+         INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,source_session_id,state,args,created_at)
+             SELECT owner_id,'external-clone','delete-external',1,'clone-key','digest','session_clone','family-child','s1','queued','{\"private\":\"source config\"}',0 FROM sessions WHERE id='s1';
          INSERT INTO delegation_start_budgets(owner_id,caller_id,epoch,starts)
              SELECT owner_id, 's1', 0, 1 FROM sessions WHERE id = 's1';
          INSERT INTO delegation_attention(owner_id,attention_id,child_id,hat_id,reason,incident)
@@ -3162,7 +3179,9 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     )
     .unwrap();
     store.close_now("s1").unwrap();
-    let before = rows_of(&conn, "s1", &events, &turns, &hashes);
+    let s1_uploads = ids("SELECT id FROM external_uploads WHERE session_id=?1", "s1");
+    let s2_uploads = ids("SELECT id FROM external_uploads WHERE session_id=?1", "s2");
+    let before = rows_of(&conn, "s1", &events, &turns, &hashes, &s1_uploads);
     let walked: Vec<&str> = before.iter().map(|(t, _)| t.as_str()).collect();
     for table in [
         "answer_queue",
@@ -3179,6 +3198,9 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         "session_attach_evidence",
         "external_client_sessions",
         "external_operations",
+        "external_uploads",
+        "external_upload_chunks",
+        "external_operation_uploads",
         "delegation_start_budgets",
         "delegation_budgets",
         "delegation_attention",
@@ -3207,13 +3229,13 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         (
             s2_events.clone(),
             s2_turns.clone(),
-            rows_of(&conn, "s2", &s2_events, &s2_turns, &[sha(&kept)]),
+            rows_of(&conn, "s2", &s2_events, &s2_turns, &[sha(&kept)], &s2_uploads),
         )
     };
 
     let event = delete(&store, "s1");
     assert_eq!((event.kind.as_str(), &event.body), ("session_deleted", &json!({})));
-    let after = rows_of(&conn, "s1", &events, &turns, &hashes);
+    let after = rows_of(&conn, "s1", &events, &turns, &hashes, &s1_uploads);
     for (table, n) in &after {
         let left = match table.as_str() {
             "sessions" | "events" => 1,
@@ -3234,7 +3256,10 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     );
     assert!(!has_file(&db, &sha(&a)) && !has_file(&db, &sha(&b)));
     let (s2_events, s2_turns, s2_rows) = s2_before;
-    assert_eq!(rows_of(&conn, "s2", &s2_events, &s2_turns, &[sha(&kept)]), s2_rows);
+    assert_eq!(
+        rows_of(&conn, "s2", &s2_events, &s2_turns, &[sha(&kept)], &s2_uploads),
+        s2_rows
+    );
     assert!(has_file(&db, &sha(&kept)));
     // A tombstone is no session: deleted again, it is not found.
     assert!(matches!(store.delete_session("s1", None).unwrap(), Deletion::NotFound));

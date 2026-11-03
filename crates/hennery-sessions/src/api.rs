@@ -1472,6 +1472,14 @@ async fn set_config(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<ConfigRequest>,
 ) -> Response {
+    set_config_authorized(state, id, req, None).await
+}
+pub(crate) async fn set_config_authorized(
+    state: AppState,
+    id: String,
+    req: ConfigRequest,
+    external: Option<crate::external_control::Command>,
+) -> Response {
     let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
@@ -1487,10 +1495,14 @@ async fn set_config(
         config_id: req.config_id,
         value: req.value,
     };
-    match state
-        .hub
-        .request(&session.host_id, &request_id, frame, CONFIG_TIMEOUT)
-        .await
+    match crate::external_control::guarded_request(
+        &state,
+        external.as_ref(),
+        "config",
+        &request_id,
+        state.hub.request(&session.host_id, &request_id, frame, CONFIG_TIMEOUT),
+    )
+    .await
     {
         Ok(_) => catalog_response(&state, &id, StatusCode::ACCEPTED),
         Err(err) => request_failed(err),

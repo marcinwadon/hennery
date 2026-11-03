@@ -56,6 +56,11 @@ pub struct ExternalIdentity {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMetadata {
+    pub agent_session_id: Option<String>,
+    pub sidebar_pinned: bool,
+    pub config: hennery_proto::frames::SessionConfig,
+    pub created_at: String,
+    pub last_event_at: String,
     pub session_id: String,
     pub host_id: String,
     pub hat_id: String,
@@ -65,6 +70,18 @@ pub struct SessionMetadata {
     pub lifecycle: String,
     pub activity: Option<String>,
     pub open_turn_id: Option<String>,
+}
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionFilters {
+    pub host_id: Option<String>,
+    pub agent: Option<String>,
+    pub cwd: Option<String>,
+    pub lifecycle: Option<String>,
+    pub activity: Option<String>,
+    pub query: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub sidebar_pinned: Option<bool>,
 }
 pub(crate) const TOKEN_PREFIX: &str = "hnry_external_";
 pub fn valid_token(token: &str) -> bool {
@@ -206,6 +223,30 @@ impl Store {
         id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<SessionMetadata>> {
+        self.external_sessions_filtered(identity, after, id, limit, &SessionFilters::default())
+    }
+    pub(crate) fn external_sessions_filtered(
+        &self,
+        identity: &ExternalIdentity,
+        after: &str,
+        id: Option<&str>,
+        limit: u32,
+        filters: &SessionFilters,
+    ) -> Result<Vec<SessionMetadata>> {
+        ensure!(
+            [
+                &filters.host_id,
+                &filters.agent,
+                &filters.cwd,
+                &filters.lifecycle,
+                &filters.activity,
+                &filters.query,
+                &filters.agent_session_id
+            ]
+            .iter()
+            .all(|s| s.as_ref().is_none_or(|s| s.len() <= 4096)),
+            "invalid_arguments"
+        );
         let conn = self.conn();
         ensure!(live(&conn, self.owner_id(), identity)?, "external_unauthenticated");
         ensure!(identity.client.read_metadata, "external_forbidden");
@@ -213,17 +254,35 @@ impl Store {
             (1..=50).contains(&limit) && after.len() <= 128 && id.is_none_or(|id| id.len() <= 128),
             "invalid_arguments"
         );
-        let mut stmt=conn.prepare("SELECT s.id,s.host_id,s.hat_id,s.agent,s.cwd,s.title,s.lifecycle,s.activity,s.open_turn_id
+        let mut stmt=conn.prepare("SELECT s.id,s.host_id,s.hat_id,s.agent,s.cwd,s.title,s.lifecycle,s.activity,s.open_turn_id,s.agent_session_id,s.sidebar_pinned,s.model,s.mode,s.config_axes,s.created_at,s.last_event_at
           FROM sessions s JOIN external_clients c ON c.owner_id = s.owner_id AND c.id = ?2 AND c.hat_id=s.hat_id
           WHERE s.owner_id = ?1 AND s.lifecycle<>'deleted' AND s.id>?3 AND (?4 IS NULL OR s.id=?4)
           AND (c.existing_sessions=1 OR EXISTS(SELECT 1 FROM external_client_sessions b WHERE b.owner_id = s.owner_id AND b.client_id=c.id AND b.session_id=s.id))
           AND EXISTS(SELECT 1 FROM external_client_roots r JOIN hosts h ON h.owner_id = r.owner_id AND h.id=r.host_id
             WHERE r.owner_id = s.owner_id AND r.client_id=c.id AND r.host_id=s.host_id AND h.revoked_at IS NULL
             AND (s.cwd=r.root OR (r.root='/' AND substr(s.cwd,1,1)='/') OR substr(s.cwd,1,length(r.root)+1)=r.root||'/'))
+          AND (?6 IS NULL OR s.host_id=?6) AND (?7 IS NULL OR s.agent=?7) AND (?8 IS NULL OR s.cwd=?8)
+          AND (?9 IS NULL OR s.lifecycle=?9) AND (?10 IS NULL OR s.activity=?10)
+          AND (?11 IS NULL OR instr(lower(COALESCE(s.title,'')||' '||s.id||' '||COALESCE(s.agent_session_id,'')||' '||s.cwd),lower(?11))>0)
+          AND (?12 IS NULL OR s.agent_session_id=?12) AND (?13 IS NULL OR s.sidebar_pinned=?13)
           ORDER BY s.id LIMIT ?5")?;
         Ok(stmt
             .query_map(
-                params![self.owner_id(), identity.client.client_id, after, id, limit],
+                params![
+                    self.owner_id(),
+                    identity.client.client_id,
+                    after,
+                    id,
+                    limit,
+                    filters.host_id,
+                    filters.agent,
+                    filters.cwd,
+                    filters.lifecycle,
+                    filters.activity,
+                    filters.query,
+                    filters.agent_session_id,
+                    filters.sidebar_pinned
+                ],
                 |r| {
                     Ok(SessionMetadata {
                         session_id: r.get(0)?,
@@ -235,6 +294,23 @@ impl Store {
                         lifecycle: r.get(6)?,
                         activity: r.get(7)?,
                         open_turn_id: r.get(8)?,
+                        agent_session_id: r.get(9)?,
+                        sidebar_pinned: r.get(10)?,
+                        config: hennery_proto::frames::SessionConfig {
+                            model: r.get(11)?,
+                            mode: r.get(12)?,
+                            axes: serde_json::from_str(&r.get::<_, Option<String>>(13)?.unwrap_or_else(|| "{}".into()))
+                                .map_err(|e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        13,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(e),
+                                    )
+                                })?,
+                            ..Default::default()
+                        },
+                        created_at: r.get(14)?,
+                        last_event_at: r.get(15)?,
                     })
                 },
             )?

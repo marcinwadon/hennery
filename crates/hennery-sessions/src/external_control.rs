@@ -11,7 +11,7 @@ use hennery_proto::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         Arc, Mutex,
@@ -54,7 +54,8 @@ pub(crate) struct Runtime {
     started: AtomicBool,
     flights: Mutex<HashSet<String>>,
     permits: Arc<Semaphore>,
-    reads: Arc<Semaphore>,
+    pub(crate) reads: Arc<Semaphore>,
+    pub(crate) answer_connections: Mutex<HashMap<String, u64>>,
 }
 impl Default for Runtime {
     fn default() -> Self {
@@ -63,6 +64,7 @@ impl Default for Runtime {
             flights: Mutex::default(),
             permits: Arc::new(Semaphore::new(4)),
             reads: Arc::new(Semaphore::new(4)),
+            answer_connections: Mutex::default(),
         }
     }
 }
@@ -135,10 +137,19 @@ struct Create {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CloneSession {
+    request_key: String,
+    source_session_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Prompt {
     request_key: String,
     session_id: String,
+    #[serde(default)]
     text: String,
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -202,6 +213,7 @@ pub(crate) fn is_control_tool(tool: &str) -> bool {
     matches!(
         tool,
         "session_create"
+            | "session_clone"
             | "session_prompt"
             | "session_cancel"
             | "session_park"
@@ -226,10 +238,17 @@ pub(crate) fn tools(identity: &ExternalIdentity) -> Vec<Value> {
                 false,
             ),
             (
+                "session_clone",
+                "Create a fresh standalone session from a scoped source session's reported configuration. Copies settings only; no transcript, native session identity or family relationship.",
+                json!({"request_key":id,"source_session_id":id}),
+                vec!["request_key", "source_session_id"],
+                false,
+            ),
+            (
                 "session_prompt",
                 "Send text to an authorized session. Busy sessions queue durably; parked sessions resume with current grant and source-policy checks. Acceptance is not completion.",
-                json!({"request_key":id,"session_id":id,"text":{"type":"string","minLength":1,"maxLength":32768}}),
-                vec!["request_key", "session_id", "text"],
+                json!({"request_key":id,"session_id":id,"text":{"type":"string","maxLength":32768},"attachments":{"type":"array","items":id,"maxItems":20}}),
+                vec!["request_key", "session_id"],
                 false,
             ),
             (
@@ -358,10 +377,19 @@ pub(crate) async fn invoke(state: &AppState, identity: &ExternalIdentity, tool: 
                     );
                     q.request_key
                 }
+                "session_clone" => {
+                    let q: CloneSession = decode(args.clone())?;
+                    ensure!(short(&q.source_session_id), "invalid_arguments");
+                    q.request_key
+                }
                 "session_prompt" => {
                     let q: Prompt = decode(args.clone())?;
                     ensure!(
-                        short(&q.session_id) && !q.text.trim().is_empty() && q.text.len() <= 32 * 1024,
+                        short(&q.session_id)
+                            && (!q.text.trim().is_empty() || !q.attachments.is_empty())
+                            && q.text.len() <= 32 * 1024
+                            && q.attachments.len() <= 20
+                            && q.attachments.iter().all(|v| short(v)),
                         "invalid_arguments"
                     );
                     q.request_key
@@ -537,6 +565,12 @@ pub fn after_startup(state: &AppState) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {biased;()=state.shutdown.cancelled()=>break,_=tick.tick()=>{}}
+            if let Err(error) = crate::external_tools::dispatch_answers(&state) {
+                tracing::warn!(code=%error_code(&error),"external answer dispatch deferred");
+            }
+            if let Err(error) = crate::external_attachments::cleanup(&state) {
+                tracing::warn!(code=%error_code(&error),"external upload cleanup deferred");
+            }
             if let Err(error) = state.store.external_settle_operations() {
                 tracing::warn!(code=%error_code(&error),"external operation settlement deferred");
             }
@@ -581,7 +615,7 @@ async fn resolved(state: &AppState, host: &str, path: &str) -> Result<()> {
 }
 async fn preflight(state: &AppState, command: &Command, args: &Value) -> Result<()> {
     let client = state.store.external_execution_client(command)?;
-    let (host, cwd, hat) = if command.tool == "session_create" {
+    let (host, cwd, hat) = if matches!(command.tool.as_str(), "session_create" | "session_clone") {
         (
             args["host_id"].as_str().unwrap_or_default().to_owned(),
             args["cwd"].as_str().unwrap_or_default().to_owned(),
@@ -599,7 +633,7 @@ async fn preflight(state: &AppState, command: &Command, args: &Value) -> Result<
         state.store.external_guard_in(
             &conn,
             command,
-            if command.tool == "session_create" {
+            if matches!(command.tool.as_str(), "session_create" | "session_clone") {
                 Some((&host, &cwd, &hat))
             } else {
                 None
@@ -608,7 +642,7 @@ async fn preflight(state: &AppState, command: &Command, args: &Value) -> Result<
     }
     if matches!(
         command.tool.as_str(),
-        "session_create" | "session_prompt" | "session_resume"
+        "session_create" | "session_clone" | "session_prompt" | "session_resume"
     ) {
         let root = crate::external_control_store::root_for(&client, &host, &cwd)
             .ok_or_else(|| anyhow::anyhow!("not_found"))?;
@@ -619,7 +653,7 @@ async fn preflight(state: &AppState, command: &Command, args: &Value) -> Result<
     }
     Ok(())
 }
-async fn response_value(response: Response) -> Result<(bool, Value)> {
+pub(crate) async fn response_value(response: Response) -> Result<(bool, Value)> {
     let success = response.status().is_success();
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
     let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"code":"operation_failed"}));
@@ -663,11 +697,28 @@ async fn execute(state: &AppState, command: &Command, args: Value) -> Result<()>
     if !state.store.external_begin(command)? {
         return Ok(());
     }
+    let args = state.store.external_arguments(command)?;
+    if crate::external_attachments::handles(&command.tool) {
+        let value = crate::external_attachments::execute(state, command, args).await?;
+        return state.store.external_finish(command, "completed", None, Some(&value));
+    }
+    if crate::external_tools::handles(&command.tool) {
+        match crate::external_tools::execute(state, command, args).await {
+            Ok(Some(result)) => return state.store.external_finish(command, "completed", None, Some(&result)),
+            Ok(None) => return Ok(()),
+            Err(error) if error.to_string() == "delivery_unknown" => {
+                return state
+                    .store
+                    .external_finish(command, "uncertain", Some("delivery_unknown"), None);
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let external = Some(command.clone());
     let state_ = state.clone();
     let id = command.session_id.clone();
     let response = match command.tool.as_str() {
-        "session_create" => {
+        "session_create" | "session_clone" => {
             let q: Create = decode(args)?;
             crate::api::start_in_hat(
                 state_,
@@ -684,11 +735,20 @@ async fn execute(state: &AppState, command: &Command, args: Value) -> Result<()>
         }
         "session_prompt" => {
             let q: Prompt = decode(args)?;
+            let mut content = Vec::new();
+            if !q.text.is_empty() {
+                content.push(json!({"type":"text","text":q.text}));
+            }
+            content.extend(crate::external_attachments::prompt_images(
+                state,
+                command,
+                &q.attachments,
+            )?);
             crate::api::prompt_authorized(
                 state_,
                 id,
                 PromptRequest {
-                    content: vec![json!({"type":"text","text":q.text})],
+                    content,
                     request_key: Some(format!("external:{}", command.operation_id)),
                 },
                 external,
@@ -1004,5 +1064,292 @@ mod tests {
         state.store.conn().execute_batch("PRAGMA query_only=ON").unwrap();
         state.store.external_recover_operations().unwrap();
         state.store.external_settle_operations().unwrap();
+    }
+    async fn ordinary_answer(state: &AppState, identity: &ExternalIdentity) -> Command {
+        use hennery_proto::frames::{Indexed, PendingExtract, PendingKind};
+        state.store.ingest("session",2,&SessionBody::PendingOpened{pending_id:"form".into(),indexed:Indexed{pending:Some(Box::new(PendingExtract{id:"form".into(),kind:PendingKind::Elicitation,option_ids:None,title:None})),..Default::default()},payload:json!({"message":"Name","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}})}).unwrap();
+        let args = json!({"request_key":"answer","session_id":"session","pending_id":"form","action":"accept","content":{"name":"test"}});
+        state
+            .store
+            .external_admit(identity, "session_answer", "answer", &args)
+            .unwrap();
+        let (command, _) = state.store.external_pending().unwrap().remove(0);
+        assert!(state.store.external_begin(&command).unwrap());
+        crate::external_tools::execute(state, &command, args).await.unwrap();
+        command
+    }
+    #[tokio::test]
+    async fn external_answer_recovery_retries_only_through_its_guarded_outbox_once_per_connection() {
+        let (_dir, state, identity) = world();
+        let command = ordinary_answer(&state, &identity).await;
+        state.store.external_recover_operations().unwrap();
+        assert_eq!(
+            state
+                .store
+                .external_operation(&identity, Some(&command.operation_id), None)
+                .unwrap()
+                .state,
+            "delivery_unknown"
+        );
+        assert!(state.store.answers_to_send("host").unwrap().is_empty());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registration = state
+            .hub
+            .register("host", tx, Default::default(), Default::default())
+            .unwrap();
+        state.hub.mark_ready("host", registration.conn_id);
+        crate::external_tools::dispatch_answers(&state).unwrap();
+        let first = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first["pending_id"], "form");
+        crate::external_tools::dispatch_answers(&state).unwrap();
+        assert!(rx.try_recv().is_err());
+        state.hub.unregister("host", registration.conn_id);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registration = state
+            .hub
+            .register("host", tx, Default::default(), Default::default())
+            .unwrap();
+        state.hub.mark_ready("host", registration.conn_id);
+        crate::external_tools::dispatch_answers(&state).unwrap();
+        let second = serde_json::to_value(rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first, second);
+        state.store.revoke_external_client(&identity.client.client_id).unwrap();
+        crate::external_tools::dispatch_answers(&state).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(state.store.open_pending("session").unwrap()[0].answered);
+    }
+    #[tokio::test]
+    async fn revocation_of_an_unsent_ordinary_answer_reopens_the_form_for_the_operator() {
+        let (_dir, state, identity) = world();
+        let command = ordinary_answer(&state, &identity).await;
+        assert!(state.store.open_pending("session").unwrap()[0].answered);
+        state.store.revoke_external_client(&identity.client.client_id).unwrap();
+        crate::external_tools::dispatch_answers(&state).unwrap();
+        assert!(!state.store.open_pending("session").unwrap()[0].answered);
+        let conn = state.store.conn();
+        let (status, args): (String, String) = conn
+            .query_row(
+                "SELECT state,args FROM external_operations WHERE owner_id=?1 AND id=?2",
+                rusqlite::params![state.store.owner_id(), command.operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(args, "{}");
+    }
+    #[tokio::test]
+    async fn revoked_catalog_authority_never_polls_the_probe_future() {
+        let (_dir, state, identity) = world();
+        state.store.revoke_external_client(&identity.client.client_id).unwrap();
+        let result = crate::external_tools::guarded_catalog(&state, Some(&identity), "host", "/project", async {
+            panic!("revoked probe must never be polled")
+        })
+        .await;
+        assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn image_staging_expiry_keeps_accepted_prompts_and_deletion_scrubs_clone_sources() {
+        let (_dir, state, identity) = world();
+        let args = json!({"request_key":"upload","session_id":"session","mime_type":"image/png","size":8,"sha256":"a".repeat(64)});
+        let receipt = state
+            .store
+            .external_admit(&identity, "attachment_upload_begin", "upload", &args)
+            .unwrap();
+        let (command, _) = state.store.external_pending().unwrap().remove(0);
+        state.store.external_begin(&command).unwrap();
+        crate::external_attachments::execute(&state, &command, args)
+            .await
+            .unwrap();
+        {
+            let conn = state.store.conn();
+            conn.execute(
+                "UPDATE external_uploads SET sealed=1,received=size,expires_at=0 WHERE owner_id=?1 AND id=?2",
+                rusqlite::params![state.store.owner_id(), receipt.operation_id],
+            )
+            .unwrap();
+        }
+        // Admission requires unexpired staging. Bind before moving the clock.
+        {
+            let conn = state.store.conn();
+            conn.execute(
+                "UPDATE external_uploads SET expires_at=?3 WHERE owner_id=?1 AND id=?2",
+                rusqlite::params![
+                    state.store.owner_id(),
+                    receipt.operation_id,
+                    hennery_kernel::secret::unix_now() + 60
+                ],
+            )
+            .unwrap();
+        }
+        let prompt = state
+            .store
+            .external_admit(
+                &identity,
+                "session_prompt",
+                "image-prompt",
+                &json!({"request_key":"image-prompt","session_id":"session","attachments":[receipt.operation_id]}),
+            )
+            .unwrap();
+        {
+            let conn = state.store.conn();
+            conn.execute(
+                "UPDATE external_uploads SET expires_at=0 WHERE owner_id=?1 AND id=?2",
+                rusqlite::params![state.store.owner_id(), receipt.operation_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET model='test' WHERE owner_id=?1 AND id='session'",
+                [state.store.owner_id()],
+            )
+            .unwrap();
+        }
+        crate::external_attachments::cleanup(&state).unwrap();
+        let count: i64 = state
+            .store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM external_uploads WHERE owner_id=?1",
+                [state.store.owner_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let clone = state
+            .store
+            .external_admit(
+                &identity,
+                "session_clone",
+                "clone",
+                &json!({"request_key":"clone","source_session_id":"session"}),
+            )
+            .unwrap();
+        state
+            .store
+            .ingest(
+                "session",
+                2,
+                &SessionBody::SessionParked {
+                    reason: hennery_proto::frames::ParkReason::Idle,
+                },
+            )
+            .unwrap();
+        state.store.close_now("session").unwrap();
+        assert!(matches!(
+            state.store.delete_session("session", None).unwrap(),
+            crate::store::Deletion::Done { .. }
+        ));
+        let conn = state.store.conn();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM external_uploads WHERE owner_id=?1",
+                [state.store.owner_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM external_operation_uploads WHERE owner_id=?1",
+                [state.store.owner_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        let (status, args, source): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT state,args,source_session_id FROM external_operations WHERE owner_id=?1 AND id=?2",
+                rusqlite::params![state.store.owner_id(), clone.operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(args, "{}");
+        assert!(source.is_none());
+        let session: String = conn
+            .query_row(
+                "SELECT session_id FROM external_operations WHERE owner_id=?1 AND id=?2",
+                rusqlite::params![state.store.owner_id(), prompt.operation_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(session.is_empty());
+    }
+    #[tokio::test]
+    async fn queued_auto_resume_recovery_preserves_handed_prompts_and_retires_unsent_attaches() {
+        for handed in [false, true] {
+            let (_dir, state, identity) = world();
+            let args = json!({"request_key":"resume-prompt","session_id":"session","text":"keep this after reconnect"});
+            let op = state
+                .store
+                .external_admit(&identity, "session_prompt", "resume-prompt", &args)
+                .unwrap();
+            let (command, _) = state.store.external_pending().unwrap().remove(0);
+            {
+                let conn = state.store.conn();
+                conn.execute(
+                    "UPDATE sessions SET lifecycle='starting' WHERE owner_id=?1 AND id='session'",
+                    [state.store.owner_id()],
+                )
+                .unwrap();
+                state.store.external_attach_in(&conn, &command).unwrap();
+                if handed {
+                    state
+                        .store
+                        .external_request_in(&conn, &command, "resume-request")
+                        .unwrap();
+                }
+            }
+            state.store.external_recover_operations().unwrap();
+            let receipt = state
+                .store
+                .external_operation(&identity, Some(&op.operation_id), None)
+                .unwrap();
+            if handed {
+                assert_eq!(receipt.state, "queued");
+                // The resume already crossed the final handoff. Neither queue
+                // editing nor withdrawal may claim to undo that phase.
+                for tool in ["operation_cancel", "session_queue_update"] {
+                    let mut change = json!({"request_key":tool,"session_id":"session","operation_id":op.operation_id});
+                    if tool == "session_queue_update" {
+                        change["text"] = json!("replacement");
+                    }
+                    let change_op = state.store.external_admit(&identity, tool, tool, &change).unwrap();
+                    let (change_command, _) = state
+                        .store
+                        .external_pending()
+                        .unwrap()
+                        .into_iter()
+                        .find(|(c, _)| c.operation_id == change_op.operation_id)
+                        .unwrap();
+                    state.store.external_begin(&change_command).unwrap();
+                    assert_eq!(
+                        crate::external_tools::execute(&state, &change_command, change)
+                            .await
+                            .unwrap_err()
+                            .to_string(),
+                        "not_queued"
+                    );
+                }
+                state
+                    .store
+                    .ingest("session", 2, &SessionBody::session_started("resume-request", "agent"))
+                    .unwrap();
+                let (_, recovered) = state
+                    .store
+                    .external_pending()
+                    .unwrap()
+                    .into_iter()
+                    .find(|(c, _)| c.operation_id == op.operation_id)
+                    .unwrap();
+                assert_eq!(recovered, args);
+            } else {
+                assert_eq!(receipt.state, "failed");
+                assert_eq!(receipt.code.as_deref(), Some("not_delivered"));
+                assert_eq!(
+                    state.store.find_session("session").unwrap().unwrap().lifecycle,
+                    "failed"
+                );
+            }
+        }
     }
 }

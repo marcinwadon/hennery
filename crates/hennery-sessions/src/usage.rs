@@ -135,7 +135,7 @@ pub(crate) fn observe_context_in(
     Ok(())
 }
 
-fn totals_in(conn: &Connection, owner: &str, id: &str) -> Result<UsageTotals> {
+pub(crate) fn totals_in(conn: &Connection, owner: &str, id: &str) -> Result<UsageTotals> {
     let (raw, cost): (Option<String>, Option<String>) = conn.query_row(
         "SELECT usage_totals,usage_cost FROM sessions WHERE owner_id = ?1 AND id=?2",
         params![owner, id],

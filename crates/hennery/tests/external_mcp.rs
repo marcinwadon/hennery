@@ -171,7 +171,9 @@ async fn protocol_discovery_and_session_reads_keep_explicit_scope_and_no_mutatio
     assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
     let listed: Value = c.rpc(token, "tools/list", json!({})).await.json().await.unwrap();
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 7);
+    assert!(tools.iter().any(|t| t["name"] == "runtime_catalog"));
+    assert!(tools.iter().any(|t| t["name"] == "session_usage"));
     assert!(tools.iter().all(|t| t["annotations"]["readOnlyHint"] == true));
     assert!(!listed.to_string().contains("session_prompt"));
     let rows: Value = c
@@ -516,7 +518,7 @@ async fn bridge_profile(offered: &str, negotiated: &str) {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0]["id"], 1);
     assert_eq!(rows[0]["result"]["protocolVersion"], negotiated);
-    assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 7);
     assert_eq!(rows[2]["id"], "unknown");
     assert_eq!(rows[2]["error"]["code"], -32602);
     assert!(rows[2].get("result").is_none());

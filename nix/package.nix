@@ -28,6 +28,7 @@ let
       ../crates/hennery-sessions/src/review_child_backfill.sql
       ../crates/hennery-sessions/src/external_clients.sql
       ../crates/hennery-sessions/src/external_oauth.sql
+      ../crates/hennery-sessions/src/external_tools.sql
       ../crates/hennery-sessions/src/external_control.sql
       ../crates/hennery-sessions/tests/fixtures/undo_family.sql
       ../crates/hennery-sessions/tests/fixtures/undo_usage.sql

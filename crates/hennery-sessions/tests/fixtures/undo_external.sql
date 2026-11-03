@@ -1,3 +1,8 @@
+DROP TRIGGER external_tools_revoke;
+DROP TRIGGER external_tools_deleted;
+DROP TABLE external_operation_uploads;
+DROP TABLE external_upload_chunks;
+DROP TABLE external_uploads;
 -- Test-only rollback of external sessions migrations before historical fixtures.
 DROP TRIGGER external_control_revoke;
 DROP TRIGGER external_control_deleted;

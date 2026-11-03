@@ -4,8 +4,8 @@ The primary integration is a public HTTPS Streamable HTTP endpoint used directly
 by Claude Desktop and other remote MCP clients. A desktop bridge is optional.
 It exposes discovery, session metadata and separately granted session control
 and transcript reads. Accepted operations survive client disconnects and can be
-recovered by request key. Ordinary answers and post-start configuration remain
-future additions.
+recovered by request key. Ordinary form answers, runtime configuration, image
+staging, queue management and session conveniences share those scoped operations.
 
 Public deployment support does not mean this change exposes an existing
 collector. No live service, Desktop account/configuration, DNS or firewall was
@@ -148,7 +148,7 @@ hat purge and host revocation cannot be bypassed by reconnecting or replaying.
 | `hennery_capabilities` | Scope/revision/expiry/limits, transcript and execution capabilities. |
 | `host_list` | Granted hosts, connectivity and currently connected runtime IDs. |
 | `workspace_list(host_id)` | Explicitly granted roots, no arbitrary browsing. |
-| `session_list(after?, limit?)` | Scoped metadata, at most 50 rows, ID continuation cursor. |
+| `session_list(after?, limit?, filters?)` | Scoped metadata, at most 50 rows, ID continuation cursor. |
 | `session_get(session_id)` | One authorized metadata record; missing and out-of-scope both report not_found. |
 
 Session metadata tools require metadata permission. Reads do not acknowledge unseen or
@@ -259,7 +259,7 @@ integration and acceptance above require no desktop binary.
 | Tool | Contract |
 | --- | --- |
 | `session_create(request_key, host_id, cwd, agent, config?)` | Durable creation of one standalone session; optional model, mode, axes and cache retention. |
-| `session_prompt(request_key, session_id, text)` | Durable text admission, queues while busy and auto-resumes a parked session. |
+| `session_prompt(request_key, session_id, text?, attachments?)` | Durable text/image admission, queues while busy and auto-resumes a parked session. |
 | `operation_get(operation_id? or request_key?)` | Recover this client's operation, delivery state, session/turn IDs and outcome. Supply exactly one lookup key. |
 | `session_wait(operation_id, timeout_ms?)` | Bounded wait, up to ten seconds, returning operation state and whether operator input is needed. |
 | `session_read(session_id, cursor?, before_turn?, max_items?)` | Canonical transcript excerpts, up to ten items, with opaque continuation and explicit resync on revision changes. |
@@ -303,6 +303,68 @@ each next read checks scope again. Wait disconnects never cancel the turn.
 Question items may describe pending permission requests; their canonical
 answerable state describes the operator UI, not external approval authority.
 
-Ordinary elicitation answers, attachments, runtime catalog discovery and
-post-start configuration are future additions. Permission requests continue
+Ordinary elicitation answers, image attachments, runtime catalog discovery and
+post-start configuration use the tools below. Permission requests continue
 through Hennery's operator UI; no approval tool is provided.
+
+
+## Additional tools and bounds
+
+The operator authorized this remaining tool set on 2026-11-03. With full consent,
+discovery advertises 30 tools. These extend the
+same explicit metadata, transcript and control grants; old read-only grants
+remain read-only. No tool can answer an agent permission request.
+
+| Tool | Contract |
+| --- | --- |
+| `session_pending` | Transcript-scoped open questions, including permission notices, at most 50; `truncated` reports further questions and `payload_truncated` marks payloads above 4 KiB. |
+| `session_answer` | Control-scoped ordinary elicitation action/content; current schema validation and durable delivery verdict. |
+| `runtime_catalog` | Scoped saved model/mode/effort catalog; `refresh:true` requires control and probes the canonical granted directory using the host’s workspace boundaries; it does not replace the operator’s saved preview. |
+| `session_config` | One attached-session config ID and string/boolean value, with requested and reported effective settings. |
+| `session_queue` | This client's active operations for a session, 50 per page; 512-byte text previews require transcript consent and report truncation. |
+| `session_queue_update` | Edit a still-queued own prompt's text, retaining its FIFO position and original request-key digest; refuses after an auto-resume handoff. |
+| `operation_cancel` | Withdraw a still-queued, unhanded own command for an existing authorized session; running work or a handed auto-resume cannot be recalled. |
+| `session_usage` | Session-only runtime token/cache/context/reported-cost data; unknown values stay unknown, without family totals. |
+| `session_update` | Title override/reset, sidebar pin and idle hold; never hat reassignment. |
+| `session_clone` | Fresh standalone session using the source's reported settings snapshotted at admission; no history, native identity or family inheritance. |
+| `attachment_upload_begin` | Reserve an upload with declared MIME, size and SHA-256. |
+| `attachment_upload_chunk` | Contiguous offset/content-idempotent chunks, up to 24 KiB decoded. |
+| `attachment_upload_status` | Recover progress, next offset, expiry and sealed state. |
+| `attachment_upload_finish` | Validate complete bytes, hash and the ordinary prompt image rules. |
+| `attachment_upload_abort` | Remove own staging, refusing images bound to an active prompt. |
+| `attachment_get` | Transcript-scoped 24 KiB image chunks, requiring an exact canonical turn reference in the named session. |
+
+Session list filters apply before pagination: host, agent, exact directory,
+lifecycle, activity, literal text query, native session ID and sidebar pin.
+Metadata includes native ID, reported config and timestamps. Session detail
+adds the catalog, bounded pending summaries and own queue count, without
+acknowledging attention or exposing ordinary form contents without transcript
+consent. Usage never leaks statistics of out-of-grant family members.
+
+Ordinary answers use the core answer validator and `ExternalClient` provenance.
+Bounded schema evaluation runs outside the database gate, then authority and
+form contents are rechecked atomically. The external answer outbox is excluded
+from operator reconnect delivery. It checks current consent/session placement
+before each host handoff and resends at most once per ready host connection;
+the host deduplicates by pending ID. Restart preserves accepted answer payloads
+in that outbox. Revocation removes proven-unsent answers and restores UI
+answerability; already-handed work remains uncertain until a host verdict.
+Configuration recovery matches the exact applied request ID, never blindly
+replays a setting. Clone source and target authority are rechecked until handoff.
+
+Images use the app's PNG/JPEG/GIF/WebP support: 5 MiB each, 20 images and 16 MiB
+per prompt. Reserve then upload contiguous 24 KiB chunks (the final chunk may
+be shorter), finalize, and pass upload IDs in `session_prompt.attachments`.
+Text is optional when images are present. Individual chunk retries compare
+content digests and do not consume operation-receipt slots. Staging is bounded
+to 20 MiB per client, 64 MiB and 256 uploads per owner, and expires after 24 h.
+Accepted active prompts retain their referenced uploads past expiry. Session
+deletion and client revocation remove staging atomically. Aborting staging
+after a prompt completes does not delete the canonical transcript image.
+
+Queued prompts report `withdrawable:false` once an auto-resume has been handed
+to the host. Their text remains durably queued through an uncertain resume and
+collector restart, until attachment facts allow prompt dispatch. A crash before
+that resume handoff retires only its own proven-unsent attachment, rather than
+leaving a session stuck starting. Queue edits/withdrawals share the final
+handoff gate and cannot cross that boundary.

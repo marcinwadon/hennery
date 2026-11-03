@@ -86,6 +86,33 @@ impl CatalogOrigin {
     }
 }
 impl Catalogs {
+    pub(crate) async fn get_external(
+        &self,
+        state: &AppState,
+        identity: &crate::external_clients::ExternalIdentity,
+        host: &str,
+        cwd: &str,
+        agent: &str,
+    ) -> Result<HostCatalog> {
+        let hat = &identity.client.hat_id;
+        state.store.catalog_scope(host, hat, cwd)?;
+        state
+            .store
+            .check_mcp_source_policy(hat, agent, crate::api::mcp_context(state, host, agent)?)?;
+        ensure!(
+            state.hub.has_capability(host, Capability::CatalogProbe),
+            "catalog_unavailable"
+        );
+        ensure!(
+            state.hub.runtime_ids(host).contains(&agent.to_owned()),
+            "runtime_unavailable"
+        );
+        let connection = state
+            .hub
+            .routable_conn(host)
+            .ok_or_else(|| anyhow::anyhow!("host_offline"))?;
+        Self::discover(state, host, hat, cwd, agent, connection, (false, Some(identity))).await
+    }
     pub async fn get(&self, state: &AppState, host: &str, hat: &str, cwd: &str, agent: &str) -> Result<HostCatalog> {
         self.get_for_origin(state, host, hat, cwd, agent, CatalogOrigin::Agent)
             .await
@@ -227,7 +254,7 @@ impl Catalogs {
 
     async fn probe_once(state: AppState, key: CatalogKey) -> CachedCatalog {
         let (_, host, hat, cwd, agent, connection, operator_initiated) = &key;
-        let result = Self::discover(&state, host, hat, cwd, agent, *connection, *operator_initiated).await;
+        let result = Self::discover(&state, host, hat, cwd, agent, *connection, (*operator_initiated, None)).await;
         CachedCatalog {
             received: Instant::now(),
             captured: SystemTime::now(),
@@ -242,8 +269,9 @@ impl Catalogs {
         cwd: &str,
         agent: &str,
         connection: u64,
-        operator_initiated: bool,
+        origin: (bool, Option<&crate::external_clients::ExternalIdentity>),
     ) -> Result<HostCatalog> {
+        let (operator_initiated, external) = origin;
         let request_id = uuid::Uuid::now_v7().to_string();
         let frame = CollectorFrame::ProbeCatalog {
             request_id: request_id.clone(),
@@ -252,9 +280,8 @@ impl Catalogs {
             operator_initiated,
         };
         let result = async {
-            let answer = state
-                .hub
-                .probe(host, &request_id, frame, Duration::from_secs(30))
+            let probe = state.hub.probe(host, &request_id, frame, Duration::from_secs(30));
+            let answer = crate::external_tools::guarded_catalog(state, external, host, cwd, probe)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(match error {

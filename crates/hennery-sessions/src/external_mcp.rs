@@ -102,7 +102,7 @@ fn tools(identity: &ExternalIdentity) -> Vec<Value> {
         json!({"name":"workspace_list","description":"List explicitly granted canonical roots, not arbitrary files or other projects.","inputSchema":{"type":"object","properties":{"host_id":{"type":"string"}},"required":["host_id"],"additionalProperties":false}}),
     ];
     if identity.client.read_metadata {
-        tools.push(json!({"name":"session_list","description":"Read bounded session metadata in this client's hat/host/root and created-or-existing session grant; never acknowledges unseen activity.","inputSchema":{"type":"object","properties":{"after":{"type":"string","maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false}}));
+        tools.push(json!({"name":"session_list","description":"Read bounded session metadata in this client's hat/host/root and created-or-existing session grant; never acknowledges unseen activity.","inputSchema":{"type":"object","properties":{"after":{"type":"string","maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50},"filters":{"type":"object","properties":{"host_id":{"type":"string"},"agent":{"type":"string"},"cwd":{"type":"string"},"lifecycle":{"type":"string"},"activity":{"type":"string"},"query":{"type":"string"},"agent_session_id":{"type":"string"},"sidebar_pinned":{"type":"boolean"}},"additionalProperties":false}},"additionalProperties":false}}));
         tools.push(json!({"name":"session_get","description":"Read one authorized session's metadata. Transcript and permission answers are not exposed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","minLength":1,"maxLength":128}},"required":["session_id"],"additionalProperties":false}}));
     }
     for tool in &mut tools {
@@ -112,6 +112,8 @@ fn tools(identity: &ExternalIdentity) -> Vec<Value> {
             json!({"type":"object","properties":{"data":{}},"required":["data"],"additionalProperties":false});
     }
     tools.extend(crate::external_control::tools(identity));
+    tools.extend(crate::external_tools::tools(identity));
+    tools.extend(crate::external_attachments::tools(identity));
     tools
 }
 #[derive(Deserialize)]
@@ -144,6 +146,7 @@ struct Page {
     after: String,
     #[serde(default = "default_limit")]
     limit: u32,
+    filters: Option<crate::external_clients::SessionFilters>,
 }
 fn default_limit() -> u32 {
     25
@@ -182,7 +185,13 @@ fn invoke(state: &AppState, identity: &ExternalIdentity, call: Call) -> anyhow::
         }
         "session_list" => {
             let page: Page = arguments(call.arguments)?;
-            let rows = state.store.external_sessions(identity, &page.after, None, page.limit)?;
+            let rows = state.store.external_sessions_filtered(
+                identity,
+                &page.after,
+                None,
+                page.limit,
+                &page.filters.unwrap_or_default(),
+            )?;
             let next = if rows.len() == page.limit as usize {
                 rows.last().map(|s| s.session_id.clone())
             } else {
@@ -198,7 +207,7 @@ fn invoke(state: &AppState, identity: &ExternalIdentity, call: Call) -> anyhow::
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("not_found"))?;
-            json!({"session":row})
+            json!({"session":row,"detail":state.store.external_detail(identity,&arg.session_id)?})
         }
         _ => anyhow::bail!("unknown_tool"),
     };
@@ -315,7 +324,11 @@ async fn endpoint(
                 Ok(v) => v,
                 Err(_) => return rpc(id, -32602, "invalid_arguments"),
             };
-            let outcome = if crate::external_control::is_control_tool(&call.name) {
+            let outcome = if crate::external_attachments::handles(&call.name) {
+                crate::external_attachments::invoke(&state, &identity, &call.name, call.arguments).await
+            } else if crate::external_tools::handles(&call.name) {
+                crate::external_tools::invoke(&state, &identity, &call.name, call.arguments).await
+            } else if crate::external_control::is_control_tool(&call.name) {
                 crate::external_control::invoke(&state, &identity, &call.name, call.arguments).await
             } else {
                 invoke(&state, &identity, call)
@@ -345,6 +358,20 @@ async fn endpoint(
                         "request_key_conflict" => "request_key_conflict",
                         "operation_limit" => "operation_limit",
                         "session_limit" => "session_limit",
+                        "configuration_unavailable" => "configuration_unavailable",
+                        "chunk_conflict" => "chunk_conflict",
+                        "invalid_offset" => "invalid_offset",
+                        "upload_incomplete" => "upload_incomplete",
+                        "cwd_unavailable" => "cwd_unavailable",
+                        "host_offline" => "host_offline",
+                        "timeout" => "timeout",
+                        "busy" => "busy",
+                        "runtime_unavailable" => "runtime_unavailable",
+                        "catalog_stale" => "catalog_stale",
+                        "auth_required" => "auth_required",
+                        "adapter_failed" => "adapter_failed",
+                        "catalog_unavailable" => "catalog_unavailable",
+                        "mcp_source_policy_unsupported" => "mcp_source_policy_unsupported",
                         "resync_required" => "resync_required",
                         _ => return rpc(id, -32603, "internal_error"),
                     };

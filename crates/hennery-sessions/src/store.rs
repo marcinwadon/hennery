@@ -476,6 +476,7 @@ END;",
     include_str!("external_clients.sql"),
     include_str!("external_oauth.sql"),
     include_str!("external_control.sql"),
+    include_str!("external_tools.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -2679,8 +2680,10 @@ impl Store {
     /// session or a tombstone, an empty catalogue for one whose host has
     /// reported none.
     pub fn catalog(&self, session_id: &str) -> Result<Option<SessionCatalog>> {
-        let row: Option<(ConfigColumns, Option<String>, Option<String>)> = self
-            .conn()
+        self.catalog_in(&self.conn(), session_id)
+    }
+    pub(crate) fn catalog_in(&self, conn: &Connection, session_id: &str) -> Result<Option<SessionCatalog>> {
+        let row: Option<(ConfigColumns, Option<String>, Option<String>)> = conn
             .query_row(
                 "SELECT s.model, s.mode, s.config_axes, c.config_options, c.commands
                  FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id AND c.owner_id = s.owner_id
@@ -2828,7 +2831,7 @@ impl Store {
              FROM answer_queue q
                  JOIN pending p ON p.pending_id = q.pending_id AND p.owner_id = q.owner_id
                  JOIN sessions s ON s.id = q.session_id AND s.owner_id = q.owner_id
-             WHERE s.host_id = ?1 AND q.delivered IS NULL AND q.delegation_handoff = 1 AND p.state = 'open' AND q.owner_id = ?2
+             WHERE s.host_id = ?1 AND q.delivered IS NULL AND q.delegation_handoff = 1 AND json_extract(q.input_origin,'$.kind')<>'external_client' AND p.state = 'open' AND q.owner_id = ?2
              ORDER BY q.rowid",
         )?;
         let rows = stmt.query_map([host_id, &self.owner], |r| {
