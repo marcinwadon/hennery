@@ -72,7 +72,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub(crate) external_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) external_admission: Arc<hennery_kernel::server::Admission>,
     pub(crate) external_oauth: Arc<external_oauth::Runtime>,
     pub handshakes: Arc<hennery_kernel::server::Admission>,
     #[cfg(feature = "test-hooks")]
@@ -116,7 +116,7 @@ impl AppState {
         let hub = Arc::new(hub::Hub::new());
         store.set_idle_hub(&hub);
         Self {
-            external_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            external_admission: Arc::new(hennery_kernel::server::Admission::new(16, 4)),
             external_oauth: Arc::new(external_oauth::Runtime::new()),
             handshakes: Arc::new(hennery_kernel::server::Admission::new(64, 4)),
             #[cfg(feature = "test-hooks")]

@@ -32,6 +32,9 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new(proxy: Option<&str>) -> Self {
+        Self::with_policy(proxy, hennery_kernel::client_address::ProxyPolicy::default()).await
+    }
+    async fn with_policy(proxy: Option<&str>, policy: hennery_kernel::client_address::ProxyPolicy) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("test.db");
         let hosts = Hosts::open(&db).unwrap();
@@ -60,12 +63,10 @@ impl Fixture {
                 let entered = entered.clone();
                 let release = release.clone();
                 async move {
-                    let req = if req.uri().path() == "/api/external-oauth/consent"
-                        && req.headers().contains_key("x-fixture-pause-body")
-                    {
+                    let req = if req.headers().contains_key("x-fixture-pause-body") {
                         let (parts, body) = req.into_parts();
                         let body = axum::body::Body::from_stream(futures::stream::once(async move {
-                            // Polled by JSON extraction only after real operator/step-up middleware.
+                            // Polled only when the real handler extracts its body.
                             entered.notify_one();
                             release.notified().await;
                             axum::body::to_bytes(body, 16 * 1024).await
@@ -78,6 +79,11 @@ impl Fixture {
                 }
             },
         ));
+        let router = hennery_kernel::server::request_limits(router)
+            .layer(axum::middleware::from_fn(
+                hennery_kernel::client_address::resolve_request,
+            ))
+            .layer(axum::Extension(policy));
         let task = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -195,6 +201,10 @@ impl Fixture {
         json!({"request_id":id,"allow":allow,"hat_id":self.hat,"roots":[{"host_id":"host","root":"/project"}],"read_metadata":true,"existing_sessions":true,"expires_in_days":7})
     }
     async fn code(&self, id: &str) -> String {
+        self.code_with_redirect(id, "https://claude.ai/api/mcp/auth_callback")
+            .await
+    }
+    async fn code_with_redirect(&self, id: &str, expected: &str) -> String {
         let r = self
             .operator
             .post(format!("{}/api/external-oauth/consent", self.base))
@@ -205,7 +215,9 @@ impl Fixture {
         assert_eq!(r.status(), 200);
         let value: Value = r.json().await.unwrap();
         let callback = Url::parse(value["redirect_uri"].as_str().unwrap()).unwrap();
-        assert_eq!(callback.host_str(), Some("claude.ai"));
+        let mut destination = callback.clone();
+        destination.set_query(None);
+        assert_eq!(destination.as_str(), expected);
         assert_eq!(
             callback.query_pairs().find(|(k, _)| k == "state").unwrap().1,
             "fixture-state"
@@ -248,6 +260,180 @@ impl Fixture {
             .await
             .unwrap()
     }
+    async fn hold_body(&self, address: &str, path: &str) -> tokio::task::JoinHandle<reqwest::Response> {
+        let request = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .header("hennery-client-ip", address)
+            .header("x-fixture-pause-body", "1")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body("grant_type=refresh_token&client_id=unknown&resource=invalid&refresh_token=unknown");
+        let task = tokio::spawn(async move { request.send().await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(3), self.body_entered.notified())
+            .await
+            .expect("request reached body extraction");
+        task
+    }
+}
+
+#[tokio::test]
+async fn shared_external_capacity_is_limited_per_effective_client() {
+    use hennery_kernel::client_address::ProxyPolicy;
+    for trusted in [false, true] {
+        let policy = if trusted {
+            ProxyPolicy::new(vec!["127.0.0.1".parse().unwrap()]).unwrap()
+        } else {
+            ProxyPolicy::default()
+        };
+        let f = Fixture::with_policy(None, policy).await;
+        let mut held = Vec::new();
+        for path in [
+            "/oauth/external/token",
+            "/oauth/external/revoke",
+            "/oauth/external/token",
+            "/oauth/external/revoke",
+        ] {
+            held.push(f.hold_body("2001:db8:1::1", path).await);
+        }
+        for address in ["2001:db8:1::2", "2001:db8:2::1"] {
+            let same_client = !trusted || address == "2001:db8:1::2";
+            for (path, available) in [
+                ("/oauth/external/token", 400),
+                ("/oauth/external/register", 400),
+                ("/oauth/external/revoke", 200),
+                ("/mcp/external/hennery", 401),
+            ] {
+                let response = f
+                    .http
+                    .post(format!("{}{path}", f.base))
+                    .header("hennery-client-ip", address)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body("client_id=unknown&token=unknown")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if same_client { 429 } else { available },
+                    "{trusted} {address} {path}"
+                );
+                if same_client {
+                    assert_eq!(response.headers()["retry-after"], "1");
+                }
+            }
+        }
+        f.body_release.notify_waiters();
+        for task in held {
+            assert_eq!(task.await.unwrap().status(), 400);
+        }
+        let response = f
+            .http
+            .post(format!("{}/mcp/external/hennery", f.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            401,
+            "completed bodies release the shared reservations"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shared_external_capacity_has_a_global_bound_and_keeps_discovery_available() {
+    let policy = hennery_kernel::client_address::ProxyPolicy::new(vec!["127.0.0.1".parse().unwrap()]).unwrap();
+    let f = Fixture::with_policy(None, policy).await;
+    let mut held = Vec::new();
+    for client in 1..=4 {
+        for _ in 0..4 {
+            held.push(
+                f.hold_body(&format!("2001:db8:{client}::1"), "/oauth/external/token")
+                    .await,
+            );
+        }
+    }
+    let response = f
+        .http
+        .post(format!("{}/mcp/external/hennery", f.base))
+        .header("hennery-client-ip", "2001:db8:5::1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let metadata = f
+        .http
+        .get(format!("{}/.well-known/oauth-authorization-server", f.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), 200);
+    f.body_release.notify_waiters();
+    for task in held {
+        assert_eq!(task.await.unwrap().status(), 400);
+    }
+    let response = f
+        .http
+        .post(format!("{}/mcp/external/hennery", f.base))
+        .header("hennery-client-ip", "2001:db8:5::1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+/// An opt-in outbound HTTPS probe, never an authenticated Claude session or
+/// proof that Anthropic can reach a public Hennery deployment.
+#[tokio::test]
+#[ignore = "requires the official public Claude CIMD HTTPS endpoint"]
+async fn official_claude_cimd_fetch_completes_isolated_consent_and_exchange() {
+    let f = Fixture::new(None).await;
+    let client = "https://claude.ai/oauth/claude-code-client-metadata";
+    let callback = "http://localhost:34567/callback";
+    let mut authorization = f.auth(client);
+    authorization
+        .iter_mut()
+        .find(|(field, _)| *field == "redirect_uri")
+        .unwrap()
+        .1 = callback.into();
+    let pending = f.pending_with(&authorization).await;
+    let request: Value = f
+        .operator
+        .get(format!("{}/api/external-oauth/requests/{pending}", f.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(request["request"]["client_id"], client);
+    assert_eq!(request["request"]["redirect_uri"], callback);
+    assert!(f.state.store.external_clients().unwrap().is_empty());
+    let code = f.code_with_redirect(&pending, callback).await;
+    let mut exchange = f.token_form(client, &code);
+    exchange
+        .iter_mut()
+        .find(|(field, _)| *field == "redirect_uri")
+        .unwrap()
+        .1 = callback.into();
+    let response = f
+        .http
+        .post(format!("{}/oauth/external/token", f.base))
+        .form(&exchange)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let token: Value = response.json().await.unwrap();
+    let result = f
+        .rpc(token["access_token"].as_str().unwrap(), "host_list", json!({}))
+        .await;
+    assert_eq!(result["result"]["isError"], false);
+    assert_eq!(
+        result["result"]["structuredContent"]["data"]["hosts"][0]["host_id"],
+        "host"
+    );
 }
 
 #[tokio::test]

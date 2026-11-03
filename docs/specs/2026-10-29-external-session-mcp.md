@@ -66,8 +66,14 @@ Unused registrations expire after ten minutes; explicit consent extends them to
 cannot reserve the bounded registry for a month without user consent.
 
 Requests to the public OAuth flow are limited per attributed network address,
-with global concurrency and stored registration/pending-request caps. These
-application limits complement the reverse proxy's TLS/socket/request limits.
+with stored registration/pending-request caps. OAuth registration, authorization,
+token/revocation and external MCP requests share 16 concurrent reservations,
+at most four per effective client (IPv6 /64), acquired before authentication or
+body reads and held until the handler completes. Only configured exact proxy
+peers may supply the client address; untrusted forwarding headers cannot obtain
+more capacity. Saturation returns 429 with `Retry-After: 1`; the OAuth attempt
+rate limiter retains its separate backoff. Public discovery remains available.
+These application limits complement the reverse proxy's TLS/socket/request limits.
 Discovery is available without cookies. Consent and grant management require
 the existing operator login and same-origin browser rules.
 

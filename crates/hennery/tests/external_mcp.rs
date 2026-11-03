@@ -98,7 +98,10 @@ async fn credentials_are_distinct_and_provision_revoke_require_fresh_stepup() {
     let stale = reqwest::Client::new()
         .post(&path)
         .header("origin", hennery_testkit::PUBLIC_URL)
-        .header("cookie", format!("hennery_session={old}"))
+        .header(
+            "cookie",
+            format!("{}={old}", hennery_kernel::operator::session_cookie_name(true)),
+        )
         .json(&c.grant(false))
         .send()
         .await
@@ -135,7 +138,10 @@ async fn credentials_are_distinct_and_provision_revoke_require_fresh_stepup() {
         reqwest::Client::new()
             .delete(format!("{path}/{id}"))
             .header("origin", hennery_testkit::PUBLIC_URL)
-            .header("cookie", format!("hennery_session={old}"))
+            .header(
+                "cookie",
+                format!("{}={old}", hennery_kernel::operator::session_cookie_name(true)),
+            )
             .send()
             .await
             .unwrap()

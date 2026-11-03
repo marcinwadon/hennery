@@ -119,6 +119,13 @@ fn unavailable() -> Response {
         Json(json!({"error":"https_public_url_required"})),
     ))
 }
+pub(crate) fn at_capacity() -> Response {
+    let mut response = error("temporarily_unavailable");
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+    response
+}
 /// Body extraction can await a slow client. Revalidate the browser session
 /// after that await, before issuing durable authority.
 pub(crate) fn fresh_operator(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
@@ -190,8 +197,8 @@ async fn body(req: Request) -> Result<axum::body::Bytes, Box<Response>> {
     }
 }
 async fn register(State(state): State<AppState>, addr: ClientAddress, req: Request) -> Response {
-    let Ok(_permit) = state.external_permits.try_acquire() else {
-        return error("temporarily_unavailable");
+    let Some(_permit) = state.external_admission.try_acquire(addr.effective) else {
+        return at_capacity();
     };
     if location(&state).is_none() {
         return unavailable();
@@ -267,8 +274,8 @@ fn metadata_document(bytes: &[u8], id: &str) -> anyhow::Result<Metadata> {
     Ok(m)
 }
 async fn authorize(State(state): State<AppState>, addr: ClientAddress, Query(a): Query<Authorization>) -> Response {
-    let Ok(_permit) = state.external_permits.try_acquire() else {
-        return error("temporarily_unavailable");
+    let Some(_permit) = state.external_admission.try_acquire(addr.effective) else {
+        return at_capacity();
     };
     let Some((_, resource)) = location(&state) else {
         return unavailable();
@@ -343,8 +350,8 @@ async fn form<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, Box<Res
         .map_err(|_| Box::new(error("invalid_request")))
 }
 async fn token(State(state): State<AppState>, addr: ClientAddress, req: Request) -> Response {
-    let Ok(_permit) = state.external_permits.try_acquire() else {
-        return error("temporarily_unavailable");
+    let Some(_permit) = state.external_admission.try_acquire(addr.effective) else {
+        return at_capacity();
     };
     let Some((_, resource)) = location(&state) else {
         return unavailable();
@@ -370,8 +377,8 @@ struct Revoke {
     client_secret: Option<String>,
 }
 async fn revoke(State(state): State<AppState>, addr: ClientAddress, req: Request) -> Response {
-    let Ok(_permit) = state.external_permits.try_acquire() else {
-        return error("temporarily_unavailable");
+    let Some(_permit) = state.external_admission.try_acquire(addr.effective) else {
+        return at_capacity();
     };
     let Some((_, resource)) = location(&state) else {
         return unavailable();

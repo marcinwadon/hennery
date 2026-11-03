@@ -28,6 +28,40 @@ fn usage() -> Box<TurnUsage> {
 }
 
 #[test]
+fn external_migrations_preserve_v37_usage_and_are_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("upgrade.db");
+    let store = Store::open(&path).unwrap();
+    seed(&store, "s", "hat");
+    finish(&store, "s", "turn", 2, Some(usage()), TurnOutcome::Completed);
+    let before = serde_json::to_value(store.session_usage("s").unwrap()).unwrap();
+    assert_eq!(before["session"]["tokens"]["total_tokens"], 100);
+    drop(store);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // Main's last schema already owns the usage columns and indexes. Only the
+    // two unpublished external migrations are absent from an upgrading DB.
+    conn.execute_batch(concat!(
+        include_str!("fixtures/undo_external.sql"),
+        "PRAGMA user_version=37;"
+    ))
+    .unwrap();
+    for _ in 0..2 {
+        let upgraded = Store::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(upgraded.session_usage("s").unwrap()).unwrap(),
+            before
+        );
+        let count: u32 = conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN (
+              'external_clients','external_client_roots','external_client_sessions',
+              'external_oauth_clients','external_oauth_requests','external_oauth_tokens','external_oauth_refresh_history')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 7);
+    }
+}
+
+#[test]
 fn late_usage_after_detach_repairs_accounting_without_reopening_a_turn() {
     let store = Store::open_in_memory().unwrap();
     seed(&store, "s", "hat");

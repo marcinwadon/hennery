@@ -3333,6 +3333,10 @@ impl Store {
             "DELETE FROM session_catalog WHERE session_id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
         )?;
+        tx.execute(
+            "DELETE FROM external_client_sessions WHERE owner_id = ?1 AND session_id = ?2",
+            params![self.owner, session_id],
+        )?;
         // A later attachment can own the options while retaining an earlier
         // session's agent baseline. Forget only that baseline, not its options.
         tx.execute(

@@ -211,9 +211,13 @@ fn invoke(state: &AppState, identity: &ExternalIdentity, call: Call) -> anyhow::
     anyhow::ensure!(serde_json::to_vec(&value)?.len() <= 256 * 1024, "result_too_large");
     Ok(json!({"data":value}))
 }
-async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
-    let Ok(_permit) = state.external_permits.try_acquire() else {
-        return private(StatusCode::TOO_MANY_REQUESTS);
+async fn endpoint(
+    State(state): State<AppState>,
+    address: hennery_kernel::client_address::ClientAddress,
+    req: Request,
+) -> Response {
+    let Some(_permit) = state.external_admission.try_acquire(address.effective) else {
+        return crate::external_oauth::at_capacity();
     };
     let headers = req.headers();
     if let Some(origin) = headers.get(header::ORIGIN)

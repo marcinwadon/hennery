@@ -3136,6 +3136,11 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
              FROM sessions WHERE id = 's1';
          INSERT INTO session_attach_evidence(owner_id,session_id,attach_generation,requested_config)
              SELECT owner_id, 's1', 1, '{}' FROM sessions WHERE id = 's1';
+         INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at)
+             SELECT owner_id,'delete-external','External fixture',hat_id,'fixture-hash',1,1,1,9999999999
+             FROM sessions WHERE id = 's1';
+         INSERT INTO external_client_sessions(owner_id,client_id,session_id)
+             SELECT owner_id,'delete-external',id FROM sessions WHERE id IN ('s1','s2');
          INSERT INTO delegation_start_budgets(owner_id,caller_id,epoch,starts)
              SELECT owner_id, 's1', 0, 1 FROM sessions WHERE id = 's1';
          INSERT INTO delegation_attention(owner_id,attention_id,child_id,hat_id,reason,incident)
@@ -3169,6 +3174,7 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         "session_operations",
         "session_dispatch_queue",
         "session_attach_evidence",
+        "external_client_sessions",
         "delegation_start_budgets",
         "delegation_budgets",
         "delegation_attention",
