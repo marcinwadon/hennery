@@ -752,6 +752,7 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Err(err) => return internal(err),
     };
     Json(SessionDetail {
+        agent_session_id: session.agent_session_id,
         mcp_source_policy,
         configuration_error: session.configuration_error,
         session: item,

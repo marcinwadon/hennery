@@ -1457,7 +1457,7 @@ pub struct ListQuery<'a> {
     /// Only sessions in one of these lifecycles (names from `LIFECYCLES`);
     /// all when `None`. Ignored while `search` is set (frontend §5).
     pub lifecycles: Option<&'a [&'a str]>,
-    /// Only sessions whose title, cwd, branch or id holds this text.
+    /// Only sessions whose title, cwd, branch or either session id holds this text.
     pub search: Option<&'a str>,
     /// Only sessions of this hat (plan 5c), with or without `search`
     /// (frontend §5: a search bypasses every filter but the hat's).
@@ -1497,7 +1497,8 @@ fn like_pattern(search: &str) -> String {
 /// unless it is NULL.
 const LIST_FILTERS: &str = "owner_id = ?1 AND (last_event_at, id) < (?2, ?3) AND lifecycle IN (?4, ?5, ?6, ?7, ?8)
              AND (?9 IS NULL OR title LIKE ?9 ESCAPE '\\' OR cwd LIKE ?9 ESCAPE '\\'
-                  OR git_branch LIKE ?9 ESCAPE '\\' OR id LIKE ?9 ESCAPE '\\')";
+                  OR git_branch LIKE ?9 ESCAPE '\\' OR id LIKE ?9 ESCAPE '\\'
+                  OR agent_session_id LIKE ?9 ESCAPE '\\')";
 
 /// The session list's statement (decision 8): `LIST_FILTERS`, the newest
 /// `last_event_at` first and the id breaking ties, at most `?10`; with

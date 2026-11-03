@@ -665,6 +665,9 @@ one of the three supported topologies (umbrella §7.5).
 
 - The collector mints `session_id` (UUIDv7) before the host is asked to start
   anything; the adapter's own id is stored as `agent_session_id`.
+  Session detail exposes the optional `agent_session_id` alongside `session_id`;
+  list search matches either identifier, including literal substrings, within
+  the existing owner and hat scope. Native identifiers need not be globally unique.
 - **Immutable after creation:** host, agent, cwd (canonical). The hat is
   changed only by explicit re-assignment (§4.9). Nothing derives them from
   events. *(P-10: an event with an empty machine field once blanked a

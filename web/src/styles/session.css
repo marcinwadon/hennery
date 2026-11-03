@@ -373,6 +373,11 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
 .session-facts { display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px; font-size:12px; }
 .session-facts dt { color:var(--hn-fg-3); }
 .session-facts dd { margin:0; color:var(--hn-fg-1); overflow-wrap:anywhere; }
+.session-facts .session-identifier-label { grid-column:1 / -1; margin-bottom:-6px; }
+.session-facts .session-identifier-value { grid-column:1 / -1; }
+.session-identifier { display:flex; align-items:flex-start; gap:6px; }
+.session-identifier bdi { flex:1; min-width:0; }
+.session-identifier button { min-width:64px; }
 .session-details .family-panel { max-height:none; overflow:visible; padding:0; border:0; font-size:13px; }
 .family-child { border:1px solid var(--hn-line); border-radius:8px; padding:12px; margin-top:12px; background:var(--hn-surface); }
 .family-meta { font-size:12px; color:var(--hn-fg-3); }

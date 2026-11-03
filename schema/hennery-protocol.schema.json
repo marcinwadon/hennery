@@ -6130,6 +6130,13 @@
         "agent": {
           "type": "string"
         },
+        "agent_session_id": {
+          "description": "The adapter's own identifier, distinct from Hennery's `session_id`.\nAbsent until the agent has reported a session.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "configuration_error": {
           "description": "A bounded, readable requested-versus-actual configuration failure.",
           "type": [

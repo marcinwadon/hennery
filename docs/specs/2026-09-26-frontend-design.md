@@ -144,7 +144,8 @@ index, so card-local state (a half-filled form) cannot move to another item.
   predecessor's single status enum plus sessions that never reconciled needed
   `isStale`/`isActionable` patches; counts claimed 17 sessions needed attention
   when 2 were live.)*
-- **Search** runs on the server (`q`) over title, cwd, branch and id across
+- **Search** runs on the server (`q`) over title, cwd, branch, Hennery session
+  id and native agent session id (full identifiers or literal substrings) across
   **all** sessions; while a query is active, the volume filters are bypassed and
   only the hat applies. *(F-10: filtering before querying made closed threads
   unfindable.)* Transcript full-text search is out of scope for v1.

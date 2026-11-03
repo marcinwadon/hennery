@@ -10,6 +10,24 @@ const report = (count = 1) => json({ session_id: 's1', agent: 'codex',
   mcp_delivery: { mode: 'unisolated', servers: count, at: '2026-10-13T00:00:00Z' } })
 
 describe('bounded session delivery reads', () => {
+  it('reads the native session ID once starting completes, including an ID reported on resume', async () => {
+    let agentSessionId: string | undefined
+    const t = routed(() => json({ session_id: 's1', agent_session_id: agentSessionId }))
+    const { result, rerender } = renderHook(({ lifecycle }) => useMcpDelivery('s1', lifecycle, 0),
+      { wrapper: t.wrapper, initialProps: { lifecycle: 'starting' } })
+    await waitFor(() => expect(result.current.detail?.session_id).toBe('s1'))
+    expect(result.current.detail?.agent_session_id).toBeUndefined()
+    agentSessionId = 'native-first'
+    rerender({ lifecycle: 'active' })
+    await waitFor(() => expect(result.current.detail?.agent_session_id).toBe('native-first'))
+    rerender({ lifecycle: 'parked' })
+    rerender({ lifecycle: 'starting' })
+    await waitFor(() => expect(t.calls).toHaveLength(3))
+    agentSessionId = 'native-resumed'
+    rerender({ lifecycle: 'active' })
+    await waitFor(() => expect(result.current.detail?.agent_session_id).toBe('native-resumed'))
+  })
+
   it('reads on open, never on focus or same-lifecycle renders, and refreshes the specified transitions', async () => {
     const t = routed(() => report())
     const { result, rerender } = renderHook(({ lifecycle, resync }) => useMcpDelivery('s1', lifecycle, resync),

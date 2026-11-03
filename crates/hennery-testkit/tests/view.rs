@@ -24,6 +24,48 @@ const OTHER: &str = "owner-00000000000000b2";
 /// How long a test waits for anything the collector sends.
 const WAIT: Duration = Duration::from_secs(20);
 
+#[tokio::test]
+async fn session_detail_exposes_the_native_id_and_both_list_apis_find_it() {
+    use hennery_proto::frames::SessionBody;
+    let c = Collector::start().await;
+    c.state
+        .store
+        .create_session("hennery-id", "host-1", "claude", "/tmp", "hat", None)
+        .unwrap();
+    let client = c.client();
+    let read = || client.get(c.url("/api/sessions/hennery-id")).send();
+    let before: Value = read().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert!(before.get("agent_session_id").is_none());
+    c.state
+        .store
+        .ingest(
+            "hennery-id",
+            1,
+            &SessionBody::session_started("start", "native-session-42"),
+        )
+        .unwrap();
+    let after: Value = read().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(after["session_id"], "hennery-id");
+    assert_eq!(after["agent_session_id"], "native-session-42");
+    for path in ["/api/sessions", "/api/view/sessions"] {
+        for query in ["native-session-42", "session-42"] {
+            let page: Value = client
+                .get(c.url(path))
+                .query(&[("q", query), ("hat", "hat")])
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(page["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(page["sessions"][0]["session_id"], "hennery-id");
+        }
+    }
+}
+
 fn complete_review_turn(c: &Collector, session: &str, name: &str, seq: u64) -> i64 {
     use hennery_proto::frames::{SessionBody, TurnOutcome};
     assert!(

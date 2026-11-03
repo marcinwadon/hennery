@@ -36,6 +36,7 @@ async function seeResult(page: Page) {
 // Every prompt: one permission ask, then a short Markdown message after the
 // echo of its answer (`permission:selected:<option>`, no newline of its own).
 const SCRIPT = {
+  session_id: '22222222-2222-4222-8222-222222222222',
   prompt_usage: { inputTokens: 10, outputTokens: 5, totalTokens: 100, cachedReadTokens: 80, cachedWriteTokens: 5 },
   usage_update: { sessionUpdate: 'usage_update', used: 124000, size: 200000, cost: { amount: 1.25, currency: 'USD' } },
   asks: ['permission'],
@@ -210,6 +211,51 @@ for (const width of [1280, 390]) {
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
       await page.screenshot({ path: testInfo.outputPath(`usage-${width}.png`) })
       await page.getByRole('button', { name: 'Close session details', exact: true }).click()
+    })
+
+    test('distinguishes and copies both session IDs and opens a conversation found by its native ID', async () => {
+      const sessionUrl = page.url()
+      const id = new URL(sessionUrl).pathname.split('/').pop()!
+      const response = await page.request.get(`${collector.origin}/api/sessions/${id}`)
+      expect(response.ok()).toBe(true)
+      const detail = await response.json()
+      const native: string = detail.agent_session_id
+      expect(native.length).toBeGreaterThan(0)
+      expect(native).not.toBe(id)
+      const panel = page.locator('.session-details')
+      if (!await panel.isVisible()) await page.getByRole('button', { name: 'Session details', exact: true }).click()
+      if (narrow) await panel.getByRole('tab', { name: 'Details', exact: true }).click()
+      await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
+      for (const [label, value] of [['Hennery session ID', id], ['Claude session ID', native]]) {
+        const row = panel.locator('dt').filter({ hasText: new RegExp(`^${label}$`) }).locator('+ dd')
+        await expect(row.locator('code')).toHaveText(value)
+        expect(await row.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
+        expect((await row.locator('code').boundingBox())!.height).toBeLessThanOrEqual(40)
+        await row.getByRole('button', { name: `Copy ${label}`, exact: true }).click()
+        await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(value)
+      }
+      await page.screenshot({ path: test.info().outputPath('session-identifiers.png') })
+      await panel.getByRole('button', { name: 'Close session details', exact: true }).click()
+      await page.goto(`${collector.origin}/sessions`)
+      if (narrow) await page.getByRole('button', { name: 'Filters', exact: true }).click()
+      const search = page.getByRole('searchbox', { name: 'Search sessions', exact: true })
+      const found = page.waitForResponse(response => {
+        const url = new URL(response.url())
+        return url.pathname === '/api/view/sessions' && url.searchParams.get('q') === native
+      })
+      await search.fill(native)
+      expect((await found).ok()).toBe(true)
+      if (narrow) await page.getByRole('button', { name: 'Close filters', exact: true }).click()
+      const match = page.locator(`[data-session-id="${id}"] [data-session-link]`)
+      await expect(match).toHaveCount(1)
+      await match.click()
+      await expect(page).toHaveURL(sessionUrl)
+      // Leave the shared fixture's list scope ready for the remaining cases.
+      await page.goto(`${collector.origin}/sessions`)
+      if (narrow) await page.getByRole('button', { name: 'Filters', exact: true }).click()
+      await search.fill('')
+      if (narrow) await page.getByRole('button', { name: 'Close filters', exact: true }).click()
+      await page.goto(sessionUrl)
     })
 
     test('the composer’s Send, and a phone’s way back, are on screen', async () => {

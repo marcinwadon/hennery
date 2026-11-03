@@ -267,6 +267,11 @@ fn another_owners_sessions_are_invisible_to_the_store() {
         ..ListQuery::default()
     };
     assert!(store.list(&search).unwrap().sessions.is_empty());
+    let native_search = ListQuery {
+        search: Some("agent-b"),
+        ..ListQuery::default()
+    };
+    assert!(store.list(&native_search).unwrap().sessions.is_empty());
     // And a hat filter naming a hat both owners' sessions carry.
     let by_hat = ListQuery {
         hat: Some("hat-x"),

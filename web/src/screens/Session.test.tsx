@@ -132,6 +132,17 @@ function scrollTo(top: number) {
 const rows = (n: number, turn: string, prefix = turn) => Array.from({ length: n }, (_, i) => message(`${prefix}-${i}`, turn))
 
 describe('SessionView', () => {
+  it('shows the native ID fetched from detail separately from the Hennery ID', async () => {
+    const native = 'native-session-42'
+    const s = server({ pages: [() => json(page([]))], detail: () => json(detail('claude', { agent_session_id: native })) })
+    const summary: SessionSummary = { ...detail('claude'), question_waits: false, operator_attention: 0, parent_handled_questions: 0 }
+    render(<SessionView id={ID} summary={summary} timing={FAST} />, { wrapper: s.wrapper })
+    fireEvent.click(await screen.findByRole('button', { name: 'Session details' }))
+    expect(await screen.findByText(native, { exact: true })).toBeVisible()
+    expect(screen.getByText('Hennery session ID', { exact: true }).nextElementSibling).toHaveTextContent(ID)
+    expect(screen.getByText('Claude session ID', { exact: true }).nextElementSibling).toHaveTextContent(native)
+  })
+
   it('does not show Codex pending when the same hat has a newer Claude override', async () => {
     const source: McpSourceSnapshot = { policy: 'legacy', revision: 1, request_id: 'codex-attach' }
     const s = server({ pages: [() => json(page([]))], hats: () => json([
