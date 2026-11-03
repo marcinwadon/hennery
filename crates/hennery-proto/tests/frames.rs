@@ -489,6 +489,7 @@ fn session_started_names_the_request_and_the_agents_session() {
 
 fn config() -> SessionConfig {
     SessionConfig {
+        context_budget: Default::default(),
         cache_retention: Default::default(),
         model: Some("large".into()),
         mode: Some("plan".into()),
@@ -498,6 +499,23 @@ fn config() -> SessionConfig {
         ]
         .into_iter()
         .collect(),
+    }
+}
+
+#[test]
+fn context_policy_is_additive_and_rejects_unbounded_or_injected_values() {
+    let old: SessionConfig = serde_json::from_value(json!({"model":"large"})).unwrap();
+    assert!(old.context_budget.is_inherit());
+    assert!(serde_json::to_value(old).unwrap().get("context_budget").is_none());
+    let request: hennery_proto::usage::SetContextBudget = serde_json::from_value(json!({"requested":"500k"})).unwrap();
+    assert_eq!(request.requested, hennery_proto::usage::ContextBudget::Tokens500K);
+    for invalid in [
+        json!({"requested":100000}),
+        json!({"requested":"0"}),
+        json!({"requested":"100000000000"}),
+        json!({"requested":"inherit","env":{"CODEX_CONFIG":"anything"}}),
+    ] {
+        assert!(serde_json::from_value::<hennery_proto::usage::SetContextBudget>(invalid).is_err());
     }
 }
 

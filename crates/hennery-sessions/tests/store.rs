@@ -1218,6 +1218,7 @@ fn catalogue(model: &str, mode: &str) -> Indexed {
 
 fn config(model: &str, mode: &str) -> SessionConfig {
     SessionConfig {
+        context_budget: Default::default(),
         cache_retention: Default::default(),
         model: Some(model.into()),
         mode: Some(mode.into()),

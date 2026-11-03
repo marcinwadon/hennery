@@ -104,15 +104,11 @@ fn like_source_with_family(collector: &Collector, hat: &str, family: bool) {
             conn.execute("INSERT INTO session_families(owner_id,child_id,parent_id,root_id,hat_id,created_event_id) VALUES (?1,'like-source','like-parent','like-parent',?2,1)", rusqlite::params![collector.state.store.owner_id(), hat]).unwrap();
         }
     }
-    collector
-        .state
-        .store
-        .ingest(
-            "like-source",
-            1,
-            &SessionBody::session_started("original", "agent-source"),
-        )
-        .unwrap();
+    let mut started = SessionBody::session_started("original", "agent-source");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut started {
+        indexed.context_budget = Some(hennery_proto::usage::ContextBudget::Inherit);
+    }
+    collector.state.store.ingest("like-source", 1, &started).unwrap();
     let options = json!([
         {"id":"model","category":"model","type":"select","currentValue":"chosen-model","options":[{"value":"chosen-model","name":"Chosen"}]},
         {"id":"mode","category":"mode","type":"select","currentValue":"plan","options":[{"value":"plan","name":"Plan"}]},
@@ -166,7 +162,18 @@ async fn new_like_this_copies_reported_configuration_into_a_fresh_empty_session(
             .parent
             .is_some()
     );
-    let mut host = ScriptedHost::connect(&collector).await;
+    let mut host = ScriptedHost::connect_with(
+        &collector,
+        Capabilities(vec![Capability::ResolvePath, Capability::ContextBudget]),
+    )
+    .await;
+    assert!(
+        collector
+            .state
+            .store
+            .set_context_budget("like-source", hennery_proto::usage::ContextBudget::Tokens500K)
+            .unwrap()
+    );
     let source = collector.state.store.find_session("like-source").unwrap().unwrap();
     let call = send(
         &collector,

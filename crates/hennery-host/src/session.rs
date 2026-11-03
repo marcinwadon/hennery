@@ -526,6 +526,8 @@ fn launch_inner(
     }));
     let actor = Actor {
         cache_retention: (launch.profile == Profile::Claude).then_some(launch.config.cache_retention),
+        context_budget: matches!(launch.profile, Profile::Claude | Profile::Codex)
+            .then_some(launch.config.context_budget),
         mcp_source_policy: launch.mcp_source_policy.clone(),
         catalog_identity: crate::delegation::catalog_identity(&launch.agent, launch.profile),
         workspace_roots,
@@ -926,6 +928,7 @@ impl Drop for AcpTask {
 
 struct Actor {
     cache_retention: Option<hennery_proto::usage::CacheRetention>,
+    context_budget: Option<hennery_proto::usage::ContextBudget>,
     mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     catalog_identity: hennery_proto::delegation_host::CatalogIdentity,
     workspace_roots: Option<Vec<PathBuf>>,
@@ -1049,6 +1052,7 @@ impl Actor {
         });
         let mut indexed = self.catalogue_extracts();
         indexed.cache_retention = self.cache_retention;
+        indexed.context_budget = self.context_budget;
         indexed.mcp_source_policy = self.mcp_source_policy.clone();
         if indexed.current_config().is_some() {
             let mut identity = self.catalog_identity.clone();
@@ -1174,6 +1178,15 @@ impl Actor {
                 request_id,
                 StartError {
                     code: "cache_retention_unavailable",
+                    message: message.into(),
+                },
+            );
+        }
+        if let Err(message) = crate::usage::context_budget(&mut agent, profile, config.context_budget) {
+            return self.start_failed(
+                request_id,
+                StartError {
+                    code: "context_budget_unavailable",
                     message: message.into(),
                 },
             );

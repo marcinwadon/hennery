@@ -4,6 +4,27 @@ use agent_client_protocol::schema::v1::PromptResponse;
 use hennery_proto::usage::{CacheRetention, ModelUsage, TokenUsage, TurnUsage};
 use serde_json::Value;
 
+pub fn context_budget(
+    command: &mut AgentCommand,
+    profile: Profile,
+    requested: hennery_proto::usage::ContextBudget,
+) -> Result<(), &'static str> {
+    let Some(tokens) = requested.tokens() else {
+        return Ok(());
+    };
+    match profile {
+        Profile::Claude => command
+            .env
+            .push(("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), tokens.to_string())),
+        Profile::Codex => command.env.push((
+            "CODEX_CONFIG".into(),
+            serde_json::json!({"model_auto_compact_token_limit":tokens}).to_string(),
+        )),
+        _ => return Err("automatic-compaction budgets are unavailable for this runtime"),
+    }
+    Ok(())
+}
+
 pub fn retention(command: &mut AgentCommand, profile: Profile, requested: CacheRetention) -> Result<(), &'static str> {
     if requested.is_inherit() {
         return Ok(());
@@ -82,6 +103,30 @@ pub fn from_response(response: &PromptResponse, profile: Profile) -> Option<Box<
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn context_budget_is_per_launch_and_only_sets_the_native_policy_key() {
+        use hennery_proto::usage::ContextBudget::*;
+        let mut claude = AgentCommand::parse("claude-test").unwrap();
+        context_budget(&mut claude, Profile::Claude, Tokens500K).unwrap();
+        assert_eq!(
+            claude.env,
+            [("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), "500000".into())]
+        );
+        let mut codex = AgentCommand::parse("codex-test").unwrap();
+        context_budget(&mut codex, Profile::Codex, Tokens100K).unwrap();
+        assert_eq!(codex.env[0].0, "CODEX_CONFIG");
+        assert_eq!(
+            serde_json::from_str::<Value>(&codex.env[0].1).unwrap(),
+            json!({"model_auto_compact_token_limit":100000})
+        );
+        for profile in [Profile::Generic, Profile::ClaudeOwnCli] {
+            let mut command = AgentCommand::parse("custom").unwrap();
+            assert!(context_budget(&mut command, profile, Tokens200K).is_err());
+            assert!(command.env.is_empty());
+            context_budget(&mut command, profile, Inherit).unwrap();
+            assert!(command.env.is_empty());
+        }
+    }
     #[test]
     fn preserves_unknown_counts_and_rejects_invalid_or_foreign_model_metadata() {
         let raw = json!({"stopReason":"cancelled", "usage":{"inputTokens":10,"outputTokens":5,"totalTokens":35,"cachedReadTokens":20},

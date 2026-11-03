@@ -104,6 +104,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/catalog", get(catalog))
         .route("/api/sessions/{id}/usage", get(session_usage))
         .route(
+            "/api/sessions/{id}/context-budget",
+            axum::routing::patch(context_budget),
+        )
+        .route(
             "/api/sessions/{id}/cache-retention",
             axum::routing::patch(cache_retention),
         )
@@ -150,6 +154,27 @@ async fn cache_retention(
             StatusCode::CONFLICT,
             "cache_retention_unavailable",
             "this runtime does not support a cache-retention request",
+        ),
+        Err(err) => internal(err),
+    }
+}
+
+async fn context_budget(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<hennery_proto::usage::SetContextBudget>,
+) -> Response {
+    match state.store.session_usage(&id) {
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "session not found"),
+        Err(err) => return internal(err),
+        _ => {}
+    }
+    match state.store.set_context_budget(&id, request.requested) {
+        Ok(true) => session_usage(State(state), Path(id)).await,
+        Ok(false) => error(
+            StatusCode::CONFLICT,
+            "context_budget_unavailable",
+            "this runtime does not support automatic-compaction budgets",
         ),
         Err(err) => internal(err),
     }
@@ -385,6 +410,13 @@ async fn new_like_this(State(state): State<AppState>, Path(id): Path<String>) ->
 }
 
 async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: Option<String>) -> Response {
+    if !req.config.context_budget.is_inherit() && !state.hub.has_capability(&req.host_id, Capability::ContextBudget) {
+        return error(
+            StatusCode::CONFLICT,
+            "context_budget_unavailable",
+            "this host does not support automatic-compaction budgets",
+        );
+    }
     if !req.config.cache_retention.is_inherit() && !state.hub.has_capability(&req.host_id, Capability::CacheRetention) {
         return error(
             StatusCode::CONFLICT,
@@ -469,6 +501,9 @@ async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: O
         Err(err) => return internal(err),
     };
     let request_id = mcp.request_id();
+    if let Err(err) = state.store.initial_budget(&session_id, req.config.context_budget) {
+        return internal(err);
+    }
     if let Err(err) = state.store.initial_retention(&session_id, req.config.cache_retention) {
         return internal(err);
     }
@@ -878,6 +913,15 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
     };
+    if !session.config.context_budget.is_inherit()
+        && !state.hub.has_capability(&session.host_id, Capability::ContextBudget)
+    {
+        return error(
+            StatusCode::CONFLICT,
+            "context_budget_unavailable",
+            "this host does not support the requested automatic-compaction budget",
+        );
+    }
     if !session.config.cache_retention.is_inherit()
         && !state.hub.has_capability(&session.host_id, Capability::CacheRetention)
     {

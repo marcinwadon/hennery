@@ -13,6 +13,9 @@ state stays outside Git; public issues are separate approved projections.
    — product, topology, protocol principles, sessions, auth, hats, module
    boundaries, testing. Authoritative where subsystem specs disagree.
 2. Subsystem specs:
+   - [Automatic compaction budgets](specs/2026-11-03-context-budget.md) —
+     optional native runtime budgets, durable launch preferences and the
+     pinned ACP boundary for cache warming.
    - [Session usage and cache retention](specs/2026-11-02-session-usage.md) —
      durable runtime observations, partial family accounting, responsive Usage
      presentation and requested per-session Claude retention.

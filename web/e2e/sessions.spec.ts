@@ -207,6 +207,28 @@ for (const width of [1280, 390]) {
       expect(usage.session.tokens.total_tokens).toBe(100)
       expect(usage.session.reported_turns).toBe(1)
       expect(usage.session.cost.amount).toBe(1.25)
+      // Browser contract for a supported native-policy snapshot. The fake
+      // agent above is deliberately generic and does not claim native support.
+      const usagePath = `**/api/sessions/${encodeURIComponent(sessionId)}/usage`
+      const budgetPath = `**/api/sessions/${encodeURIComponent(sessionId)}/context-budget`
+      let requested = 'inherit'
+      const snapshot = () => ({ ...usage, budget: { supported: true, requested, attached_request: 'inherit' } })
+      await page.route(usagePath, route => route.fulfill({ json: snapshot() }))
+      await page.route(budgetPath, route => {
+        requested = route.request().postDataJSON().requested
+        return route.fulfill({ json: snapshot() })
+      })
+      try {
+        const budget = panel.getByRole('combobox', { name: 'Automatic compaction budget', exact: true })
+        await expect(budget).toBeVisible({ timeout: 10_000 })
+        await budget.selectOption('500k')
+        await expect(budget).toHaveValue('500k')
+        await expect(panel.getByText(/^Requests a compaction budget/)).toContainText('Takes effect on the next resume.')
+        expect(await budget.evaluate(el => el.getBoundingClientRect().height)).toBeGreaterThanOrEqual(44)
+      } finally {
+        await page.unroute(usagePath)
+        await page.unroute(budgetPath)
+      }
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
       await page.screenshot({ path: testInfo.outputPath(`usage-${width}.png`) })
       await page.getByRole('button', { name: 'Close session details', exact: true }).click()

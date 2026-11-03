@@ -9,6 +9,18 @@ function observation(id = 's', requested = 'inherit') {
 afterEach(() => vi.restoreAllMocks())
 
 describe('session usage observations', () => {
+  it('saving a context budget uses its own endpoint and coalesces competing policy writes', async () => {
+    let finish!: (response: Response) => void
+    const t = routed(call => call.method === 'GET' ? observation() : new Promise<Response>(done => { finish = done }))
+    const { result } = renderHook(() => useSessionUsage('s'), { wrapper: t.wrapper })
+    await waitFor(() => expect(result.current.data?.session_id).toBe('s'))
+    act(() => { void result.current.setBudget('500k'); void result.current.setRetention('1h') })
+    const calls = t.calls.filter(c => c.method === 'PATCH')
+    expect(calls).toHaveLength(1)
+    expect(calls[0].path).toBe('/api/sessions/s/context-budget')
+    await act(async () => finish(observation()))
+    expect(result.current.saving).toBe(false)
+  })
   it('an older read cannot undo a preference save and duplicate saves are coalesced', async () => {
     let finishRead!: (response: Response) => void
     let finishWrite!: (response: Response) => void

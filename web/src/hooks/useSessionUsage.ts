@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useClient } from '../app-client'
 import { messageOf } from '../api/errors'
-import type { CacheRetention, SessionUsage } from '../generated/protocol'
+import type { CacheRetention, ContextBudget, SessionUsage } from '../generated/protocol'
 
 /** A separate bounded read also observes child usage without another SSE stream.
  * Poll only the selected, visible session; retain the last observation on errors. */
@@ -38,7 +38,7 @@ export function useSessionUsage(id: string) {
     document.addEventListener('visibilitychange', visible)
     return () => { state.generation++; state.controller?.abort(); clearInterval(interval); document.removeEventListener('visibilitychange', visible) }
   }, [id, read])
-  const setRetention = useCallback(async (requested: CacheRetention) => {
+  const updatePolicy = useCallback(async (route: 'cache-retention' | 'context-budget', requested: CacheRetention | ContextBudget) => {
     const state = current.current
     if (state.writing || state.id !== id) return
     state.writing = true
@@ -47,11 +47,13 @@ export function useSessionUsage(id: string) {
     state.busy = true
     setSaving(true); setError(null)
     try {
-      const next = await client.request<SessionUsage>('PATCH', `${path}/cache-retention`, { requested })
+      const next = await client.request<SessionUsage>('PATCH', `${path}/${route}`, { requested })
       if (current.current === state && generation === state.generation) setData(next)
     } catch (e) { if (current.current === state && generation === state.generation) setError(messageOf(e)) }
     finally { if (current.current === state && generation === state.generation) { state.busy = false; state.writing = false; setSaving(false) } }
   }, [client, id, path])
-  return { data, error, saving, setRetention, refresh: read }
+  const setRetention = useCallback((requested: CacheRetention) => updatePolicy('cache-retention', requested), [updatePolicy])
+  const setBudget = useCallback((requested: ContextBudget) => updatePolicy('context-budget', requested), [updatePolicy])
+  return { data, error, saving, setRetention, setBudget, refresh: read }
 }
 export type SessionUsageState = ReturnType<typeof useSessionUsage>

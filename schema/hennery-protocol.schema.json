@@ -209,6 +209,31 @@
       ],
       "type": "object"
     },
+    "BudgetState": {
+      "properties": {
+        "attached_request": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContextBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested": {
+          "$ref": "#/$defs/ContextBudget"
+        },
+        "supported": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "requested"
+      ],
+      "type": "object"
+    },
     "CacheRetention": {
       "enum": [
         "inherit",
@@ -350,6 +375,11 @@
         {
           "const": "cache_retention",
           "description": "Per-session Claude cache-retention requests applied at attach.",
+          "type": "string"
+        },
+        {
+          "const": "context_budget",
+          "description": "Native automatic-compaction budgets applied at attachment.",
           "type": "string"
         },
         {
@@ -714,6 +744,9 @@
               "minimum": 0,
               "type": "integer"
             },
+            "context_budget": {
+              "$ref": "#/$defs/ContextBudget"
+            },
             "cwd": {
               "type": "string"
             },
@@ -884,6 +917,9 @@
               "minimum": 0,
               "type": "integer"
             },
+            "context_budget": {
+              "$ref": "#/$defs/ContextBudget"
+            },
             "cwd": {
               "type": "string"
             },
@@ -969,6 +1005,9 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "context_budget": {
+              "$ref": "#/$defs/ContextBudget"
             },
             "cwd": {
               "type": "string"
@@ -1468,6 +1507,17 @@
         }
       ],
       "description": "The value of one config option (ACP `session/set_config_option`): a\nselect's value id, or a boolean toggle's state."
+    },
+    "ContextBudget": {
+      "description": "A requested native automatic-compaction budget, not a billing limit.",
+      "enum": [
+        "inherit",
+        "100k",
+        "200k",
+        "500k",
+        "1m"
+      ],
+      "type": "string"
     },
     "ContextEntry": {
       "additionalProperties": false,
@@ -2925,6 +2975,17 @@
             "array",
             "null"
           ]
+        },
+        "context_budget": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContextBudget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host-owned launch acknowledgement, not effective provider readback."
         },
         "current_axes": {
           "additionalProperties": {
@@ -6068,6 +6129,9 @@
           "items": true,
           "type": "array"
         },
+        "context_budget": {
+          "$ref": "#/$defs/ContextBudget"
+        },
         "mode": {
           "type": [
             "string",
@@ -6102,6 +6166,9 @@
         },
         "cache_retention": {
           "$ref": "#/$defs/CacheRetention"
+        },
+        "context_budget": {
+          "$ref": "#/$defs/ContextBudget"
         },
         "mode": {
           "type": [
@@ -6461,6 +6528,14 @@
     },
     "SessionUsage": {
       "properties": {
+        "budget": {
+          "$ref": "#/$defs/BudgetState",
+          "default": {
+            "attached_request": null,
+            "requested": "inherit",
+            "supported": false
+          }
+        },
         "context": {
           "anyOf": [
             {
@@ -6511,6 +6586,18 @@
       "properties": {
         "requested": {
           "$ref": "#/$defs/CacheRetention"
+        }
+      },
+      "required": [
+        "requested"
+      ],
+      "type": "object"
+    },
+    "SetContextBudget": {
+      "additionalProperties": false,
+      "properties": {
+        "requested": {
+          "$ref": "#/$defs/ContextBudget"
         }
       },
       "required": [
@@ -6736,6 +6823,9 @@
         },
         "cache_retention": {
           "$ref": "#/$defs/CacheRetention"
+        },
+        "context_budget": {
+          "$ref": "#/$defs/ContextBudget"
         },
         "cwd": {
           "type": "string"

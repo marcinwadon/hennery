@@ -10,6 +10,7 @@ fn seed(store: &Store, id: &str, hat: &str) {
     let mut started = SessionBody::session_started("start", "agent-id");
     if let SessionBody::SessionStarted { indexed, .. } = &mut started {
         indexed.cache_retention = Some(CacheRetention::Inherit);
+        indexed.context_budget = Some(ContextBudget::Inherit);
     }
     store.ingest(id, 1, &started).unwrap();
 }
@@ -205,6 +206,48 @@ fn totals_and_retention_survive_restart_and_resume_carries_the_request() {
     };
     assert_eq!(config.cache_retention, CacheRetention::OneHour);
 }
+
+#[test]
+fn native_context_budget_is_deferred_durable_and_carried_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let store = Store::open(&db).unwrap();
+    seed(&store, "s", "hat");
+    assert!(store.set_context_budget("s", ContextBudget::Tokens500K).unwrap());
+    let state = store.session_usage("s").unwrap().unwrap();
+    assert!(state.budget.supported);
+    assert_eq!(state.budget.requested, ContextBudget::Tokens500K);
+    assert_eq!(state.budget.attached_request, Some(ContextBudget::Inherit));
+    assert_eq!(store.find_session("s").unwrap().unwrap().lifecycle, "active");
+    store
+        .ingest(
+            "s",
+            2,
+            &SessionBody::SessionParked {
+                reason: hennery_proto::frames::ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    drop(store);
+    let store = Store::open(&db).unwrap();
+    assert_eq!(
+        store.session_usage("s").unwrap().unwrap().budget.requested,
+        ContextBudget::Tokens500K
+    );
+    let ResumeRequest::Starting { config, .. } = store.request_resume("s", "hat").unwrap() else {
+        panic!("resume refused")
+    };
+    assert_eq!(config.context_budget, ContextBudget::Tokens500K);
+    let mut started = SessionBody::session_started("resumed", "agent-id");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut started {
+        indexed.context_budget = Some(ContextBudget::Tokens500K);
+    }
+    store.ingest("s", 3, &started).unwrap();
+    assert_eq!(
+        store.session_usage("s").unwrap().unwrap().budget.attached_request,
+        Some(ContextBudget::Tokens500K)
+    );
+}
 #[test]
 fn unsupported_and_deleted_sessions_do_not_accept_preferences_or_expose_usage() {
     let store = Store::open_in_memory().unwrap();
@@ -213,6 +256,8 @@ fn unsupported_and_deleted_sessions_do_not_accept_preferences_or_expose_usage() 
         .unwrap();
     store.ingest("old", 1, &SessionBody::session_started("r", "a")).unwrap();
     assert!(!store.set_cache_retention("old", CacheRetention::OneHour).unwrap());
+    assert!(!store.set_context_budget("old", ContextBudget::Tokens500K).unwrap());
+    assert!(store.set_context_budget("old", ContextBudget::Inherit).unwrap());
     seed(&store, "s", "hat");
     finish(&store, "s", "t", 2, Some(usage()), TurnOutcome::Completed);
     store
@@ -235,6 +280,7 @@ fn unsupported_and_deleted_sessions_do_not_accept_preferences_or_expose_usage() 
         .unwrap();
     assert!(store.session_usage("s").unwrap().is_none());
     assert!(!store.set_cache_retention("s", CacheRetention::FiveMinutes).unwrap());
+    assert!(!store.set_context_budget("s", ContextBudget::Tokens100K).unwrap());
 }
 #[test]
 fn family_aggregation_respects_hat_boundaries_and_does_not_count_missing_as_zero() {
