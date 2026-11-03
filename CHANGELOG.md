@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Expose external session management through the public HTTPS MCP endpoint,
+  with OAuth sign-in and explicit hat, host, workspace and session grants.
+- Offer 30 tools for session creation, prompting, transcript reads, lifecycle
+  control, ordinary forms, runtime configuration, queues, usage and images.
+  Metadata-only clients retain seven read tools; agent permission requests
+  still require approval in Hennery.
+- Preserve accepted commands across disconnects with durable request keys,
+  operation receipts, bounded queues and authorization checks at host handoff.
+- Upload images in bounded chunks and read them only through an authorized
+  session's transcript references. Support session renaming, pinning and
+  cloning reported settings into a fresh standalone session.
+- Show both Hennery and native agent session IDs and search conversations by
+  their native ID, with filters and richer session details available over MCP.
+- Configure automatic session parking in Settings: choose an idle timeout,
+  disable automatic parking, or inherit the host setting. Busy sessions,
+  unanswered questions and parking holds keep their existing protection.
+- Update the collector and agent hosts to use the shared parking preference.
+  External remote-client acceptance remains a separate deployment check;
+  automated HTTP, host, OAuth and browser coverage does not establish live
+  Claude Desktop compatibility.
+
 ## 0.4.0
 
 - Add Usage to session details, with a composer context meter, per-turn input,

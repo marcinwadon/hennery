@@ -149,6 +149,12 @@ published crate or treat a registry error as absence.
 
 ## One tagged run, one protected publisher
 
+Before tagging, synchronize the workspace and web package versions, exact
+internal dependency pins, lockfile, README install examples and the CLI's
+cargo-binstall `signer-identity` tag URL. Check them with
+`nix develop -c node --test packaging/binstall-policy.test.mjs`
+and `nix develop -c pnpm --dir web test src/lib/releaseVersions.test.ts`.
+
 The tag-only `release.yml` calls read-only reusable `packaging.yml`. Prepare
 requires successful main-push core CI for the exact signed commit, builds the UI
 and audits dependencies once. Native builders share their archives with image,

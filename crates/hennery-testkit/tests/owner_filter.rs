@@ -101,6 +101,11 @@ const SOURCES: &[(&str, &str, usize)] = &[
         5,
     ),
     (
+        "hennery-sessions/src/idle_parking.rs",
+        include_str!("../../hennery-sessions/src/idle_parking.rs"),
+        3,
+    ),
+    (
         "hennery-sessions/src/idle_hold.rs",
         include_str!("../../hennery-sessions/src/idle_hold.rs"),
         5,
