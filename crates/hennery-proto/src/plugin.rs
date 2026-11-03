@@ -9,6 +9,10 @@ use ts_rs::TS;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InputOrigin {
     Operator {},
+    ExternalClient {
+        client_id: String,
+        operation_id: String,
+    },
     PluginContext {
         request_id: String,
     },

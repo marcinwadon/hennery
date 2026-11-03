@@ -1,5 +1,5 @@
 //! External control identities are separate from operator and delegated sessions.
-//! This first slice exposes discovery/metadata only; it grants no agent execution.
+//! Metadata, transcript and session-control authority are separately granted.
 use crate::store::Store;
 use anyhow::{Result, ensure};
 use hennery_kernel::{
@@ -24,6 +24,10 @@ pub struct NewClient {
     #[serde(default)]
     pub read_metadata: bool,
     #[serde(default)]
+    pub read_transcript: bool,
+    #[serde(default)]
+    pub control_sessions: bool,
+    #[serde(default)]
     pub existing_sessions: bool,
     /// Credentials are finite-lived. Renewal/rotation is a later explicit action.
     pub expires_in_days: u32,
@@ -35,6 +39,8 @@ pub struct ClientRecord {
     pub hat_id: String,
     pub roots: Vec<RootGrant>,
     pub read_metadata: bool,
+    pub read_transcript: bool,
+    pub control_sessions: bool,
     pub existing_sessions: bool,
     pub revision: i64,
     pub expires_at: i64,
@@ -58,6 +64,7 @@ pub struct SessionMetadata {
     pub title: Option<String>,
     pub lifecycle: String,
     pub activity: Option<String>,
+    pub open_turn_id: Option<String>,
 }
 pub(crate) const TOKEN_PREFIX: &str = "hnry_external_";
 pub fn valid_token(token: &str) -> bool {
@@ -65,10 +72,10 @@ pub fn valid_token(token: &str) -> bool {
         .strip_prefix(TOKEN_PREFIX)
         .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
 }
-fn record(conn: &rusqlite::Connection, owner: &str, id: &str) -> Result<Option<ClientRecord>> {
+pub(crate) fn record(conn: &rusqlite::Connection, owner: &str, id: &str) -> Result<Option<ClientRecord>> {
     let row = conn
         .query_row(
-            "SELECT id,label,hat_id,read_metadata,existing_sessions,revision,expires_at,revoked_at IS NOT NULL
+            "SELECT id,label,hat_id,read_metadata,existing_sessions,revision,expires_at,revoked_at IS NOT NULL,read_transcript,control_sessions
         FROM external_clients WHERE owner_id = ?1 AND id = ?2",
             params![owner, id],
             |r| {
@@ -78,6 +85,8 @@ fn record(conn: &rusqlite::Connection, owner: &str, id: &str) -> Result<Option<C
                     hat_id: r.get(2)?,
                     roots: vec![],
                     read_metadata: r.get(3)?,
+                    read_transcript: r.get(8)?,
+                    control_sessions: r.get(9)?,
                     existing_sessions: r.get(4)?,
                     revision: r.get(5)?,
                     expires_at: r.get(6)?,
@@ -92,7 +101,7 @@ fn record(conn: &rusqlite::Connection, owner: &str, id: &str) -> Result<Option<C
         Ok(client)
     }).transpose()
 }
-fn live(conn: &rusqlite::Connection, owner: &str, identity: &ExternalIdentity) -> Result<bool> {
+pub(crate) fn live(conn: &rusqlite::Connection, owner: &str, identity: &ExternalIdentity) -> Result<bool> {
     if identity.owner != owner {
         return Ok(false);
     }
@@ -204,7 +213,7 @@ impl Store {
             (1..=50).contains(&limit) && after.len() <= 128 && id.is_none_or(|id| id.len() <= 128),
             "invalid_arguments"
         );
-        let mut stmt=conn.prepare("SELECT s.id,s.host_id,s.hat_id,s.agent,s.cwd,s.title,s.lifecycle,s.activity
+        let mut stmt=conn.prepare("SELECT s.id,s.host_id,s.hat_id,s.agent,s.cwd,s.title,s.lifecycle,s.activity,s.open_turn_id
           FROM sessions s JOIN external_clients c ON c.owner_id = s.owner_id AND c.id = ?2 AND c.hat_id=s.hat_id
           WHERE s.owner_id = ?1 AND s.lifecycle<>'deleted' AND s.id>?3 AND (?4 IS NULL OR s.id=?4)
           AND (c.existing_sessions=1 OR EXISTS(SELECT 1 FROM external_client_sessions b WHERE b.owner_id = s.owner_id AND b.client_id=c.id AND b.session_id=s.id))
@@ -225,6 +234,7 @@ impl Store {
                         title: r.get(5)?,
                         lifecycle: r.get(6)?,
                         activity: r.get(7)?,
+                        open_turn_id: r.get(8)?,
                     })
                 },
             )?
@@ -246,6 +256,10 @@ pub(crate) fn issue_in(
         "invalid_grant"
     );
     ensure!(!input.existing_sessions || input.read_metadata, "invalid_grant");
+    ensure!(
+        !(input.read_transcript || input.control_sessions) || input.read_metadata,
+        "invalid_grant"
+    );
     let allowed: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM hats h WHERE h.owner_id = ?1 AND h.id = ?2
           AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = h.owner_id AND p.hat_id = h.id))",
@@ -273,8 +287,8 @@ pub(crate) fn issue_in(
     let id = uuid::Uuid::now_v7().to_string();
     let token = format!("{TOKEN_PREFIX}{}", hex::encode(random_bytes::<32>()));
     let expires = unix_now() + i64::from(input.expires_in_days) * 86400;
-    tx.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at)
-          VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",params![owner,id,input.label.trim(),input.hat_id,sha256_hex(token.as_bytes()),input.read_metadata,input.existing_sessions,expires])?;
+    tx.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at,read_transcript,control_sessions)
+          VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10)",params![owner,id,input.label.trim(),input.hat_id,sha256_hex(token.as_bytes()),input.read_metadata,input.existing_sessions,expires,input.read_transcript,input.control_sessions])?;
     for root in &input.roots {
         tx.execute(
             "INSERT OR IGNORE INTO external_client_roots(owner_id,client_id,host_id,root) VALUES(?1,?2,?3,?4)",
@@ -328,6 +342,8 @@ mod tests {
                     root: "/project".into(),
                 }],
                 read_metadata: true,
+                read_transcript: false,
+                control_sessions: false,
                 existing_sessions: existing,
                 expires_in_days: 1,
             }

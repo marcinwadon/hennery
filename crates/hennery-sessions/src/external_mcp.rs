@@ -97,7 +97,7 @@ fn result(id: Value, value: Value) -> Response {
 }
 fn tools(identity: &ExternalIdentity) -> Vec<Value> {
     let mut tools = vec![
-        json!({"name":"hennery_capabilities","description":"Read this external client's scope and implemented read-only tools. Agent execution is not implemented by this slice.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
+        json!({"name":"hennery_capabilities","description":"Read this external client's effective scope, session-control capability and limits.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
         json!({"name":"host_list","description":"List only hosts explicitly granted to this external client.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}),
         json!({"name":"workspace_list","description":"List explicitly granted canonical roots, not arbitrary files or other projects.","inputSchema":{"type":"object","properties":{"host_id":{"type":"string"}},"required":["host_id"],"additionalProperties":false}}),
     ];
@@ -111,6 +111,7 @@ fn tools(identity: &ExternalIdentity) -> Vec<Value> {
         tool["outputSchema"] =
             json!({"type":"object","properties":{"data":{}},"required":["data"],"additionalProperties":false});
     }
+    tools.extend(crate::external_control::tools(identity));
     tools
 }
 #[derive(Deserialize)]
@@ -157,7 +158,7 @@ fn invoke(state: &AppState, identity: &ExternalIdentity, call: Call) -> anyhow::
         "hennery_capabilities" => {
             let _: std::collections::BTreeMap<String, Value> = arguments(call.arguments.clone())?;
             anyhow::ensure!(call.arguments == json!({}), "invalid_arguments");
-            json!({"client_id":identity.client.client_id,"hat_id":identity.client.hat_id,"revision":identity.client.revision,"expires_at":identity.client.expires_at,"existing_sessions":identity.client.existing_sessions,"read_metadata":identity.client.read_metadata,"execution":false,"max_page":50,"permissions":"operator_ui","source_policy":"server_resolved_per_hat_actual_acp"})
+            json!({"client_id":identity.client.client_id,"hat_id":identity.client.hat_id,"revision":identity.client.revision,"expires_at":identity.client.expires_at,"existing_sessions":identity.client.existing_sessions,"read_metadata":identity.client.read_metadata,"read_transcript":identity.client.read_transcript,"execution":identity.client.control_sessions,"max_page":50,"permissions":"operator_ui","source_policy":"server_resolved_per_hat_actual_acp"})
         }
         "host_list" => {
             anyhow::ensure!(call.arguments == json!({}), "invalid_arguments");
@@ -304,7 +305,7 @@ async fn endpoint(
             };
             result(
                 id,
-                json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"hennery-external","version":env!("CARGO_PKG_VERSION")},"instructions":"External read-only discovery. Agent execution is not available in this slice; permission requests stay in Hennery's operator UI."}),
+                json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"hennery-external","version":env!("CARGO_PKG_VERSION")},"instructions":"Scoped external session management. Use request_key for retry-safe mutations and operation_get/session_wait for outcomes. Conversation access and session control require separate consent; permission requests stay in Hennery's operator UI."}),
             )
         }
         Some("ping") => result(id, json!({})),
@@ -314,19 +315,37 @@ async fn endpoint(
                 Ok(v) => v,
                 Err(_) => return rpc(id, -32602, "invalid_arguments"),
             };
-            match invoke(&state, &identity, call) {
+            let outcome = if crate::external_control::is_control_tool(&call.name) {
+                crate::external_control::invoke(&state, &identity, &call.name, call.arguments).await
+            } else {
+                invoke(&state, &identity, call)
+            };
+            match outcome {
                 Ok(data) => result(
                     id,
                     json!({"content":[{"type":"text","text":serde_json::to_string(&data).expect("JSON value")}],"structuredContent":data,"isError":false}),
                 ),
                 Err(e) if e.to_string() == "external_unauthenticated" => crate::external_oauth::challenge(&state),
                 Err(e) if e.to_string() == "external_forbidden" => crate::external_oauth::insufficient_scope(&state),
+                Err(e) if e.to_string() == "external_control_forbidden" => crate::external_oauth::scope_challenge(
+                    &state,
+                    "hennery:discover hennery:sessions:read hennery:sessions:control",
+                ),
+                Err(e) if e.to_string() == "external_transcript_forbidden" => crate::external_oauth::scope_challenge(
+                    &state,
+                    "hennery:discover hennery:sessions:read hennery:sessions:transcript",
+                ),
                 Err(e) if e.to_string() == "unknown_tool" => rpc(id, -32602, "unknown_tool"),
                 Err(e) => {
                     let code = match e.to_string().as_str() {
                         "invalid_arguments" => "invalid_arguments",
                         "not_found" => "not_found",
                         "result_too_large" => "result_too_large",
+                        "invalid_request_key" => "invalid_request_key",
+                        "request_key_conflict" => "request_key_conflict",
+                        "operation_limit" => "operation_limit",
+                        "session_limit" => "session_limit",
+                        "resync_required" => "resync_required",
                         _ => return rpc(id, -32603, "internal_error"),
                     };
                     result(id, json!({"content":[{"type":"text","text":code}],"isError":true}))

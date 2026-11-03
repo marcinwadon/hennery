@@ -998,6 +998,16 @@ fn validate(item: &PluginActivityItem, epoch: &str) -> Result<()> {
             ensure!(source_refs.contains(source), "invalid provenance");
             match origin {
                 InputOrigin::Operator {} => {}
+                InputOrigin::ExternalClient {
+                    client_id,
+                    operation_id,
+                } => ensure!(
+                    !client_id.is_empty()
+                        && client_id.len() <= 256
+                        && !operation_id.is_empty()
+                        && operation_id.len() <= 256,
+                    "invalid external client evidence"
+                ),
                 InputOrigin::PluginContext { .. } => anyhow::bail!("injected context is not source material"),
                 InputOrigin::Parent {
                     session_id,

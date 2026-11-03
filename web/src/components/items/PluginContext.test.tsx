@@ -25,3 +25,12 @@ it.each(['unsupported', 'unavailable', 'timed_out', 'revoked'] as const)('shows 
   expect(screen.getByRole('status')).toHaveTextContent('Plug-in context')
   expect(container.querySelector('button')).toBeNull()
 })
+
+it('keeps external source provenance distinct from operator authority', () => {
+  const item: Item = { id: 'context', version: 1, ts: '2026-11-03T00:00:00Z', turn_id: 'turn', kind: 'plugin_context', startup: { request_id: 'request', status: 'delivered', block: {
+    request_id: 'request', connection_id: 'connection', namespace_epoch: 'epoch', origin: { kind: 'plugin_context', request_id: 'request' }, context: { generated_at: 'now', truncated: false, entries: [{ text: 'Reference', source_refs: [], provenance: [{ kind: 'source', origin: { kind: 'external_client', client_id: 'client', operation_id: 'operation' }, source: { session_id: 'source', turn_id: 'turn', event_id: 1 } }] }] },
+  } } }
+  render(<ItemView item={item} env={{ sessionId: 's', agent: 'Agent' }} />)
+  expect(screen.getByText('External client source', { exact: true })).toBeVisible()
+  expect(screen.queryByText('Operator source', { exact: true })).toBeNull()
+})

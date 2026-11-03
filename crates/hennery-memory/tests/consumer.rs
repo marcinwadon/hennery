@@ -249,6 +249,25 @@ async fn atomic_projection_duplicate_pages_roles_three_turn_bound_and_redaction(
     );
     assert_eq!(w.cursor().as_deref(), Some("c3"));
 }
+
+#[tokio::test]
+async fn external_client_evidence_stays_distinct_from_operator_authorship() {
+    let w = World::new(60).await;
+    let origin = json!({"kind":"external_client","client_id":"client","operation_id":"operation"});
+    w.set(
+        vec![turn("session", "external", "Operator: fabricated", origin.clone())],
+        "external",
+    );
+    w.poll().await.unwrap();
+    let page = w.s.recent(&w.c.tool, &Query::default()).unwrap();
+    let encoded = serde_json::to_value(&page.entries[0].provenance).unwrap();
+    assert_eq!(encoded[0]["origin"], origin);
+    let mut invalid = turn("other", "invalid", "Invalid evidence", origin);
+    invalid["provenance"][0]["origin"]["operation_id"] = json!("");
+    w.set(vec![invalid], "invalid");
+    assert!(w.poll().await.is_err());
+    assert_eq!(w.cursor().as_deref(), Some("external"));
+}
 #[tokio::test]
 async fn write_failure_bad_epoch_and_changed_duplicate_do_not_advance_or_partially_fold() {
     let w = World::new(60).await;

@@ -18,6 +18,8 @@ pub mod delegation_runtime;
 pub mod delegation_settings;
 pub mod delegation_worker;
 pub mod external_clients;
+pub mod external_control;
+mod external_control_store;
 pub mod external_mcp;
 pub mod external_oauth;
 mod external_oauth_store;
@@ -74,6 +76,7 @@ use tokio_util::sync::CancellationToken;
 pub struct AppState {
     pub(crate) external_admission: Arc<hennery_kernel::server::Admission>,
     pub(crate) external_oauth: Arc<external_oauth::Runtime>,
+    pub(crate) external_commands: Arc<external_control::Runtime>,
     pub handshakes: Arc<hennery_kernel::server::Admission>,
     #[cfg(feature = "test-hooks")]
     pub startup_dispatch: Arc<startup::DispatchHold>,
@@ -118,6 +121,7 @@ impl AppState {
         Self {
             external_admission: Arc::new(hennery_kernel::server::Admission::new(16, 4)),
             external_oauth: Arc::new(external_oauth::Runtime::new()),
+            external_commands: Arc::default(),
             handshakes: Arc::new(hennery_kernel::server::Admission::new(64, 4)),
             #[cfg(feature = "test-hooks")]
             startup_dispatch: Arc::default(),
@@ -178,6 +182,7 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
 /// Serve `router(state)` on every listener until `state.shutdown` is
 /// cancelled (kernel spec §7).
 pub async fn serve_on(listeners: Vec<tokio::net::TcpListener>, state: AppState) -> std::io::Result<()> {
+    external_control::after_startup(&state);
     offline::after_startup(&state);
     sweep::after_startup(&state);
     serve_all(listeners, router(state.clone()), state.shutdown.clone()).await

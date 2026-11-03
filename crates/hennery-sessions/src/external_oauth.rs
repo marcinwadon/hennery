@@ -1,7 +1,7 @@
 //! Incoming OAuth authorization server for external MCP, separate from outbound gateway OAuth.
 use crate::{
     AppState,
-    external_oauth_store::{Authorization, Consent, Metadata, SCOPE, TokenRequest, validate_metadata},
+    external_oauth_store::{Authorization, Consent, DEFAULT_SCOPE, Metadata, SCOPE, TokenRequest, validate_metadata},
 };
 use axum::{
     Json, Router,
@@ -62,7 +62,7 @@ pub(crate) fn challenge(state: &AppState) -> Response {
     let mut r = private(StatusCode::UNAUTHORIZED);
     let value = match location(state) {
         Some((issuer, _)) => format!(
-            "Bearer resource_metadata=\"{issuer}/.well-known/oauth-protected-resource/mcp/external/hennery\", scope=\"{SCOPE}\""
+            "Bearer resource_metadata=\"{issuer}/.well-known/oauth-protected-resource/mcp/external/hennery\", scope=\"{DEFAULT_SCOPE}\""
         ),
         None => "Bearer".into(),
     };
@@ -73,6 +73,9 @@ pub(crate) fn challenge(state: &AppState) -> Response {
     r
 }
 pub(crate) fn insufficient_scope(state: &AppState) -> Response {
+    scope_challenge(state, SCOPE)
+}
+pub(crate) fn scope_challenge(state: &AppState, scope: &str) -> Response {
     let mut response = challenge(state);
     *response.status_mut() = StatusCode::FORBIDDEN;
     let metadata = location(state)
@@ -83,7 +86,7 @@ pub(crate) fn insufficient_scope(state: &AppState) -> Response {
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
         header::HeaderValue::from_str(&format!(
-            "Bearer error=\"insufficient_scope\", scope=\"{SCOPE}\"{metadata}"
+            "Bearer error=\"insufficient_scope\", scope=\"{scope}\"{metadata}"
         ))
         .expect("validated public origin"),
     );
@@ -179,7 +182,7 @@ async fn resource_metadata(State(state): State<AppState>) -> Response {
         return unavailable();
     };
     private(Json(
-        json!({"resource":resource,"authorization_servers":[issuer],"scopes_supported":["hennery:discover","hennery:sessions:read"],"bearer_methods_supported":["header"],"resource_name":"Hennery external sessions"}),
+        json!({"resource":resource,"authorization_servers":[issuer],"scopes_supported":["hennery:discover","hennery:sessions:read","hennery:sessions:transcript","hennery:sessions:control"],"bearer_methods_supported":["header"],"resource_name":"Hennery external sessions"}),
     ))
 }
 async fn server_metadata(State(state): State<AppState>) -> Response {
@@ -187,7 +190,7 @@ async fn server_metadata(State(state): State<AppState>) -> Response {
         return unavailable();
     };
     private(Json(
-        json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/oauth/external/authorize"),"token_endpoint":format!("{issuer}/oauth/external/token"),"registration_endpoint":format!("{issuer}/oauth/external/register"),"revocation_endpoint":format!("{issuer}/oauth/external/revoke"),"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"scopes_supported":["hennery:discover","hennery:sessions:read","offline_access"],"client_id_metadata_document_supported":true,"authorization_response_iss_parameter_supported":true}),
+        json!({"issuer":issuer,"authorization_endpoint":format!("{issuer}/oauth/external/authorize"),"token_endpoint":format!("{issuer}/oauth/external/token"),"registration_endpoint":format!("{issuer}/oauth/external/register"),"revocation_endpoint":format!("{issuer}/oauth/external/revoke"),"response_types_supported":["code"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"scopes_supported":["hennery:discover","hennery:sessions:read","hennery:sessions:transcript","hennery:sessions:control","offline_access"],"client_id_metadata_document_supported":true,"authorization_response_iss_parameter_supported":true}),
     ))
 }
 async fn body(req: Request) -> Result<axum::body::Bytes, Box<Response>> {

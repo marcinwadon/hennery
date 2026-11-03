@@ -353,7 +353,7 @@ const NEVER_CONNECTED: &str = "the host has not connected since it was paired; o
      connected";
 
 async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<StartSessionRequest>) -> Response {
-    start_in_hat(state, req, None).await
+    start_in_hat(state, req, None, None).await
 }
 
 /// Copy only the last reported launch settings. Normal creation gives this
@@ -380,11 +380,17 @@ async fn new_like_this(State(state): State<AppState>, Path(id): Path<String>) ->
             config: source.config,
         },
         Some(source.hat_id),
+        None,
     )
     .await
 }
 
-async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: Option<String>) -> Response {
+pub(crate) async fn start_in_hat(
+    state: AppState,
+    req: StartSessionRequest,
+    expected_hat: Option<String>,
+    external: Option<crate::external_control::Command>,
+) -> Response {
     if !req.config.cache_retention.is_inherit() && !state.hub.has_capability(&req.host_id, Capability::CacheRetention) {
         return error(
             StatusCode::CONFLICT,
@@ -446,8 +452,11 @@ async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: O
         Ok(context) => context,
         Err(err) => return internal(err),
     };
-    let session_id = uuid::Uuid::now_v7().to_string();
-    let mcp = match state.store.create_session_with_mcp(
+    let session_id = external
+        .as_ref()
+        .map(|c| c.session_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    let mcp = match state.store.create_session_authorized(
         &session_id,
         &req.host_id,
         &req.agent,
@@ -455,6 +464,7 @@ async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: O
         &hat.hat_id,
         hat.rule_id.as_deref(),
         mcp_context,
+        external.as_ref(),
     ) {
         Ok(Some(mcp)) => mcp,
         // The hat resolved before its purge froze it (plan 9c decision 10c).
@@ -491,10 +501,16 @@ async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: O
     let undo = Undo::Start {
         session_id: session_id.clone(),
     };
-    match state
-        .hub
-        .request_with_undo(&req.host_id, &request_id, frame, START_TIMEOUT, undo)
-        .await
+    match crate::external_control::guarded_request(
+        &state,
+        external.as_ref(),
+        "start",
+        &request_id,
+        state
+            .hub
+            .request_with_undo(&req.host_id, &request_id, frame, START_TIMEOUT, undo),
+    )
+    .await
     {
         Ok(_) => match copied_config {
             Some(config) => (
@@ -873,6 +889,13 @@ async fn update_session(
 /// different one refuses the resume (409 `hat_mismatch`) until the session
 /// is re-assigned.
 async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    resume_authorized(state, id, None).await
+}
+pub(crate) async fn resume_authorized(
+    state: AppState,
+    id: String,
+    external: Option<crate::external_control::Command>,
+) -> Response {
     let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
@@ -928,10 +951,11 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         Ok(context) => context,
         Err(err) => return internal(err),
     };
-    let (agent_session_id, committed_seq, config, mcp) = match state.store.request_resume_with_mcp(
+    let (agent_session_id, committed_seq, config, mcp) = match state.store.request_resume_authorized(
         &id,
         &hat.hat_id,
         mcp_context,
+        external.as_ref(),
     ) {
         Ok(ResumeRequest::Starting {
             events,
@@ -993,10 +1017,16 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         mcp: mcp.frame(),
     };
     let undo = Undo::Start { session_id: id.clone() };
-    match state
-        .hub
-        .request_with_undo(&session.host_id, &request_id, frame, START_TIMEOUT, undo)
-        .await
+    match crate::external_control::guarded_request(
+        &state,
+        external.as_ref(),
+        "resume",
+        &request_id,
+        state
+            .hub
+            .request_with_undo(&session.host_id, &request_id, frame, START_TIMEOUT, undo),
+    )
+    .await
     {
         Ok(_) => lifecycle_response(&state, &id),
         // Still `starting`: the next handshake reconciles it (ACP core §3.4).
@@ -1022,6 +1052,14 @@ async fn prompt(
     State(state): State<AppState>,
     Path(id): Path<String>,
     ApiJson(req): ApiJson<PromptRequest>,
+) -> Response {
+    prompt_authorized(state, id, req, None).await
+}
+pub(crate) async fn prompt_authorized(
+    state: AppState,
+    id: String,
+    req: PromptRequest,
+    external: Option<crate::external_control::Command>,
 ) -> Response {
     let mut checked = match content::check(req.content) {
         Ok(checked) => checked,
@@ -1087,16 +1125,19 @@ async fn prompt(
         }
     }
     match state.store.prompt_must_queue(&id) {
-        Ok(true) => return accept_queued_prompt(&state, &id, &checked, key.as_ref()),
+        Ok(true) => return external_queue_or_operator(&state, &id, &checked, key.as_ref(), external.as_ref()),
         Ok(false) => {}
         Err(err) => return internal(err),
     }
     if let Err(err) = state.store.save_images(&checked.images) {
         return internal(err);
     }
-    let turn_id = uuid::Uuid::now_v7().to_string();
+    let turn_id = external
+        .as_ref()
+        .and_then(|c| c.turn_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     let Some(_admission) = state.store.reserve_prompt(&id) else {
-        return accept_queued_prompt(&state, &id, &checked, key.as_ref());
+        return external_queue_or_operator(&state, &id, &checked, key.as_ref(), external.as_ref());
     };
     let request_id = uuid::Uuid::now_v7().to_string();
     let mut startup = state
@@ -1110,10 +1151,12 @@ async fn prompt(
         .await;
     match state
         .store
-        .open_prompt_with_startup_and_key(&id, &turn_id, &checked, &mut startup, key.as_ref())
+        .open_prompt_authorized(&id, &turn_id, &checked, &mut startup, key.as_ref(), external.as_ref())
     {
         Ok(PromptAdmission::Opened) => {}
-        Ok(PromptAdmission::MustQueue) => return accept_queued_prompt(&state, &id, &checked, key.as_ref()),
+        Ok(PromptAdmission::MustQueue) => {
+            return external_queue_or_operator(&state, &id, &checked, key.as_ref(), external.as_ref());
+        }
         Ok(PromptAdmission::Existing(receipt)) => return accepted_prompt_receipt(receipt),
         Err(err) => return queue_error(err),
     }
@@ -1129,10 +1172,16 @@ async fn prompt(
         session_id: id.clone(),
         turn_id: turn_id.clone(),
     };
-    match state
-        .hub
-        .request_with_undo(&session.host_id, &request_id, frame, PROMPT_TIMEOUT, undo)
-        .await
+    match crate::external_control::guarded_request(
+        &state,
+        external.as_ref(),
+        "prompt",
+        &request_id,
+        state
+            .hub
+            .request_with_undo(&session.host_id, &request_id, frame, PROMPT_TIMEOUT, undo),
+    )
+    .await
     {
         Ok(_) => (StatusCode::ACCEPTED, Json(PromptResponse { turn_id })).into_response(),
         // Unknown delivery keeps the turn open; the outbox resolves it.
@@ -1149,6 +1198,19 @@ async fn prompt(
     }
 }
 
+fn external_queue_or_operator(
+    state: &AppState,
+    id: &str,
+    checked: &content::Checked,
+    key: Option<&PromptRequestKey>,
+    external: Option<&crate::external_control::Command>,
+) -> Response {
+    if external.is_some() {
+        (StatusCode::ACCEPTED, Json(serde_json::json!({"external_queued":true}))).into_response()
+    } else {
+        accept_queued_prompt(state, id, checked, key)
+    }
+}
 fn queue_error(err: anyhow::Error) -> Response {
     match err.to_string().as_str() {
         "host_revoked" => error(
@@ -1316,11 +1378,39 @@ async fn attachment_usage(State(state): State<AppState>) -> Response {
 /// turn and sending the cancel: the host then answers `not_running`, and
 /// the stored outcome is the answer.
 async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    cancel_authorized(state, id, None).await
+}
+pub(crate) async fn cancel_authorized(
+    state: AppState,
+    id: String,
+    external: Option<crate::external_control::Command>,
+) -> Response {
     let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
     };
+    if let Some(command) = external.as_ref()
+        && command.turn_id.as_ref() != session.open_turn_id.as_ref()
+        && let Some(turn) = command.turn_id.as_deref()
+    {
+        return match state.store.external_turn_outcome(command, turn) {
+            Ok(Some(outcome)) => (
+                StatusCode::ACCEPTED,
+                Json(CancelResponse {
+                    turn_id: turn.into(),
+                    outcome,
+                }),
+            )
+                .into_response(),
+            Ok(None) => error(
+                StatusCode::CONFLICT,
+                "turn_changed",
+                "the requested turn is no longer running",
+            ),
+            Err(e) => internal(e),
+        };
+    }
     if session.lifecycle != "active" || !state.hub.is_ready(&session.host_id) {
         return error(StatusCode::CONFLICT, "not_attached", "the session is not attached");
     }
@@ -1333,10 +1423,16 @@ async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         session_id: id.clone(),
         turn_id: turn_id.clone(),
     };
-    match state
-        .hub
-        .request_for_turn(&session.host_id, &request_id, &id, &turn_id, frame, CANCEL_TIMEOUT)
-        .await
+    match crate::external_control::guarded_request(
+        &state,
+        external.as_ref(),
+        "cancel",
+        &request_id,
+        state
+            .hub
+            .request_for_turn(&session.host_id, &request_id, &id, &turn_id, frame, CANCEL_TIMEOUT),
+    )
+    .await
     {
         Ok(SessionBody::TurnEnded { turn_id, outcome, .. }) => {
             (StatusCode::ACCEPTED, Json(CancelResponse { turn_id, outcome })).into_response()
@@ -1460,8 +1556,13 @@ fn lifecycle_response(state: &AppState, id: &str) -> Response {
 
 /// Close collector-side: the session has no adapter the collector can
 /// reach (ACP core §4.8).
-fn close_unattached(state: &AppState, id: &str) -> Response {
-    match state.store.close_now(id) {
+fn close_unattached_authorized(
+    state: &AppState,
+    id: &str,
+    external: Option<&crate::external_control::Command>,
+    judged: &Unattached,
+) -> Response {
+    match state.store.close_now_authorized(id, external, Some(judged)) {
         Ok(events) => {
             for event in events {
                 state.hub.publish(event);
@@ -1477,6 +1578,13 @@ fn close_unattached(state: &AppState, id: &str) -> Response {
 /// that overtakes the park ends the actor, whose `not_attached` answers
 /// 409 and leaves the session closed.
 async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    park_authorized(state, id, None).await
+}
+pub(crate) async fn park_authorized(
+    state: AppState,
+    id: String,
+    external: Option<crate::external_control::Command>,
+) -> Response {
     let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
@@ -1493,7 +1601,7 @@ async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response
             "this host cannot park sessions; close the session instead",
         );
     }
-    let park_event = match state.store.record_park_request(&id) {
+    let park_event = match state.store.record_park_authorized(&id, external.as_ref()) {
         Ok(event) => event,
         Err(err) => return internal(err),
     };
@@ -1504,10 +1612,16 @@ async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response
         request_id: request_id.clone(),
         session_id: id.clone(),
     };
-    match state
-        .hub
-        .request_for_session(&session.host_id, &request_id, &id, frame, TEARDOWN_TIMEOUT)
-        .await
+    match crate::external_control::guarded_request(
+        &state,
+        external.as_ref(),
+        "park",
+        &request_id,
+        state
+            .hub
+            .request_for_session(&session.host_id, &request_id, &id, frame, TEARDOWN_TIMEOUT),
+    )
+    .await
     {
         Ok(_) => lifecycle_response(&state, &id),
         Err(err) => {
@@ -1540,6 +1654,13 @@ pub(crate) enum Closing {
 /// collector-side here. A close whose delivery is unknown stays requested
 /// and is re-sent after the host's next handshake.
 pub(crate) async fn close_through_host(state: &AppState, session: &SessionRow) -> Closing {
+    close_through_host_authorized(state, session, None).await
+}
+async fn close_through_host_authorized(
+    state: &AppState,
+    session: &SessionRow,
+    external: Option<&crate::external_control::Command>,
+) -> Closing {
     let judged = Unattached {
         lifecycle: session.lifecycle.clone(),
         presumed_parked: session.presumed_parked,
@@ -1558,7 +1679,7 @@ pub(crate) async fn close_through_host(state: &AppState, session: &SessionRow) -
         _ => return Closing::Unattached(judged),
     }
     let id = &session.id;
-    match state.store.record_close_request(id) {
+    match state.store.record_close_authorized(id, external) {
         Ok(event) => state.hub.publish(event),
         Err(err) => return Closing::Answer(internal(err)),
     }
@@ -1567,10 +1688,16 @@ pub(crate) async fn close_through_host(state: &AppState, session: &SessionRow) -
         request_id: request_id.clone(),
         session_id: id.clone(),
     };
-    match state
-        .hub
-        .request_for_session(&session.host_id, &request_id, id, frame, TEARDOWN_TIMEOUT)
-        .await
+    match crate::external_control::guarded_request(
+        state,
+        external,
+        "close",
+        &request_id,
+        state
+            .hub
+            .request_for_session(&session.host_id, &request_id, id, frame, TEARDOWN_TIMEOUT),
+    )
+    .await
     {
         // Only `session_closed` answers a close. A `session_parked` that
         // overtakes it (an idle reap or adapter exit) does not: ingest
@@ -1591,14 +1718,21 @@ pub(crate) async fn close_through_host(state: &AppState, session: &SessionRow) -
 /// Close: attached sessions are closed by their host (`session_closed`);
 /// anything else is closed immediately.
 async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    close_authorized(state, id, None).await
+}
+pub(crate) async fn close_authorized(
+    state: AppState,
+    id: String,
+    external: Option<crate::external_control::Command>,
+) -> Response {
     let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
     };
-    match close_through_host(&state, &session).await {
+    match close_through_host_authorized(&state, &session, external.as_ref()).await {
         Closing::Closed => lifecycle_response(&state, &id),
-        Closing::Unattached(_) => close_unattached(&state, &id),
+        Closing::Unattached(judged) => close_unattached_authorized(&state, &id, external.as_ref(), &judged),
         Closing::Answer(response) => response,
     }
 }

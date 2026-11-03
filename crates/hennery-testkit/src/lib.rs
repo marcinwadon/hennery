@@ -117,6 +117,9 @@ pub struct FakeScript {
     /// would reach `adapter_exited`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_log: Option<String>,
+    /// Also record actual prompt admissions in `session_log`, for retry probes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub log_prompts: bool,
     /// Apply switches but answer them with an empty `configOptions` list (a
     /// read-back the host cannot use).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -331,6 +334,7 @@ impl Default for FakeScript {
             prompt_sets_mode: None,
             config_log: None,
             session_log: None,
+            log_prompts: false,
             empty_config_read_back: false,
             hang_config: false,
             slow_model_switch_ms: None,

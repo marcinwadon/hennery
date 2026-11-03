@@ -450,6 +450,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let forms = forms.clone();
                 let servers = servers.clone();
                 async move |req: PromptRequest, responder, cx| {
+                    if script.log_prompts {
+                        log_session(&script, "session/prompt", &req);
+                    }
                     if script.echo_prompt {
                         cx.send_notification(chunk(
                             &req.session_id,

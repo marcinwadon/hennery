@@ -12,6 +12,7 @@ interface Pending {
 interface Grant {
   client_id: string; label: string; hat_id: string; roots: { host_id: string; root: string }[]
   read_metadata: boolean; existing_sessions: boolean; expires_at: number; revoked: boolean
+  read_transcript?: boolean; control_sessions?: boolean
 }
 function callbackHost(uri: string): string { try { return new URL(uri).host } catch { return 'Invalid callback' } }
 
@@ -26,6 +27,8 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
   const [host, setHost] = useState('')
   const [root, setRoot] = useState('')
   const [metadata, setMetadata] = useState(false)
+  const [transcript, setTranscript] = useState(false)
+  const [control, setControl] = useState(false)
   const [existing, setExisting] = useState(false)
   const [days, setDays] = useState(7)
   const [error, setError] = useState('')
@@ -37,7 +40,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
     const epoch = ++generation.current
     const abort = new AbortController()
     locked.current = null
-    setBusy(false); setPending(null); setGrants([]); setAfter(null); setError(''); setHat(''); setHost(''); setRoot(''); setExisting(false); setMetadata(false); setDays(7)
+    setBusy(false); setPending(null); setGrants([]); setAfter(null); setError(''); setHat(''); setHost(''); setRoot(''); setExisting(false); setMetadata(false); setTranscript(false); setControl(false); setDays(7)
     const operation = consent
       ? client.request<Pending>('GET', '/api/external-oauth/requests/' + encodeURIComponent(requestId), undefined, { signal: abort.signal }).then(p => {
         if (abort.signal.aborted || epoch !== generation.current) return
@@ -57,6 +60,8 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
       const result = await client.request<{ redirect_uri: string }>('POST', '/api/external-oauth/consent', {
         request_id: requestId, allow, hat_id: hat, roots: [{ host_id: host, root }],
         read_metadata: metadata, existing_sessions: existing && metadata, expires_in_days: days,
+        ...(transcript && metadata ? { read_transcript: true } : {}),
+        ...(control && metadata ? { control_sessions: true } : {}),
       }, { signal: controller.signal })
       if (!controller.signal.aborted && epoch === generation.current) window.location.assign(result.redirect_uri)
     } catch (err) { if (!controller.signal.aborted && epoch === generation.current) setError(messageOf(err)) }
@@ -90,7 +95,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
   return <main className="auth" style={{ alignItems: 'flex-start', overflowY: 'auto', minHeight: 0, flex: 1 }}><section className="auth-card" aria-label="External MCP access" style={{ overflowWrap: 'anywhere' }}>
     <div className="brand-name">hennery</div>
     <h1>{consent ? 'Connect an external MCP client' : 'External MCP clients'}</h1>
-    <p>Permissions requested by agents still require your approval in Hennery. This version shares discovery and session metadata only; it cannot execute agents.</p>
+    <p>Choose whether this client may inspect sessions, read conversations, or create and control agents within the selected project. Permissions requested by agents still require your approval in Hennery.</p>
     {error && <p role="alert">{error}</p>}
     {consent && !pending && !error && <p role="status">Loading request…</p>}
     {consent && pending && pending.request.request_id === requestId && <>
@@ -106,9 +111,12 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
         <label className="field"><span className="field-label">Host</span><select aria-label="Host" required disabled={busy} value={host} onChange={e => setHost(e.target.value)}><option value="">Choose a host</option>{pending.hosts.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}</select></label>
         <label className="field"><span className="field-label">Workspace root</span><input className="text-input" required disabled={busy} value={root} onChange={e => setRoot(e.target.value)} placeholder="/workspace/project" /></label>
         <label className="field"><span className="field-label">Access expires in</span><select aria-label="Access expires in" disabled={busy} value={days} onChange={e => setDays(Number(e.target.value))}>{[1, 7, 30, 90].map(d => <option key={d} value={d}>{d} days</option>)}</select></label>
-        <label className="field"><span><input type="checkbox" checked={metadata} disabled={busy || !pending.request.scope.split(' ').includes('hennery:sessions:read')} onChange={e => { setMetadata(e.target.checked); if (!e.target.checked) setExisting(false) }} /> Read session metadata</span></label>
+        <label className="field"><span><input type="checkbox" checked={metadata} disabled={busy || !pending.request.scope.split(' ').includes('hennery:sessions:read')} onChange={e => { setMetadata(e.target.checked); if (!e.target.checked) { setExisting(false); setTranscript(false); setControl(false) } }} /> Read session metadata</span></label>
+        <label className="field"><span><input type="checkbox" checked={transcript} disabled={busy || !metadata || !pending.request.scope.split(' ').includes('hennery:sessions:transcript')} onChange={e => setTranscript(e.target.checked)} /> Read session conversations</span></label>
+        <label className="field"><span><input type="checkbox" checked={control} disabled={busy || !metadata || !pending.request.scope.split(' ').includes('hennery:sessions:control')} onChange={e => setControl(e.target.checked)} /> Create, prompt and control sessions</span></label>
+        {control && <p>Session control includes choosing the agent’s model and permission mode. Agent actions follow that mode; any permission requests still appear in Hennery.</p>}
         <label className="field"><span><input type="checkbox" checked={existing} disabled={busy || !metadata} onChange={e => setExisting(e.target.checked)} /> Also allow existing sessions within this hat, host and root</span></label>
-        <p>By default, access is limited to sessions created by this client. Session creation is not yet implemented, so that selection currently returns no sessions.</p>
+        <p>By default, access is limited to sessions created by this client. Including existing sessions also allows the selected read and control actions on those sessions.</p>
         <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => void decide(false)}>Deny</button>
         <button type="submit" className="btn btn-primary" disabled={busy || !hat || !host || !root.startsWith('/')}>Allow selected access</button>
       </form>
@@ -117,6 +125,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
       <h2><bdi>{g.label}</bdi></h2><p>Hat: <bdi>{g.hat_id}</bdi></p>
       {g.roots.map(r => <p key={r.host_id + r.root}><bdi>{r.host_id}: {r.root}</bdi></p>)}
       <p>{g.existing_sessions ? 'Existing sessions included' : 'Created by this client only'}; {g.read_metadata ? 'metadata enabled' : 'discovery only'}.</p>
+      <p>{g.read_transcript ? 'Conversation access enabled' : 'No conversation access'}; {g.control_sessions ? 'session control enabled' : 'no session control'}.</p>
       <p>Expires: {new Date(g.expires_at * 1000).toLocaleString()}</p>
       {g.revoked ? <p>Revoked</p> : <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => void revoke(g.client_id)}>Revoke access to {g.label}</button>}
     </li>)}</ul>}

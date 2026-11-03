@@ -808,10 +808,11 @@ impl Hosts {
     }
 }
 
-/// Resolve placement in the caller's mutation transaction. Delegated allocation
-/// and dispatch use this rather than retaining a preflight path-rule decision.
+/// Resolve placement under the caller's coordinated database gate, including
+/// mutation transactions. Allocation, dispatch and external host handoff use
+/// this rather than retaining a preflight path-rule decision.
 pub fn session_hat_in(
-    conn: &rusqlite::Transaction<'_>,
+    conn: &rusqlite::Connection,
     owner: &str,
     host_id: &str,
     path: &str,

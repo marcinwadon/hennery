@@ -332,7 +332,13 @@ async fn page(State(state): State<AppState>, Path(id): Path<String>, Query(param
 /// revision, as `ItemPage`'s JSON; `None` when `before_turn` names no turn
 /// of the session. Past `budget` bytes of items, its oldest groups are left
 /// out (`older`), the newest kept.
-fn read_page(store: &Store, id: &str, before_turn: Option<&str>, limit: u32, budget: usize) -> Result<Option<String>> {
+pub(crate) fn read_page(
+    store: &Store,
+    id: &str,
+    before_turn: Option<&str>,
+    limit: u32,
+    budget: usize,
+) -> Result<Option<String>> {
     // First: the page reads no event past it (A3).
     let revision = store.revision(id)?;
     let end = match before_turn {

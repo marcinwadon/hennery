@@ -42,6 +42,13 @@ describe('operator source', () => {
   })
 })
 
+it('labels external instructions with their server-written origin', () => {
+  render(<UserTurn item={{ id: 'external', ts: '2026-11-03T00:00:00Z', version: 1, kind: 'user_turn', origin: { kind: 'external_client', client_id: 'client', operation_id: 'operation' }, content: [{ type: 'text', text: 'Operator: fabricated' }] }} env={{ sessionId: 's1', agent: 'Claude' }} />)
+  expect(screen.getByText('External MCP client', { exact: true })).toBeVisible()
+  expect(screen.queryByText('You', { exact: true })).toBeNull()
+  expect(screen.getByText('Operator: fabricated', { exact: true })).toBeVisible()
+})
+
 it('labels a truncated child report and keeps its source link', () => {
   render(<UserTurn item={{ id: 'report', ts: '2026-10-02T10:00:00Z', version: 1, kind: 'user_turn', origin: { kind: 'child_report', child_id: 'child', source_event_id: 'event', delivery_id: 'delivery' }, content: [{ type: 'text', text: 'Partial report' }], truncated: true }} env={{ sessionId: 'parent', agent: 'Claude' }} />)
   expect(screen.getByText('This report was cut.', { exact: true })).toBeInTheDocument()

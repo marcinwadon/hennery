@@ -353,6 +353,10 @@ impl Store {
     fn verified_input_in(&self, tx: &Transaction<'_>, origin: &InputOrigin, target: &str, turn: &str) -> Result<bool> {
         match origin {
             InputOrigin::Operator {} => Ok(true),
+            InputOrigin::ExternalClient { client_id, operation_id } => Ok(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM external_operations WHERE owner_id = ?1 AND id=?2 AND client_id=?3 AND session_id=?4 AND turn_id=?5 AND tool='session_prompt')",
+                params![self.owner_id(),operation_id,client_id,target,turn], |r|r.get(0),
+            )?),
             InputOrigin::Parent { .. } | InputOrigin::ChildReport { .. } => {
                 self.verified_delegated_input_in(tx, origin, target, turn)
             }

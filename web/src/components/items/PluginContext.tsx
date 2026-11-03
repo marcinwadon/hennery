@@ -20,7 +20,7 @@ export default function PluginContext({ item }: { item: ItemOf<'plugin_context'>
             {entry.provenance.map((source, j) => <li key={j}>
               {source.kind === 'unverified' || source.origin.kind === 'plugin_context'
                 ? 'Unverified source'
-                : <><span>{source.origin.kind === 'operator' ? 'Operator source' : source.origin.kind === 'parent' ? 'Parent source' : 'Child report source'}</span><pre>{JSON.stringify(source)}</pre></>}
+                : <><span>{source.origin.kind === 'operator' ? 'Operator source' : source.origin.kind === 'external_client' ? 'External client source' : source.origin.kind === 'parent' ? 'Parent source' : 'Child report source'}</span><pre>{JSON.stringify(source)}</pre></>}
             </li>)}
           </ul>
         </div>

@@ -475,6 +475,7 @@ END;",
      CREATE INDEX turns_usage_state ON turns(owner_id,session_id,state);",
     include_str!("external_clients.sql"),
     include_str!("external_oauth.sql"),
+    include_str!("external_control.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -2219,9 +2220,27 @@ impl Store {
         rule_id: Option<&str>,
         mcp: McpContext,
     ) -> Result<Option<McpGiven>> {
+        self.create_session_authorized(id, host_id, agent, cwd, hat_id, rule_id, mcp, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_session_authorized(
+        &self,
+        id: &str,
+        host_id: &str,
+        agent: &str,
+        cwd: &str,
+        hat_id: &str,
+        rule_id: Option<&str>,
+        mcp: McpContext,
+        external: Option<&crate::external_control::Command>,
+    ) -> Result<Option<McpGiven>> {
         let ts = now();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(command) = external {
+            self.external_guard_in(&tx, command, Some((host_id, cwd, hat_id)))?;
+        }
         let created = tx.execute(
             "INSERT INTO sessions(id, host_id, agent, cwd, hat_id, hat_rule_id, lifecycle, created_at, last_event_at,
                                   owner_id)
@@ -2234,6 +2253,13 @@ impl Store {
         }
         // A fresh id had no token before this one: nothing to cut.
         let (given, _superseded) = self.deliver_in(&tx, id, host_id, hat_id, mcp, &ts)?;
+        if let Some(command) = external {
+            tx.execute(
+                "INSERT INTO external_client_sessions(owner_id,client_id,session_id) VALUES(?1,?2,?3)",
+                params![self.owner_id(), command.client_id, id],
+            )?;
+            self.external_attach_in(&tx, command)?;
+        }
         tx.commit()?;
         Ok(Some(given))
     }
@@ -2907,7 +2933,27 @@ impl Store {
         startup: &mut Option<hennery_proto::plugin::StartupRecord>,
         key: Option<&crate::prompt_receipts::PromptRequestKey>,
     ) -> Result<crate::prompt_receipts::PromptAdmission> {
-        self.open_turn_with_startup_and_key(session_id, turn_id, &prompt.stored_json(), &prompt.images, startup, key)
+        self.open_prompt_authorized(session_id, turn_id, prompt, startup, key, None)
+    }
+
+    pub(crate) fn open_prompt_authorized(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        prompt: &Checked,
+        startup: &mut Option<hennery_proto::plugin::StartupRecord>,
+        key: Option<&crate::prompt_receipts::PromptRequestKey>,
+        external: Option<&crate::external_control::Command>,
+    ) -> Result<crate::prompt_receipts::PromptAdmission> {
+        self.open_turn_with_startup_and_key(
+            session_id,
+            turn_id,
+            &prompt.stored_json(),
+            &prompt.images,
+            startup,
+            key,
+            external,
+        )
     }
 
     fn open_turn_with(&self, session_id: &str, turn_id: &str, content: &[Value], images: &[Image]) -> Result<bool> {
@@ -2922,13 +2968,14 @@ impl Store {
         images: &[Image],
         startup: &mut Option<hennery_proto::plugin::StartupRecord>,
     ) -> Result<bool> {
-        match self.open_turn_with_startup_and_key(session_id, turn_id, content, images, startup, None)? {
+        match self.open_turn_with_startup_and_key(session_id, turn_id, content, images, startup, None, None)? {
             crate::prompt_receipts::PromptAdmission::Opened => Ok(true),
             crate::prompt_receipts::PromptAdmission::MustQueue => Ok(false),
             crate::prompt_receipts::PromptAdmission::Existing(_) => anyhow::bail!("unexpected keyed receipt"),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_turn_with_startup_and_key(
         &self,
         session_id: &str,
@@ -2937,9 +2984,13 @@ impl Store {
         images: &[Image],
         startup: &mut Option<hennery_proto::plugin::StartupRecord>,
         key: Option<&crate::prompt_receipts::PromptRequestKey>,
+        external: Option<&crate::external_control::Command>,
     ) -> Result<crate::prompt_receipts::PromptAdmission> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(command) = external {
+            self.external_guard_in(&tx, command, None)?;
+        }
         if let Some(receipt) = crate::prompt_receipts::lookup_in(&tx, &self.owner, session_id, key)? {
             return Ok(crate::prompt_receipts::PromptAdmission::Existing(receipt));
         }
@@ -2967,8 +3018,9 @@ impl Store {
             }
             let ts = now();
             tx.execute(
-                "INSERT INTO turns(turn_id, session_id, content, created_at, owner_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![turn_id, session_id, serde_json::to_string(&content)?, ts, self.owner],
+                "INSERT INTO turns(turn_id, session_id, content, created_at, owner_id,input_origin) VALUES (?1, ?2, ?3, ?4, ?5,?6)",
+                params![turn_id, session_id, serde_json::to_string(&content)?, ts, self.owner,
+                    serde_json::to_string(&external.map(crate::external_control::Command::origin).unwrap_or(hennery_proto::plugin::InputOrigin::Operator{}))?],
             )?;
             for image in images {
                 // The row and its turn's link (`link_turn_attachments`) go in
@@ -2997,6 +3049,14 @@ impl Store {
                     turn_id: turn_id.into(),
                 },
             )?;
+            // A preceding auto-resume handoff is not evidence that this
+            // prompt was sent. Only the final synchronous handoff sets it.
+            if let Some(command) = external {
+                tx.execute(
+                    "UPDATE external_operations SET request_id=NULL WHERE owner_id = ?1 AND id=?2",
+                    params![self.owner_id(), command.operation_id],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(if changed == 1 {
@@ -3512,9 +3572,29 @@ impl Store {
 
     /// Record an operator park before `park_session` is sent.
     pub fn record_park_request(&self, session_id: &str) -> Result<EventDto> {
+        self.record_park_authorized(session_id, None)
+    }
+    pub(crate) fn record_park_authorized(
+        &self,
+        session_id: &str,
+        external: Option<&crate::external_control::Command>,
+    ) -> Result<EventDto> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let event = collector_event(&tx, &self.owner, session_id, "operator_parked", json!({}), &now())?;
+        if let Some(command) = external {
+            self.external_guard_in(&tx, command, None)?;
+        }
+        let event = collector_event(
+            &tx,
+            &self.owner,
+            session_id,
+            "operator_parked",
+            external.map_or_else(|| json!({}), |c| json!({"source":c.origin()})),
+            &now(),
+        )?;
+        if let Some(command) = external {
+            self.external_intent_in(&tx, command, event.event_id)?;
+        }
         tx.execute(
             "UPDATE sessions SET prompt_queue_held=1 WHERE owner_id = ?1 AND id=?2 AND lifecycle<>'deleted'",
             params![self.owner_id(), session_id],
@@ -3539,13 +3619,33 @@ impl Store {
     /// confirms, the next handshake sends `close_session` again. For a
     /// tombstone it fails as for an unknown session, and writes nothing.
     pub fn record_close_request(&self, session_id: &str) -> Result<EventDto> {
+        self.record_close_authorized(session_id, None)
+    }
+    pub(crate) fn record_close_authorized(
+        &self,
+        session_id: &str,
+        external: Option<&crate::external_control::Command>,
+    ) -> Result<EventDto> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(command) = external {
+            self.external_guard_in(&tx, command, None)?;
+        }
         tx.execute(
             "UPDATE sessions SET close_requested = 1 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
             [session_id, &self.owner],
         )?;
-        let event = collector_event(&tx, &self.owner, session_id, "operator_closed", json!({}), &now())?;
+        let event = collector_event(
+            &tx,
+            &self.owner,
+            session_id,
+            "operator_closed",
+            external.map_or_else(|| json!({}), |c| json!({"source":c.origin()})),
+            &now(),
+        )?;
+        if let Some(command) = external {
+            self.external_intent_in(&tx, command, event.event_id)?;
+        }
         crate::delegation_attention::reconcile_closed_attention(&tx, &self.owner)?;
         tx.commit()?;
         Ok(event)
@@ -3560,8 +3660,23 @@ impl Store {
     /// all) — then writes `operator_closed` unless a close request already
     /// recorded it. Idempotent: a closed session is left alone.
     pub fn close_now(&self, session_id: &str) -> Result<Vec<EventDto>> {
+        self.close_now_authorized(session_id, None, None)
+    }
+    pub(crate) fn close_now_authorized(
+        &self,
+        session_id: &str,
+        external: Option<&crate::external_control::Command>,
+        expected: Option<&Unattached>,
+    ) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(command) = external {
+            self.external_guard_in(&tx, command, None)?;
+            if let Some(expected) = expected {
+                let same:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE owner_id = ?1 AND id=?2 AND lifecycle=?3 AND presumed_parked=?4)",params![self.owner_id(),session_id,expected.lifecycle,expected.presumed_parked],|r|r.get(0))?;
+                anyhow::ensure!(same, "attachment_changed");
+            }
+        }
         let mcp = self.mcp();
         let (events, cut) = close_in(&tx, &self.owner, mcp.as_ref(), session_id)?;
         commit_then_cut(tx, mcp.as_ref(), cut)?;
@@ -3631,8 +3746,20 @@ impl Store {
     /// one before (ACP core §4.3), so a failed mint leaves the session as
     /// it was.
     pub fn request_resume_with_mcp(&self, session_id: &str, hat_id: &str, mcp: McpContext) -> Result<ResumeRequest> {
+        self.request_resume_authorized(session_id, hat_id, mcp, None)
+    }
+    pub(crate) fn request_resume_authorized(
+        &self,
+        session_id: &str,
+        hat_id: &str,
+        mcp: McpContext,
+        external: Option<&crate::external_control::Command>,
+    ) -> Result<ResumeRequest> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        if let Some(command) = external {
+            self.external_guard_in(&tx, command, None)?;
+        }
         let row: Option<ResumeRow> = tx
             .query_row(
                 "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes, hat_id FROM sessions
@@ -3712,6 +3839,9 @@ impl Store {
         let mut config = config;
         config.cache_retention = crate::usage::retention_in(&tx, &self.owner, session_id)?;
         let (given, cut) = self.deliver_in(&tx, session_id, &host_id, &stored_hat, mcp, &ts)?;
+        if let Some(command) = external {
+            self.external_attach_in(&tx, command)?;
+        }
         commit_then_cut(tx, self.mcp().as_ref(), cut)?;
         Ok(ResumeRequest::Starting {
             events,

@@ -5,6 +5,7 @@ use serde_json::json;
 #[test]
 fn parent_and_child_report_preserve_typed_display_authorship() {
     for origin in [
+        json!({"kind":"external_client","client_id":"client","operation_id":"operation"}),
         json!({"kind":"parent","session_id":"p","operation_id":"o"}),
         json!({"kind":"child_report","child_id":"c","source_event_id":"7","delivery_id":"d"}),
     ] {

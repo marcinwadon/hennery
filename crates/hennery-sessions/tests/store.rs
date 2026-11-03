@@ -3141,6 +3141,9 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
              FROM sessions WHERE id = 's1';
          INSERT INTO external_client_sessions(owner_id,client_id,session_id)
              SELECT owner_id,'delete-external',id FROM sessions WHERE id IN ('s1','s2');
+         INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,state,args,created_at)
+             SELECT owner_id,'external-op-'||id,'delete-external',1,'key-'||id,'digest','session_prompt',id,'completed','{}',0
+             FROM sessions WHERE id IN ('s1','s2');
          INSERT INTO delegation_start_budgets(owner_id,caller_id,epoch,starts)
              SELECT owner_id, 's1', 0, 1 FROM sessions WHERE id = 's1';
          INSERT INTO delegation_attention(owner_id,attention_id,child_id,hat_id,reason,incident)
@@ -3175,6 +3178,7 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         "session_dispatch_queue",
         "session_attach_evidence",
         "external_client_sessions",
+        "external_operations",
         "delegation_start_budgets",
         "delegation_budgets",
         "delegation_attention",

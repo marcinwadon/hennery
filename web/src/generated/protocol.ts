@@ -83,7 +83,7 @@ export type PluginLease = { namespace_epoch: string, lease_until: number, };
  */
 export type PluginDeletionReceipt = { owner_id: string, hat_id: string, request_id: string, status: ForgetStatus, };
 
-export type InputOrigin = { "kind": "operator", } | { "kind": "plugin_context", request_id: string, } | { "kind": "parent", session_id: string, operation_id: string, } | { "kind": "child_report", child_id: string, source_event_id: string, delivery_id: string, };
+export type InputOrigin = { "kind": "operator", } | { "kind": "external_client", client_id: string, operation_id: string, } | { "kind": "plugin_context", request_id: string, } | { "kind": "parent", session_id: string, operation_id: string, } | { "kind": "child_report", child_id: string, source_event_id: string, delivery_id: string, };
 
 export type SourceRef = { session_id: string, turn_id: string | null, event_id: number, };
 

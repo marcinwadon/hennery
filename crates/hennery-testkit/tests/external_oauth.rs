@@ -569,16 +569,17 @@ async fn direct_remote_oauth_round_trip_over_real_tls_and_shipped_proxies() {
             f.rpc(access, "session_get", json!({"session_id":"outside"})).await["result"]["isError"],
             true
         );
-        let write = f
-            .rpc(
-                access,
-                "session_prompt",
-                json!({"session_id":"allowed","content":"blocked"}),
-            )
-            .await;
-        assert_eq!(write["id"], 1);
-        assert_eq!(write["error"]["code"], -32602);
-        assert!(write.get("result").is_none());
+        let write=f.http.post(format!("{}/mcp/external/hennery",f.base)).bearer_auth(access)
+            .header("accept","application/json, text/event-stream")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"session_prompt","arguments":{"request_key":"blocked","session_id":"allowed","text":"blocked"}}}))
+            .send().await.unwrap();
+        assert_eq!(write.status(), 403);
+        assert!(
+            write.headers()["www-authenticate"]
+                .to_str()
+                .unwrap()
+                .contains("hennery:sessions:control")
+        );
         assert_eq!(
             f.http
                 .get(format!("{}/api/sessions", f.base))

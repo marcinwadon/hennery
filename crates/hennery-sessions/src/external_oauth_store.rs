@@ -17,6 +17,10 @@ use sha2::{Digest, Sha256};
 pub(crate) const READ_SCOPE: &str = "hennery:sessions:read";
 pub(crate) const DISCOVER_SCOPE: &str = "hennery:discover";
 pub(crate) const SCOPE: &str = "hennery:discover hennery:sessions:read";
+pub(crate) const TRANSCRIPT_SCOPE: &str = "hennery:sessions:transcript";
+pub(crate) const CONTROL_SCOPE: &str = "hennery:sessions:control";
+pub(crate) const DEFAULT_SCOPE: &str =
+    "hennery:discover hennery:sessions:read hennery:sessions:transcript hennery:sessions:control";
 pub(crate) fn secret(prefix: &str) -> String {
     format!("{prefix}{}", hex::encode(random_bytes::<32>()))
 }
@@ -133,6 +137,10 @@ pub(crate) struct Consent {
     pub roots: Vec<RootGrant>,
     #[serde(default)]
     pub read_metadata: bool,
+    #[serde(default)]
+    pub read_transcript: bool,
+    #[serde(default)]
+    pub control_sessions: bool,
     #[serde(default)]
     pub existing_sessions: bool,
     #[serde(default = "days")]
@@ -262,7 +270,10 @@ impl Store {
         let mut scopes = std::collections::BTreeSet::new();
         for s in scope.split_ascii_whitespace() {
             ensure!(
-                matches!(s, DISCOVER_SCOPE | READ_SCOPE | "offline_access"),
+                matches!(
+                    s,
+                    DISCOVER_SCOPE | READ_SCOPE | TRANSCRIPT_SCOPE | CONTROL_SCOPE | "offline_access"
+                ),
                 "invalid_scope"
             );
             scopes.insert(s);
@@ -323,11 +334,22 @@ impl Store {
             !c.read_metadata || p.scope.split_ascii_whitespace().any(|s| s == READ_SCOPE),
             "invalid_scope"
         );
+        for (selected, scope) in [
+            (c.read_transcript, TRANSCRIPT_SCOPE),
+            (c.control_sessions, CONTROL_SCOPE),
+        ] {
+            ensure!(
+                !selected || p.scope.split_ascii_whitespace().any(|s| s == scope),
+                "invalid_scope"
+            );
+        }
         let input = NewClient {
             label: p.client_name,
             hat_id: c.hat_id.clone(),
             roots: c.roots.clone(),
             read_metadata: c.read_metadata,
+            read_transcript: c.read_transcript,
+            control_sessions: c.control_sessions,
             existing_sessions: c.existing_sessions,
             expires_in_days: c.expires_in_days,
         };
@@ -341,6 +363,12 @@ impl Store {
         let mut scopes = vec![DISCOVER_SCOPE];
         if c.read_metadata {
             scopes.push(READ_SCOPE);
+        }
+        if c.read_transcript {
+            scopes.push(TRANSCRIPT_SCOPE);
+        }
+        if c.control_sessions {
+            scopes.push(CONTROL_SCOPE);
         }
         if p.scope.split_ascii_whitespace().any(|s| s == "offline_access") {
             scopes.push("offline_access");
@@ -547,6 +575,8 @@ mod tests {
                     root: "/project".into(),
                 }],
                 read_metadata: true,
+                read_transcript: false,
+                control_sessions: false,
                 existing_sessions: false,
                 expires_in_days: 7,
             }
@@ -579,6 +609,89 @@ mod tests {
     }
     const ISSUER: &str = "https://collector.example";
     const RESOURCE: &str = "https://collector.example/mcp/external/hennery";
+    #[test]
+    fn control_and_transcript_require_explicit_requested_consent_and_survive_token_refresh() {
+        let w = World::new();
+        let m = w.client();
+        let a = w.authorization(&m);
+        let id = w.store.begin_oauth(&a, &m, RESOURCE).unwrap();
+        let mut c = w.consent(&id);
+        c.control_sessions = true;
+        assert!(w.store.consent_oauth(&c, RESOURCE, ISSUER).is_err());
+        c.control_sessions = false;
+        c.read_transcript = true;
+        assert!(w.store.consent_oauth(&c, RESOURCE, ISSUER).is_err());
+
+        let mut a = w.authorization(&m);
+        a.scope = Some(format!("{DEFAULT_SCOPE} offline_access"));
+        let id = w.store.begin_oauth(&a, &m, RESOURCE).unwrap();
+        let mut c = w.consent(&id);
+        c.control_sessions = true;
+        c.read_transcript = true;
+        c.read_metadata = false;
+        assert!(w.store.consent_oauth(&c, RESOURCE, ISSUER).is_err());
+        c.read_metadata = true;
+        c.existing_sessions = true;
+        let redirect = w.store.consent_oauth(&c, RESOURCE, ISSUER).unwrap();
+        let u = Url::parse(&redirect).unwrap();
+        let request = TokenRequest {
+            grant_type: "authorization_code".into(),
+            client_id: a.client_id.clone(),
+            resource: RESOURCE.into(),
+            code: Some(u.query_pairs().find(|(k, _)| k == "code").unwrap().1.to_string()),
+            redirect_uri: Some(a.redirect_uri),
+            code_verifier: Some("a".repeat(43)),
+            refresh_token: None,
+            scope: None,
+            client_secret: None,
+        };
+        let token = w.store.exchange_oauth(&request, RESOURCE).unwrap();
+        let identity = w
+            .store
+            .authenticate_external_resource(&token.access_token, RESOURCE)
+            .unwrap()
+            .unwrap();
+        assert!(identity.client.control_sessions && identity.client.read_transcript);
+        w.store
+            .create_session("session", "host", "claude", "/project", &w.hat, None)
+            .unwrap();
+        w.store
+            .external_admit(
+                &identity,
+                "session_close",
+                "key",
+                &serde_json::json!({"request_key":"key","session_id":"session"}),
+            )
+            .unwrap();
+        let (command, _) = w.store.external_pending().unwrap().remove(0);
+        let refresh = TokenRequest {
+            grant_type: "refresh_token".into(),
+            client_id: a.client_id,
+            resource: RESOURCE.into(),
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: token.refresh_token,
+            scope: None,
+            client_secret: None,
+        };
+        let rotated = w.store.exchange_oauth(&refresh, RESOURCE).unwrap();
+        assert!(
+            w.store
+                .authenticate_external_resource(&token.access_token, RESOURCE)
+                .unwrap()
+                .is_none()
+        );
+        assert!(w.store.external_guard_in(&w.store.conn(), &command, None).is_ok());
+        assert!(
+            w.store
+                .authenticate_external_resource(&rotated.access_token, RESOURCE)
+                .unwrap()
+                .unwrap()
+                .client
+                .control_sessions
+        );
+    }
     #[test]
     fn registration_pkce_redirect_resource_and_scope_are_validated_before_consent() {
         let w = World::new();

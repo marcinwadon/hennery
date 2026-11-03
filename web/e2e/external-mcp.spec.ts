@@ -47,7 +47,7 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
       expect(clientResponse.status()).toBe(201)
       const client = (await clientResponse.json()).client_id as string
       const verifier = 'a'.repeat(43)
-      const query = new URLSearchParams({ client_id: client, redirect_uri: 'https://client.example/callback', response_type: 'code', code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256', resource: origin + '/mcp/external/hennery', scope: 'hennery:discover hennery:sessions:read offline_access', state: 'remote-state' })
+      const query = new URLSearchParams({ client_id: client, redirect_uri: 'https://client.example/callback', response_type: 'code', code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256', resource: origin + '/mcp/external/hennery', scope: 'hennery:discover hennery:sessions:read hennery:sessions:control hennery:sessions:transcript offline_access', state: 'remote-state' })
       let callback: URL | null = null
       await context.route('https://client.example/callback**', async route => { callback = new URL(route.request().url()); await route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Remote client callback fixture</h1>' }) })
       const page = await context.newPage()
@@ -60,6 +60,8 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
       await expect(page.getByRole('heading', { name: 'Connect an external MCP client', exact: true })).toBeInViewport()
       await expect(page.getByText('client.example', { exact: true })).toBeVisible()
       await expect(page.getByLabel('Also allow existing sessions within this hat, host and root', { exact: true })).not.toBeChecked()
+      await expect(page.getByLabel('Create, prompt and control sessions', { exact: true })).not.toBeChecked()
+      await expect(page.getByLabel('Read session conversations', { exact: true })).not.toBeChecked()
       const before = await page.request.get('/api/external-clients'); expect(await before.json()).toEqual([])
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
       if (outcome === 'allow') {
@@ -67,6 +69,8 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
         await page.getByLabel('Host', { exact: true }).selectOption({ index: 1 })
         await page.getByLabel('Workspace root', { exact: true }).fill('/project')
         await page.getByLabel('Also allow existing sessions within this hat, host and root', { exact: true }).check()
+        await page.getByLabel('Create, prompt and control sessions', { exact: true }).check()
+        await page.getByLabel('Read session conversations', { exact: true }).check()
         await page.getByRole('heading', { name: 'Connect an external MCP client', exact: true }).scrollIntoViewIfNeeded()
         await page.screenshot({ path: test.info().outputPath('external-consent.png'), fullPage: true })
         await page.getByRole('button', { name: 'Allow selected access', exact: true }).click()
@@ -89,6 +93,8 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
         const hosts = await rpc(token.access_token)
         expect(hosts.status()).toBe(200)
         expect((await hosts.json()).result.structuredContent.data.hosts[0].name).toBe('External fixture host')
+        const capabilities = await remote.post('/mcp/external/hennery', { headers: { Authorization: `Bearer ${token.access_token}`, Accept: 'application/json, text/event-stream' }, data: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'hennery_capabilities', arguments: {} } } })
+        expect((await capabilities.json()).result.structuredContent.data.execution).toBe(true)
         await page.goto(origin + '/external-mcp')
         await page.getByRole('button', { name: 'Revoke access to Remote fixture app', exact: true }).click()
         await expect(page.getByText('Revoked', { exact: true })).toBeVisible()

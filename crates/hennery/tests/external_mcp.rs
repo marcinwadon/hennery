@@ -203,19 +203,20 @@ async fn protocol_discovery_and_session_reads_keep_explicit_scope_and_no_mutatio
         .unwrap();
     assert_eq!(denied["result"]["isError"], true);
     assert!(!denied.to_string().contains("/project-other"));
-    let write: Value = c
+    let write = c
         .rpc(
             token,
             "tools/call",
             json!({"name":"session_prompt","arguments":{"session_id":"in-scope","text":"do not execute"}}),
         )
-        .await
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(write["id"], 1);
-    assert_eq!(write["error"]["code"], -32602);
-    assert!(write.get("result").is_none());
+        .await;
+    assert_eq!(write.status(), 403);
+    assert!(
+        write.headers()["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .contains("hennery:sessions:control")
+    );
     let default = c.issue(false).await;
     let empty: Value = c
         .rpc(
