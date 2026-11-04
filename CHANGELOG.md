@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.5.2
+
+- Select Nix package checks independently from source tests and README recipes;
+  avoid rebuilding archives for unrelated CI workflow and tooling changes.
+- Add a read-only CI watcher with exact-source run binding, atomic checkpoints,
+  failure/stall detection and an optional local notification callback.
+- Keep real-agent sessions outside routine coding and CI. The operator or an
+  explicitly configured automation in their Hennery owns native-host acceptance
+  with local credentials, including synthetic-provider CLI probes.
+- Add the explicit runtime acceptance driver and an offline verifier requiring
+  matching source/input digests and complete reports from all three host platforms.
+
 ## 0.5.1
 
 - Replace unsupported bundled OpenSSL 3.6.3 with checksum-pinned OpenSSL
