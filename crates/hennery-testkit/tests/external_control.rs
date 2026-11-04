@@ -111,6 +111,7 @@ impl Harness {
         self.state
             .store
             .issue_external_client(&NewClient {
+                scope: None,
                 label: "External test".into(),
                 hat_id: self.state.hosts.host("host").unwrap().unwrap().default_hat_id,
                 roots: vec![RootGrant {
@@ -1148,5 +1149,192 @@ async fn a_prompt_auto_resumes_a_parked_session_before_admission() {
     assert_eq!(h.log("session/load"), 1);
     assert_eq!(h.log("session/prompt"), 1);
     h.action("session_close", "close", &session).await;
+    h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_mcp_connection_controls_two_hats_on_two_real_hosts() {
+    use hennery_kernel::hats::{HatChange, NewRule};
+    use hennery_sessions::external_clients::GrantScope;
+    let mut h = Harness::new(FakeScript {
+        config_options: hennery_testkit::sample_config_options(),
+        ..Default::default()
+    })
+    .await;
+    let default_hat = h.state.hosts.host("host").unwrap().unwrap().default_hat_id;
+    let HatChange::Done(second) = h.state.hosts.create_hat("Second", None, 0).unwrap() else {
+        panic!()
+    };
+    let second_root = PathBuf::from(&h.root).join("second");
+    std::fs::create_dir(&second_root).unwrap();
+    let second_root = second_root.to_string_lossy().into_owned();
+    let key = HostKey::from_seed([78; 32]);
+    h.state
+        .hosts
+        .register(
+            "host2",
+            &Enrollment {
+                public_key: key.public_key_hex(),
+                name: "Second isolated host".into(),
+                platform: "test".into(),
+                host_version: "test".into(),
+            },
+            0,
+        )
+        .unwrap();
+    for host in ["host", "host2"] {
+        h.state
+            .hosts
+            .replace_path_rules(
+                host,
+                &[NewRule {
+                    prefix: second_root.clone(),
+                    hat_id: second.id.clone(),
+                    verified: true,
+                }],
+            )
+            .unwrap();
+    }
+    let mut cfg = HostConfig::new(
+        h.url.replacen("http:", "ws:", 1) + "/api/hosts/ws",
+        "host2",
+        key,
+        h.dir.path().join("host2"),
+    );
+    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    fake.env.push((
+        SCRIPT_ENV.into(),
+        serde_json::to_string(&FakeScript {
+            config_options: hennery_testkit::sample_config_options(),
+            ..Default::default()
+        })
+        .unwrap(),
+    ));
+    cfg.agents.insert("fake".into(), fake);
+    cfg.workspace_roots = vec![PathBuf::from(&h.root)];
+    cfg.home = Some(h.dir.path().join("home2"));
+    std::fs::create_dir(cfg.home.as_ref().unwrap()).unwrap();
+    cfg.idle_timeout = Duration::ZERO;
+    let shutdown = h.state.shutdown.clone();
+    let second_host = tokio::spawn(hennery_host::run_until(cfg, async move { shutdown.cancelled().await }));
+    h.until(|| h.state.hub.is_ready("host2")).await;
+    h.token = h
+        .state
+        .store
+        .issue_external_client(&NewClient {
+            label: "Multi-scope fixture".into(),
+            hat_id: String::new(),
+            roots: vec![],
+            scope: Some(GrantScope {
+                hat_ids: vec![default_hat.clone(), second.id.clone()],
+                all_hats: false,
+                roots: ["host", "host2"]
+                    .into_iter()
+                    .map(|host| RootGrant {
+                        host_id: host.into(),
+                        root: h.root.clone(),
+                    })
+                    .collect(),
+                all_hosts: false,
+            }),
+            read_metadata: true,
+            read_transcript: true,
+            control_sessions: true,
+            existing_sessions: false,
+            expires_in_days: 1,
+        })
+        .unwrap()
+        .1;
+    assert_eq!(
+        h.rpc("host_list", json!({})).await["hosts"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        h.rpc("hennery_capabilities", json!({})).await["hats"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for (n, (host, cwd, hat)) in [
+        ("host", &h.root, &default_hat),
+        ("host", &second_root, &second.id),
+        ("host2", &h.root, &default_hat),
+        ("host2", &second_root, &second.id),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let catalog = h
+            .rpc(
+                "runtime_catalog",
+                json!({"host_id":host,"cwd":cwd,"agent":"fake","refresh":true}),
+            )
+            .await;
+        assert!(!catalog["config_options"].as_array().unwrap().is_empty());
+        let receipt = h
+            .rpc(
+                "session_create",
+                json!({"request_key":format!("create-{n}"),"host_id":host,"cwd":cwd,"agent":"fake"}),
+            )
+            .await;
+        let operation = h.done(receipt["operation_id"].as_str().unwrap()).await;
+        let session = operation["session_id"].as_str().unwrap();
+        let stored = h.state.store.find_session(session).unwrap().unwrap();
+        assert_eq!(stored.host_id, host);
+        assert_eq!(&stored.hat_id, hat);
+        let prompt = h
+            .rpc(
+                "session_prompt",
+                json!({"request_key":format!("prompt-{n}"),"session_id":session,"text":"Work in the selected scope"}),
+            )
+            .await;
+        h.done(prompt["operation_id"].as_str().unwrap()).await;
+        assert!(
+            h.rpc("session_read", json!({"session_id":session}))
+                .await
+                .to_string()
+                .contains("Hello world")
+        );
+        h.action("session_park", &format!("park-{n}"), session).await;
+        h.action("session_resume", &format!("resume-{n}"), session).await;
+        h.action("session_close", &format!("close-{n}"), session).await;
+    }
+    let second_hat_sessions = h.rpc("session_list", json!({"filters":{"hat_id":second.id}})).await;
+    assert_eq!(second_hat_sessions["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        h.rpc("session_list", json!({"filters":{"host_id":"host2"}})).await["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let HatChange::Done(excluded) = h.state.hosts.create_hat("Excluded", None, 0).unwrap() else {
+        panic!()
+    };
+    h.state
+        .hosts
+        .replace_path_rules(
+            "host",
+            &[NewRule {
+                prefix: second_root.clone(),
+                hat_id: excluded.id,
+                verified: true,
+            }],
+        )
+        .unwrap();
+    let denied: Value = h
+        .raw(
+            &h.token,
+            "session_create",
+            json!({"request_key":"denied","host_id":"host","cwd":second_root,"agent":"fake"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(denied["result"]["isError"], true);
+    h.state.shutdown.cancel();
+    second_host.await.unwrap().unwrap();
     h.finish().await;
 }

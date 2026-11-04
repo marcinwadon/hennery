@@ -18,6 +18,9 @@ fn contains(root: &str, path: &str) -> bool {
         || path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
 }
 pub(crate) fn root_for<'a>(client: &'a ClientRecord, host: &str, cwd: &str) -> Option<&'a str> {
+    if client.scope.all_hosts && is_canonical(cwd) {
+        return Some("/");
+    }
     client
         .roots
         .iter()
@@ -34,11 +37,12 @@ pub(crate) fn placement(
     hat: &str,
 ) -> Result<()> {
     ensure!(
-        is_canonical(cwd) && root_for(client, host, cwd).is_some() && client.hat_id == hat,
+        is_canonical(cwd) && root_for(client, host, cwd).is_some() && client.allows_hat(hat),
         "not_found"
     );
     let allowed: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM hosts h WHERE h.owner_id = ?1 AND h.id=?2 AND h.revoked_at IS NULL)
+        AND EXISTS(SELECT 1 FROM hats h WHERE h.owner_id = ?1 AND h.id=?3)
         AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = ?1 AND p.hat_id=?3)",
         params![owner, host, hat],
         |r| r.get(0),
@@ -49,6 +53,21 @@ pub(crate) fn placement(
         "not_found"
     );
     Ok(())
+}
+/// Choose the actual path-resolved hat, never the first hat in a grant. The
+/// caller must fence this choice across any asynchronous host/catalog work.
+pub(crate) fn resolved_hat(
+    conn: &Connection,
+    owner: &str,
+    client: &ClientRecord,
+    host: &str,
+    cwd: &str,
+) -> Result<String> {
+    let Some(SessionHat::Decided(resolution)) = hennery_kernel::hats::session_hat_in(conn, owner, host, cwd)? else {
+        anyhow::bail!("not_found");
+    };
+    placement(conn, owner, client, host, cwd, &resolution.hat_id)?;
+    Ok(resolution.hat_id)
 }
 pub(crate) fn session_scope(
     conn: &Connection,
@@ -75,15 +94,19 @@ pub(crate) fn session_scope(
         placement(conn, owner, client, &host, &cwd, &hat)
     } else {
         ensure!(
-            client.hat_id == hat && root_for(client, &host, &cwd).is_some(),
+            client.allows_hat(&hat) && root_for(client, &host, &cwd).is_some(),
             "not_found"
         );
-        let allowed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM hosts h WHERE h.owner_id = ?1 AND h.id=?2 AND h.revoked_at IS NULL) AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = ?1 AND p.hat_id=?3)",params![owner,host,hat],|r|r.get(0))?;
+        let allowed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM hosts h WHERE h.owner_id = ?1 AND h.id=?2 AND h.revoked_at IS NULL) AND EXISTS(SELECT 1 FROM hats h WHERE h.owner_id = ?1 AND h.id=?3) AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = ?1 AND p.hat_id=?3)",params![owner,host,hat],|r|r.get(0))?;
         ensure!(allowed, "not_found");
         Ok(())
     }
 }
 fn current_client(conn: &Connection, owner: &str, id: &str, revision: i64) -> Result<ClientRecord> {
+    ensure!(
+        external_clients::active_grant(conn, owner, id)?,
+        "external_unauthenticated"
+    );
     let client =
         external_clients::record(conn, owner, id)?.ok_or_else(|| anyhow::anyhow!("external_unauthenticated"))?;
     ensure!(
@@ -107,6 +130,13 @@ fn command_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Command> {
     })
 }
 impl Store {
+    pub(crate) fn external_target_hat_in(&self, conn: &Connection, command: &Command) -> Result<Option<String>> {
+        Ok(conn.query_row(
+            "SELECT target_hat_id FROM external_operations WHERE owner_id = ?1 AND id=?2",
+            params![self.owner_id(), command.operation_id],
+            |r| r.get(0),
+        )?)
+    }
     pub(crate) fn external_attach_in(&self, conn: &Connection, command: &Command) -> Result<()> {
         conn.execute(
             "UPDATE sessions SET external_attach_operation=?3 WHERE owner_id = ?1 AND id=?2",
@@ -165,13 +195,6 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    pub(crate) fn external_execution_client_unlocked(
-        &self,
-        conn: &Connection,
-        command: &Command,
-    ) -> Result<ClientRecord> {
-        current_client(conn, self.owner_id(), &command.client_id, command.revision)
-    }
     pub(crate) fn external_execution_client(&self, command: &Command) -> Result<ClientRecord> {
         current_client(&self.conn(), self.owner_id(), &command.client_id, command.revision)
     }
@@ -193,10 +216,25 @@ impl Store {
             session_scope(conn, self.owner_id(), &client, &source, true)?;
         }
         if let Some((host, cwd, hat)) = create {
+            ensure!(
+                self.external_target_hat_in(conn, command)?.as_deref() == Some(hat),
+                "not_found"
+            );
             let live:i64=conn.query_row("SELECT count(*) FROM external_client_sessions x JOIN sessions s ON s.owner_id=x.owner_id AND s.id=x.session_id WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','deleted','failed')",params![self.owner_id(),client.client_id],|r|r.get(0))?;
             ensure!(live < 32, "session_limit");
             placement(conn, self.owner_id(), &client, host, cwd, hat)
         } else {
+            if matches!(command.tool.as_str(), "session_create" | "session_clone") {
+                let hat: String = conn.query_row(
+                    "SELECT hat_id FROM sessions WHERE owner_id = ?1 AND id=?2",
+                    params![self.owner_id(), command.session_id],
+                    |r| r.get(0),
+                )?;
+                ensure!(
+                    self.external_target_hat_in(conn, command)?.as_deref() == Some(hat.as_str()),
+                    "not_found"
+                );
+            }
             session_scope(conn, self.owner_id(), &client, &command.session_id, true)
         }
     }
@@ -267,6 +305,7 @@ impl Store {
             execution = json!({"request_key":key,"host_id":host,"cwd":cwd,"agent":agent,"config":config});
             raw = serde_json::to_string(&execution)?;
         }
+        let mut target_hat = None;
         let session = if matches!(tool, "session_create" | "session_clone") {
             let host = execution["host_id"]
                 .as_str()
@@ -274,7 +313,7 @@ impl Store {
             let cwd = execution["cwd"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid_arguments"))?;
-            placement(&tx, self.owner_id(), client, host, cwd, &client.hat_id)?;
+            target_hat = Some(resolved_hat(&tx, self.owner_id(), client, host, cwd)?);
             let live:i64=tx.query_row("SELECT count(*) FROM external_client_sessions x JOIN sessions s ON s.owner_id=x.owner_id AND s.id=x.session_id WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','deleted','failed')",params![self.owner_id(),client.client_id],|r|r.get(0))?;
             ensure!(live < 32, "session_limit");
             uuid::Uuid::now_v7().to_string()
@@ -298,8 +337,8 @@ impl Store {
         };
         tx.execute("INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,turn_id,state,args,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10,?11)",params![self.owner_id(),id,client.client_id,client.revision,key_hash,digest,tool,session,turn,raw,unix_now()])?;
         tx.execute(
-            "UPDATE external_operations SET source_session_id=?3 WHERE owner_id = ?1 AND id=?2",
-            params![self.owner_id(), id, source],
+            "UPDATE external_operations SET source_session_id=?3,target_hat_id=?4 WHERE owner_id = ?1 AND id=?2",
+            params![self.owner_id(), id, source, target_hat],
         )?;
         if tool == "session_prompt" {
             crate::external_attachments::bind_in(&tx, self.owner_id(), client, &session, &id, args)?;
@@ -486,7 +525,9 @@ impl Store {
         conn.execute("UPDATE external_operations SET state='failed',code='not_delivered',args=json_object() WHERE owner_id = ?1 AND tool='session_prompt' AND state IN ('running','uncertain') AND EXISTS(SELECT 1 FROM turns t WHERE t.owner_id = ?1 AND t.session_id=external_operations.session_id AND t.turn_id=external_operations.turn_id AND t.state='not_delivered')",[self.owner_id()])?;
         conn.execute("UPDATE external_operations SET state='cancelled',code='grant_changed',args=json_object() WHERE owner_id = ?1 AND state='queued'
             AND NOT EXISTS(SELECT 1 FROM external_clients c WHERE c.owner_id = ?1 AND c.id=external_operations.client_id AND c.revision=external_operations.revision AND c.revoked_at IS NULL AND c.expires_at>?2
-              AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = ?1 AND p.hat_id=c.hat_id))",params![self.owner_id(),unix_now()])?;
+              AND EXISTS(SELECT 1 FROM hats h WHERE h.owner_id = ?1
+                AND (c.all_hats=1 OR EXISTS(SELECT 1 FROM external_client_hats ch WHERE ch.owner_id = ?1 AND ch.client_id=c.id AND ch.hat_id=h.id))
+                AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = ?1 AND p.hat_id=h.id)))",params![self.owner_id(),unix_now()])?;
         conn.execute("UPDATE external_operations SET state='failed',code='not_delivered',args=json_object() WHERE owner_id = ?1 AND state='uncertain' AND request_id IS NULL AND NOT (tool='session_answer' AND EXISTS(SELECT 1 FROM answer_queue q WHERE q.owner_id = ?1 AND q.session_id=external_operations.session_id AND json_extract(q.input_origin,'$.operation_id')=external_operations.id)) AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.owner_id = ?1 AND t.session_id=external_operations.session_id AND t.turn_id=external_operations.turn_id)", [self.owner_id()])?;
         conn.execute("UPDATE external_operations SET state='completed',code=NULL,args=json_object() WHERE owner_id = ?1 AND tool='session_config' AND state IN ('running','uncertain') AND EXISTS(SELECT 1 FROM events e WHERE e.owner_id = ?1 AND e.session_id=external_operations.session_id AND e.kind='config_applied' AND e.applied=1 AND json_extract(e.body,'$.request_id')=external_operations.request_id)",[self.owner_id()])?;
         conn.execute("UPDATE external_operations SET state='completed',args=json_object() WHERE owner_id = ?1 AND state IN ('running','uncertain') AND

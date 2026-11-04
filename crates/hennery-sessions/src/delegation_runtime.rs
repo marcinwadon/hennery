@@ -94,7 +94,14 @@ impl Catalogs {
         cwd: &str,
         agent: &str,
     ) -> Result<HostCatalog> {
-        let hat = &identity.client.hat_id;
+        let hat = crate::external_control_store::resolved_hat(
+            &state.store.conn(),
+            state.store.owner_id(),
+            &identity.client,
+            host,
+            cwd,
+        )?;
+        let hat = hat.as_str();
         state.store.catalog_scope(host, hat, cwd)?;
         state
             .store
@@ -281,7 +288,7 @@ impl Catalogs {
         };
         let result = async {
             let probe = state.hub.probe(host, &request_id, frame, Duration::from_secs(30));
-            let answer = crate::external_tools::guarded_catalog(state, external, host, cwd, probe)
+            let answer = crate::external_tools::guarded_catalog(state, external, host, cwd, hat, probe)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(match error {

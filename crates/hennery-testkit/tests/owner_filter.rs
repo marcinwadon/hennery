@@ -58,7 +58,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-sessions/src/external_oauth_store.rs",
         include_str!("../../hennery-sessions/src/external_oauth_store.rs"),
-        22,
+        21, // Grant liveness is shared with external_clients instead of duplicated here.
     ),
     (
         "hennery-sessions/src/usage.rs",

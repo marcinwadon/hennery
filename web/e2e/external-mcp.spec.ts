@@ -7,10 +7,11 @@ import { startCollector } from './collector'
 import { testHost } from './host'
 
 const PASSWORD = 'correct horse battery staple'
-for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as const) {
+for (const width of [1280, 390]) for (const outcome of ['allow', 'deny', 'current', 'future'] as const) {
   test(`external remote OAuth ${outcome} over isolated HTTPS at ${width}px`, async ({ browser }) => {
     const collector = await startCollector()
     const host = testHost()
+    const secondHost = testHost()
     const proxy = createServer({
       key: readFileSync(new URL('./fixtures/oauth-local-key.pem', import.meta.url)),
       cert: readFileSync(new URL('./fixtures/oauth-local-cert.pem', import.meta.url)),
@@ -36,6 +37,11 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
       await setupPage.getByRole('button', { name: 'Add host', exact: true }).click()
       const command = (await setupPage.getByLabel('Pairing command', { exact: true }).textContent())!
       expect(await host.join(command, ['--name', 'External fixture host', '--no-runtime'])).toBe(0)
+      const secondHat = await setupContext.request.post('/api/hats', { headers: { Origin: collector.origin }, data: { name: 'Second hat' } })
+      expect(secondHat.status()).toBe(201)
+      const pairing = await setupContext.request.post('/api/hosts/pairing-codes', { headers: { Origin: collector.origin } })
+      expect(pairing.status()).toBe(201)
+      expect(await secondHost.join(`hennery host join ${collector.origin} ${(await pairing.json()).code}`, ['--name', 'Second fixture host', '--no-runtime'])).toBe(0)
       const changed = await setupContext.request.patch('/api/settings', { headers: { Origin: collector.origin }, data: { public_url: origin } })
       expect(changed.status()).toBe(200)
       const challenge = await remote.post('/mcp/external/hennery', { data: {} })
@@ -59,16 +65,22 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
       await expect(page.getByRole('heading', { name: 'Connect an external MCP client', exact: true })).toBeVisible()
       await expect(page.getByRole('heading', { name: 'Connect an external MCP client', exact: true })).toBeInViewport()
       await expect(page.getByText('client.example', { exact: true })).toBeVisible()
-      await expect(page.getByLabel('Also allow existing sessions within this hat, host and root', { exact: true })).not.toBeChecked()
+      await expect(page.getByLabel('Also allow existing sessions within the selected scope', { exact: true })).not.toBeChecked()
       await expect(page.getByLabel('Create, prompt and control sessions', { exact: true })).not.toBeChecked()
       await expect(page.getByLabel('Read session conversations', { exact: true })).not.toBeChecked()
       const before = await page.request.get('/api/external-clients'); expect(await before.json()).toEqual([])
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
-      if (outcome === 'allow') {
-        await page.getByLabel('Hat', { exact: true }).selectOption({ index: 1 })
-        await page.getByLabel('Host', { exact: true }).selectOption({ index: 1 })
-        await page.getByLabel('Workspace root', { exact: true }).fill('/project')
-        await page.getByLabel('Also allow existing sessions within this hat, host and root', { exact: true }).check()
+      if (outcome !== 'deny') {
+        if (outcome === 'allow') {
+          await page.getByLabel('Hat', { exact: true }).selectOption([{ index: 0 }, { index: 1 }])
+          await page.getByLabel('Host', { exact: true }).selectOption([{ index: 0 }, { index: 1 }])
+          await page.getByLabel('Workspace root', { exact: true }).fill('/project')
+        } else {
+          await page.getByLabel('Hat access', { exact: true }).selectOption(outcome)
+          await page.getByLabel('Host access', { exact: true }).selectOption(outcome)
+          if (outcome === 'current') await page.getByLabel('All workspaces on selected hosts', { exact: true }).check()
+        }
+        await page.getByLabel('Also allow existing sessions within the selected scope', { exact: true }).check()
         await page.getByLabel('Create, prompt and control sessions', { exact: true }).check()
         await page.getByLabel('Read session conversations', { exact: true }).check()
         await page.getByRole('heading', { name: 'Connect an external MCP client', exact: true }).scrollIntoViewIfNeeded()
@@ -92,9 +104,16 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
         const rpc = async (bearer: string) => remote.post('/mcp/external/hennery', { headers: { Authorization: `Bearer ${bearer}`, Accept: 'application/json, text/event-stream' }, data: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'host_list', arguments: {} } } })
         const hosts = await rpc(token.access_token)
         expect(hosts.status()).toBe(200)
-        expect((await hosts.json()).result.structuredContent.data.hosts[0].name).toBe('External fixture host')
+        expect((await hosts.json()).result.structuredContent.data.hosts.map((h: { name: string }) => h.name).sort()).toEqual(['External fixture host', 'Second fixture host'])
         const capabilities = await remote.post('/mcp/external/hennery', { headers: { Authorization: `Bearer ${token.access_token}`, Accept: 'application/json, text/event-stream' }, data: { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'hennery_capabilities', arguments: {} } } })
-        expect((await capabilities.json()).result.structuredContent.data.execution).toBe(true)
+        const data = (await capabilities.json()).result.structuredContent.data
+        expect(data.execution).toBe(true)
+        expect(data.hat_id).toBeNull()
+        expect(data.hats).toHaveLength(2)
+        expect(data.scope.all_hats).toBe(outcome === 'future')
+        expect(data.scope.all_hosts).toBe(outcome === 'future')
+        expect(data.scope.hat_ids).toHaveLength(outcome === 'future' ? 0 : 2)
+        expect(data.scope.roots).toHaveLength(outcome === 'future' ? 0 : 2)
         await page.goto(origin + '/external-mcp')
         await page.getByRole('button', { name: 'Revoke access to Remote fixture app', exact: true }).click()
         await expect(page.getByText('Revoked', { exact: true })).toBeVisible()
@@ -104,7 +123,7 @@ for (const width of [1280, 390]) for (const outcome of ['allow', 'deny'] as cons
     } finally {
       proxy.closeAllConnections()
       const stopped = await Promise.allSettled([
-        remote.dispose(), setupContext.close(), context.close(), host.stop(), collector.stop(),
+        remote.dispose(), setupContext.close(), context.close(), host.stop(), secondHost.stop(), collector.stop(),
         new Promise<void>(resolve => proxy.close(() => resolve())),
       ])
       const failed = stopped.find(result => result.status === 'rejected')

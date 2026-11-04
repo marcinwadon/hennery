@@ -159,20 +159,51 @@ fn configure(mut conn: Connection) -> Result<Connection> {
 /// would run twice.
 pub fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
     loop {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: usize = tx.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? as usize;
-        if current > migrations.len() {
-            bail!(
-                "database schema version {current} is newer than this binary supports ({})",
-                migrations.len()
-            );
+        // SQLite's documented table-rebuild procedure must disable foreign keys
+        // before BEGIN, otherwise DROP TABLE cascades into dependent tables.
+        // The version is still read under IMMEDIATE below, including after a
+        // competing migrator advances it. Only explicitly marked steps opt in.
+        let observed: usize = conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? as usize;
+        let rebuild = migrations
+            .get(observed)
+            .is_some_and(|sql| sql.starts_with("-- rebuild-with-foreign-keys-off\n"));
+        if rebuild {
+            conn.pragma_update(None, "foreign_keys", false)?;
         }
-        let Some(sql) = migrations.get(current) else {
+        let result = (|| -> Result<bool> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current: usize = tx.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? as usize;
+            if current > migrations.len() {
+                bail!(
+                    "database schema version {current} is newer than this binary supports ({})",
+                    migrations.len()
+                );
+            }
+            // A competing migrator may have advanced while BEGIN waited.
+            // Re-evaluate the mode before any SQL, particularly if the next
+            // ordinary step relies on ON DELETE actions being enabled.
+            if current != observed {
+                return Ok(false);
+            }
+            let Some(sql) = migrations.get(current) else {
+                return Ok(true);
+            };
+            tx.execute_batch(sql)?;
+            if rebuild {
+                let violation = tx.prepare("PRAGMA foreign_key_check")?.exists([])?;
+                anyhow::ensure!(!violation, "migration introduced a foreign key violation");
+            }
+            tx.pragma_update(None, "user_version", (current + 1) as i64)?;
+            tx.commit()?;
+            Ok(false)
+        })();
+        // Restore enforcement after either commit or rollback, even on failure.
+        if rebuild {
+            conn.pragma_update(None, "foreign_keys", true)?;
+        }
+        if result? {
             return Ok(());
-        };
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", (current + 1) as i64)?;
-        tx.commit()?;
+        }
     }
 }
 
@@ -308,6 +339,46 @@ mod tests {
         tx.execute("INSERT INTO t VALUES (2)", []).unwrap();
         tx.commit().unwrap();
         second.execute("INSERT INTO t VALUES (3)", []).unwrap();
+    }
+
+    #[test]
+    fn rebuilding_a_parent_preserves_children_and_restores_enforcement_on_failure() {
+        let mut conn = open_in_memory().unwrap();
+        let base = "CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER REFERENCES parent(id) ON DELETE CASCADE); INSERT INTO parent VALUES(1); INSERT INTO child VALUES(1);";
+        let rebuild = "-- rebuild-with-foreign-keys-off\nCREATE TABLE parent_new(id INTEGER PRIMARY KEY, extra TEXT); INSERT INTO parent_new(id) SELECT id FROM parent; DROP TABLE parent; ALTER TABLE parent_new RENAME TO parent;";
+        migrate(&mut conn, &[base, rebuild]).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM child", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(conn.execute("INSERT INTO child VALUES(2)", []).is_err());
+        let broken = "-- rebuild-with-foreign-keys-off\nDELETE FROM parent;";
+        assert!(migrate(&mut conn, &[base, rebuild, broken]).is_err());
+        assert_eq!(
+            conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM parent", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let syntax = "-- rebuild-with-foreign-keys-off\nINVALID SQL";
+        assert!(migrate(&mut conn, &[base, rebuild, syntax]).is_err());
+        assert!(conn.execute("INSERT INTO child VALUES(2)", []).is_err());
+        conn.execute("DELETE FROM parent", []).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM child", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

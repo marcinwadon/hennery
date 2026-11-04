@@ -1,3 +1,4 @@
+DROP TRIGGER external_scope_purge;
 DROP TRIGGER external_tools_revoke;
 DROP TRIGGER external_tools_deleted;
 DROP TABLE external_operation_uploads;
@@ -15,4 +16,5 @@ DROP TABLE external_oauth_requests;
 DROP TABLE external_oauth_clients;
 DROP TABLE external_client_sessions;
 DROP TABLE external_client_roots;
+DROP TABLE external_client_hats;
 DROP TABLE external_clients;

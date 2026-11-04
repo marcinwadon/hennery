@@ -24,7 +24,7 @@ state stays outside Git; public issues are separate approved projections.
      bounded admission, timed reads and negotiated small host authentication.
    - [MCP gateway](specs/2026-09-26-mcp-gateway-design.md) — connections,
      OAuth, per-session tokens, streaming proxy, renderers.
-   - [External session MCP](specs/2026-10-29-external-session-mcp.md) — public HTTPS/OAuth, scoped consent, 30 tools for session control, forms/configuration, queue, usage and images; direct remote Desktop setup and pending live acceptance.
+   - [External session MCP](specs/2026-10-29-external-session-mcp.md) — public HTTPS/OAuth, consent across selected or explicitly future hats/hosts, 30 tools for session control, forms/configuration, queue, usage and images; direct remote Desktop setup and pending live acceptance.
    - [Per-hat, per-ACP MCP sources](specs/2026-10-28-mcp-source-policy.md) —
      independent agent source permissions, compatible fallback/reset revisions
      and attach acknowledgement.

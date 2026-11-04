@@ -4,7 +4,7 @@ use crate::{
     AppState,
     external_clients::{self, ExternalIdentity},
     external_control::Command,
-    external_control_store::{placement, session_scope},
+    external_control_store::{placement, resolved_hat, session_scope},
     store::Store,
 };
 use anyhow::{Result, bail, ensure};
@@ -228,7 +228,6 @@ impl Store {
         )?;
         let args: Value = serde_json::from_str(&raw)?;
         if matches!(command.tool.as_str(), "session_create" | "session_clone") {
-            let client = self.external_execution_client_unlocked(&conn, command)?;
             self.external_guard_in(
                 &conn,
                 command,
@@ -239,7 +238,9 @@ impl Store {
                     args["cwd"]
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("invalid_arguments"))?,
-                    &client.hat_id,
+                    &self
+                        .external_target_hat_in(&conn, command)?
+                        .ok_or_else(|| anyhow::anyhow!("not_found"))?,
                 )),
             )?;
         } else {
@@ -326,23 +327,16 @@ pub(crate) async fn invoke(state: &AppState, identity: &ExternalIdentity, name: 
                 !q.refresh || identity.client.control_sessions,
                 "external_control_forbidden"
             );
-            let check = || -> Result<()> {
+            let check = || -> Result<String> {
                 let conn = state.store.conn();
                 ensure!(
                     external_clients::live(&conn, state.store.owner_id(), identity)?,
                     "external_unauthenticated"
                 );
                 ensure!(identity.client.read_metadata, "external_forbidden");
-                placement(
-                    &conn,
-                    state.store.owner_id(),
-                    &identity.client,
-                    &q.host_id,
-                    &q.cwd,
-                    &identity.client.hat_id,
-                )
+                resolved_hat(&conn, state.store.owner_id(), &identity.client, &q.host_id, &q.cwd)
             };
-            check()?;
+            let hat = check()?;
             let catalog = if q.refresh {
                 let resolved = crate::resolve::resolve_on_host(state, &q.host_id, &q.cwd)
                     .await
@@ -351,17 +345,15 @@ pub(crate) async fn invoke(state: &AppState, identity: &ExternalIdentity, name: 
                     resolved.exists && resolved.is_dir && resolved.canonical == q.cwd,
                     "cwd_unavailable"
                 );
-                check()?;
+                ensure!(check()? == hat, "not_found");
                 state
                     .catalogs
                     .get_external(state, identity, &q.host_id, &q.cwd, &q.agent)
                     .await?
             } else {
-                state
-                    .store
-                    .saved_runtime_catalog(&q.host_id, &identity.client.hat_id, &q.cwd, &q.agent)?
+                state.store.saved_runtime_catalog(&q.host_id, &hat, &q.cwd, &q.agent)?
             };
-            check()?;
+            ensure!(check()? == hat, "not_found");
             serde_json::to_value(catalog)?
         }
         _ => {
@@ -701,6 +693,7 @@ pub(crate) async fn guarded_catalog<F>(
     identity: Option<&ExternalIdentity>,
     host: &str,
     cwd: &str,
+    hat: &str,
     future: F,
 ) -> std::result::Result<hennery_proto::frames::HostFrame, crate::hub::RequestError>
 where
@@ -718,14 +711,7 @@ where
                 "external_unauthenticated"
             );
             ensure!(identity.client.control_sessions, "external_control_forbidden");
-            placement(
-                &conn,
-                state.store.owner_id(),
-                &identity.client,
-                host,
-                cwd,
-                &identity.client.hat_id,
-            )
+            placement(&conn, state.store.owner_id(), &identity.client, host, cwd, hat)
         })();
         std::task::Poll::Ready(match checked {
             Ok(()) => future.as_mut().poll(cx),

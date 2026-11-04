@@ -619,7 +619,10 @@ async fn preflight(state: &AppState, command: &Command, args: &Value) -> Result<
         (
             args["host_id"].as_str().unwrap_or_default().to_owned(),
             args["cwd"].as_str().unwrap_or_default().to_owned(),
-            client.hat_id.clone(),
+            state
+                .store
+                .external_target_hat_in(&state.store.conn(), command)?
+                .ok_or_else(|| anyhow::anyhow!("not_found"))?,
         )
     } else {
         let s = state
@@ -830,6 +833,7 @@ mod tests {
         let (_, token) = state
             .store
             .issue_external_client(&NewClient {
+                scope: None,
                 label: "test".into(),
                 hat_id: hat,
                 roots: vec![RootGrant {
@@ -846,6 +850,210 @@ mod tests {
         let identity = state.store.authenticate_external(&token).unwrap().unwrap();
         (dir, state, identity)
     }
+    #[test]
+    fn multi_hat_create_freezes_actual_hat_at_admission_and_fences_rule_changes() {
+        use crate::external_clients::GrantScope;
+        use hennery_kernel::hats::{HatChange, NewRule};
+        let (_dir, state, legacy) = world();
+        let HatChange::Done(other) = state.hosts.create_hat("Second", None, 0).unwrap() else {
+            panic!()
+        };
+        let old = legacy.client.scope.hat_ids[0].clone();
+        let (_, token) = state
+            .store
+            .issue_external_client(&NewClient {
+                scope: Some(GrantScope {
+                    hat_ids: vec![old.clone(), other.id.clone()],
+                    all_hats: false,
+                    roots: vec![RootGrant {
+                        host_id: "host".into(),
+                        root: "/".into(),
+                    }],
+                    all_hosts: false,
+                }),
+                hat_id: String::new(),
+                roots: vec![],
+                label: "Multi".into(),
+                read_metadata: true,
+                read_transcript: true,
+                control_sessions: true,
+                existing_sessions: true,
+                expires_in_days: 1,
+            })
+            .unwrap();
+        state
+            .hosts
+            .replace_path_rules(
+                "host",
+                &[NewRule {
+                    prefix: "/second".into(),
+                    hat_id: other.id.clone(),
+                    verified: true,
+                }],
+            )
+            .unwrap();
+        let identity = state.store.authenticate_external(&token).unwrap().unwrap();
+        state
+            .store
+            .external_admit(
+                &identity,
+                "session_create",
+                "multi-create",
+                &json!({"request_key":"multi-create","host_id":"host","cwd":"/second","agent":"fake"}),
+            )
+            .unwrap();
+        let (command, _) = state.store.external_pending().unwrap().remove(0);
+        let conn = state.store.conn();
+        assert_eq!(
+            state.store.external_target_hat_in(&conn, &command).unwrap(),
+            Some(other.id.clone())
+        );
+        state
+            .store
+            .external_guard_in(&conn, &command, Some(("host", "/second", &other.id)))
+            .unwrap();
+        drop(conn);
+        state.hosts.replace_path_rules("host", &[]).unwrap();
+        let conn = state.store.conn();
+        // Both hats are granted; a new current hat is still not the admitted
+        // target. Neither the old nor new placement may dispatch this request.
+        assert!(
+            state
+                .store
+                .external_guard_in(&conn, &command, Some(("host", "/second", &other.id)))
+                .is_err()
+        );
+        assert!(
+            state
+                .store
+                .external_guard_in(&conn, &command, Some(("host", "/second", &old)))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_hat_purge_scrubs_uncreated_operations_and_preserves_other_hats_work() {
+        use crate::external_clients::GrantScope;
+        use hennery_kernel::hats::{HatChange, NewRule, PurgeStart};
+        let (_dir, state, legacy) = world();
+        let original = legacy.client.scope.hat_ids[0].clone();
+        let HatChange::Done(other) = state.hosts.create_hat("Purge target", None, 0).unwrap() else {
+            panic!()
+        };
+        state
+            .hosts
+            .replace_path_rules(
+                "host",
+                &[NewRule {
+                    prefix: "/private-project".into(),
+                    hat_id: other.id.clone(),
+                    verified: true,
+                }],
+            )
+            .unwrap();
+        let (_, token) = state
+            .store
+            .issue_external_client(&NewClient {
+                label: "Multi purge fixture".into(),
+                hat_id: String::new(),
+                roots: vec![],
+                scope: Some(GrantScope {
+                    hat_ids: vec![original.clone(), other.id.clone()],
+                    all_hats: false,
+                    roots: vec![],
+                    all_hosts: true,
+                }),
+                read_metadata: true,
+                read_transcript: true,
+                control_sessions: true,
+                existing_sessions: true,
+                expires_in_days: 1,
+            })
+            .unwrap();
+        let identity = state.store.authenticate_external(&token).unwrap().unwrap();
+        let doomed=state.store.external_admit(&identity,"session_create","doomed",&json!({"request_key":"doomed","host_id":"host","cwd":"/private-project/sensitive-name","agent":"fake","config":{"model":"sensitive-model"}})).unwrap();
+        let retained = state
+            .store
+            .external_admit(
+                &identity,
+                "session_create",
+                "retained",
+                &json!({"request_key":"retained","host_id":"host","cwd":"/project","agent":"fake"}),
+            )
+            .unwrap();
+        let moved = state
+            .store
+            .external_admit(
+                &identity,
+                "session_create",
+                "moved",
+                &json!({"request_key":"moved","host_id":"host","cwd":"/private-project/moved","agent":"fake"}),
+            )
+            .unwrap();
+        let (command, _) = state
+            .store
+            .external_pending()
+            .unwrap()
+            .into_iter()
+            .find(|(c, _)| c.operation_id == moved.operation_id)
+            .unwrap();
+        state.store.external_begin(&command).unwrap();
+        state
+            .store
+            .create_session(
+                &moved.session_id,
+                "host",
+                "fake",
+                "/private-project/moved",
+                &other.id,
+                None,
+            )
+            .unwrap();
+        state
+            .store
+            .external_finish(&command, "completed", None, Some(&json!({"retained":true})))
+            .unwrap();
+        state.store.close_now(&moved.session_id).unwrap();
+        assert!(matches!(
+            state.store.reassign_hat(&moved.session_id, &original).unwrap(),
+            crate::store::Reassign::Done(_)
+        ));
+        assert!(matches!(
+            state.hosts.begin_purge(&other.id, 0).unwrap(),
+            PurgeStart::Frozen { .. }
+        ));
+        let conn = state.store.conn();
+        let row:(String,Option<String>,String,Option<String>,String)=conn.query_row("SELECT state,code,args,target_hat_id,session_id FROM external_operations WHERE owner_id = ?1 AND id=?2",rusqlite::params![state.store.owner_id(),doomed.operation_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(
+            row,
+            ("failed".into(), Some("gone".into()), "{}".into(), None, String::new())
+        );
+        let remaining: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT state,args,target_hat_id FROM external_operations WHERE owner_id = ?1 AND id=?2",
+                rusqlite::params![state.store.owner_id(), retained.operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(remaining.0, "queued");
+        assert!(remaining.1.contains("/project"));
+        assert_eq!(remaining.2, Some(original.clone()));
+        let moved_result: (String, String) = conn
+            .query_row(
+                "SELECT state,result FROM external_operations WHERE owner_id = ?1 AND id=?2",
+                rusqlite::params![state.store.owner_id(), moved.operation_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(moved_result, ("completed".into(), json!({"retained":true}).to_string()));
+
+        drop(conn);
+        assert!(state.hosts.finish_purge(&other.id).unwrap());
+        let current = state.store.authenticate_external(&token).unwrap().unwrap();
+        assert_eq!(current.client.scope.hat_ids, [original]);
+        assert!(state.store.external_roots(&legacy).is_ok());
+    }
+
     #[tokio::test]
     async fn revocation_at_final_handoff_does_not_send_or_leave_an_unsent_turn_open() {
         let (_dir, state, identity) = world();
@@ -1141,9 +1349,14 @@ mod tests {
     async fn revoked_catalog_authority_never_polls_the_probe_future() {
         let (_dir, state, identity) = world();
         state.store.revoke_external_client(&identity.client.client_id).unwrap();
-        let result = crate::external_tools::guarded_catalog(&state, Some(&identity), "host", "/project", async {
-            panic!("revoked probe must never be polled")
-        })
+        let result = crate::external_tools::guarded_catalog(
+            &state,
+            Some(&identity),
+            "host",
+            "/project",
+            &identity.client.scope.hat_ids[0],
+            async { panic!("revoked probe must never be polled") },
+        )
         .await;
         assert!(result.is_err());
     }

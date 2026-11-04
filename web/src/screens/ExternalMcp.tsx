@@ -9,8 +9,10 @@ interface Pending {
   hats: ScopeOption[]
   hosts: ScopeOption[]
 }
+interface GrantScope { hat_ids: string[]; all_hats: boolean; roots: { host_id: string; root: string }[]; all_hosts: boolean }
+type Selection = 'selected' | 'current' | 'future'
 interface Grant {
-  client_id: string; label: string; hat_id: string; roots: { host_id: string; root: string }[]
+  client_id: string; label: string; hat_id: string | null; scope?: GrantScope; roots: { host_id: string; root: string }[]
   read_metadata: boolean; existing_sessions: boolean; expires_at: number; revoked: boolean
   read_transcript?: boolean; control_sessions?: boolean
 }
@@ -23,8 +25,11 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
   const [pending, setPending] = useState<Pending | null>(null)
   const [grants, setGrants] = useState<Grant[]>([])
   const [after, setAfter] = useState<string | null>(null)
-  const [hat, setHat] = useState('')
-  const [host, setHost] = useState('')
+  const [hats, setHats] = useState<string[]>([])
+  const [hatMode, setHatMode] = useState<Selection>('selected')
+  const [hosts, setHosts] = useState<string[]>([])
+  const [hostMode, setHostMode] = useState<Selection>('selected')
+  const [allWorkspaces, setAllWorkspaces] = useState(false)
   const [root, setRoot] = useState('')
   const [metadata, setMetadata] = useState(false)
   const [transcript, setTranscript] = useState(false)
@@ -40,7 +45,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
     const epoch = ++generation.current
     const abort = new AbortController()
     locked.current = null
-    setBusy(false); setPending(null); setGrants([]); setAfter(null); setError(''); setHat(''); setHost(''); setRoot(''); setExisting(false); setMetadata(false); setTranscript(false); setControl(false); setDays(7)
+    setBusy(false); setPending(null); setGrants([]); setAfter(null); setError(''); setHats([]); setHosts([]); setHatMode('selected'); setHostMode('selected'); setAllWorkspaces(false); setRoot(''); setExisting(false); setMetadata(false); setTranscript(false); setControl(false); setDays(7)
     const operation = consent
       ? client.request<Pending>('GET', '/api/external-oauth/requests/' + encodeURIComponent(requestId), undefined, { signal: abort.signal }).then(p => {
         if (abort.signal.aborted || epoch !== generation.current) return
@@ -58,7 +63,13 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
     const controller = new AbortController(); mutation.current = controller
     try {
       const result = await client.request<{ redirect_uri: string }>('POST', '/api/external-oauth/consent', {
-        request_id: requestId, allow, hat_id: hat, roots: [{ host_id: host, root }],
+        request_id: requestId, allow,
+        ...(allow ? { scope: {
+          hat_ids: hatMode === 'future' ? [] : hatMode === 'current' ? pending.hats.map(h => h.id) : hats,
+          all_hats: hatMode === 'future',
+          roots: hostMode === 'future' ? [] : (hostMode === 'current' ? pending.hosts.map(h => h.id) : hosts).map(host_id => ({ host_id, root: allWorkspaces ? '/' : root })),
+          all_hosts: hostMode === 'future',
+        } } : {}),
         read_metadata: metadata, existing_sessions: existing && metadata, expires_in_days: days,
         ...(transcript && metadata ? { read_transcript: true } : {}),
         ...(control && metadata ? { control_sessions: true } : {}),
@@ -95,7 +106,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
   return <main className="auth" style={{ alignItems: 'flex-start', overflowY: 'auto', minHeight: 0, flex: 1 }}><section className="auth-card" aria-label="External MCP access" style={{ overflowWrap: 'anywhere' }}>
     <div className="brand-name">hennery</div>
     <h1>{consent ? 'Connect an external MCP client' : 'External MCP clients'}</h1>
-    <p>Choose whether this client may inspect sessions, read conversations, or create and control agents within the selected project. Permissions requested by agents still require your approval in Hennery.</p>
+    <p>Choose whether this client may inspect sessions, read conversations, or create and control agents within the selected scope. Permissions requested by agents still require your approval in Hennery.</p>
     {error && <p role="alert">{error}</p>}
     {consent && !pending && !error && <p role="status">Loading request…</p>}
     {consent && pending && pending.request.request_id === requestId && <>
@@ -107,22 +118,37 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
       <p>Requested scopes: <bdi>{pending.request.scope}</bdi></p>
       <p>Only continue if you started this connection and recognize its destination. Application names are supplied by the client.</p>
       <form onSubmit={submit}>
-        <label className="field"><span className="field-label">Hat</span><select aria-label="Hat" required disabled={busy} value={hat} onChange={e => setHat(e.target.value)}><option value="">Choose a hat</option>{pending.hats.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}</select></label>
-        <label className="field"><span className="field-label">Host</span><select aria-label="Host" required disabled={busy} value={host} onChange={e => setHost(e.target.value)}><option value="">Choose a host</option>{pending.hosts.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}</select></label>
-        <label className="field"><span className="field-label">Workspace root</span><input className="text-input" required disabled={busy} value={root} onChange={e => setRoot(e.target.value)} placeholder="/workspace/project" /></label>
+        <label className="field"><span className="field-label">Hat access</span><select aria-label="Hat access" disabled={busy} value={hatMode} onChange={e => setHatMode(e.target.value as Selection)}>
+          <option value="selected">Selected hats</option><option value="current">All current hats</option><option value="future">All current and future hats</option>
+        </select></label>
+        {hatMode === 'selected' && <label className="field"><span className="field-label">Hat</span><select multiple aria-label="Hat" required disabled={busy} value={hats} onChange={e => setHats(Array.from(e.target.selectedOptions, o => o.value))}>{pending.hats.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}</select></label>}
+        {hatMode === 'current' && <p>Includes these hats only: {pending.hats.map(h => h.name).join(', ')}. New hats need a new consent.</p>}
+        {hatMode === 'future' && <p>Allows every hat you own, including hats created later.</p>}
+        <label className="field"><span className="field-label">Host access</span><select aria-label="Host access" disabled={busy} value={hostMode} onChange={e => setHostMode(e.target.value as Selection)}>
+          <option value="selected">Selected hosts</option><option value="current">All current hosts</option><option value="future">All current and future hosts</option>
+        </select></label>
+        {hostMode === 'selected' && <label className="field"><span className="field-label">Host</span><select multiple aria-label="Host" required disabled={busy} value={hosts} onChange={e => setHosts(Array.from(e.target.selectedOptions, o => o.value))}>{pending.hosts.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}</select></label>}
+        {hostMode === 'current' && <p>Includes these hosts only: {pending.hosts.map(h => h.name).join(', ')}. Newly paired hosts need a new consent.</p>}
+        {hostMode === 'future' ? <p>Allows all workspaces on every paired host you own, including hosts paired later. Access is still limited to the allowed hats.</p> : <>
+          <label className="field"><span><input type="checkbox" checked={allWorkspaces} disabled={busy} onChange={e => setAllWorkspaces(e.target.checked)} /> All workspaces on selected hosts</span></label>
+          {!allWorkspaces && <label className="field"><span className="field-label">Workspace root</span><input className="text-input" required disabled={busy} value={root} onChange={e => setRoot(e.target.value)} placeholder="/workspace/project" /></label>}
+          <p>{allWorkspaces ? 'All directories on the selected hosts, within the allowed hats.' : 'This root and its subdirectories apply to each selected host, within the allowed hats.'}</p>
+        </>}
         <label className="field"><span className="field-label">Access expires in</span><select aria-label="Access expires in" disabled={busy} value={days} onChange={e => setDays(Number(e.target.value))}>{[1, 7, 30, 90].map(d => <option key={d} value={d}>{d} days</option>)}</select></label>
         <label className="field"><span><input type="checkbox" checked={metadata} disabled={busy || !pending.request.scope.split(' ').includes('hennery:sessions:read')} onChange={e => { setMetadata(e.target.checked); if (!e.target.checked) { setExisting(false); setTranscript(false); setControl(false) } }} /> Read session metadata</span></label>
         <label className="field"><span><input type="checkbox" checked={transcript} disabled={busy || !metadata || !pending.request.scope.split(' ').includes('hennery:sessions:transcript')} onChange={e => setTranscript(e.target.checked)} /> Read session conversations</span></label>
         <label className="field"><span><input type="checkbox" checked={control} disabled={busy || !metadata || !pending.request.scope.split(' ').includes('hennery:sessions:control')} onChange={e => setControl(e.target.checked)} /> Create, prompt and control sessions</span></label>
         {control && <p>Session control includes changing the model and permission mode, answering ordinary forms, sending images, editing queued prompts, and renaming, pinning or cloning sessions. Agent actions follow that mode; permission requests still require approval in Hennery.</p>}
-        <label className="field"><span><input type="checkbox" checked={existing} disabled={busy || !metadata} onChange={e => setExisting(e.target.checked)} /> Also allow existing sessions within this hat, host and root</span></label>
+        <label className="field"><span><input type="checkbox" checked={existing} disabled={busy || !metadata} onChange={e => setExisting(e.target.checked)} /> Also allow existing sessions within the selected scope</span></label>
         <p>By default, access is limited to sessions created by this client. Including existing sessions also allows the selected read and control actions on those sessions.</p>
         <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => void decide(false)}>Deny</button>
-        <button type="submit" className="btn btn-primary" disabled={busy || !hat || !host || !root.startsWith('/')}>Allow selected access</button>
+        <button type="submit" className="btn btn-primary" disabled={busy || (hatMode === 'selected' && !hats.length) || (hostMode === 'selected' && !hosts.length) || (hostMode !== 'future' && !allWorkspaces && !root.startsWith('/'))}>Allow selected access</button>
       </form>
     </>}
     {!consent && <ul aria-label="Client grants">{grants.map(g => <li key={g.client_id}>
-      <h2><bdi>{g.label}</bdi></h2><p>Hat: <bdi>{g.hat_id}</bdi></p>
+      <h2><bdi>{g.label}</bdi></h2>
+      <p>Hats: {g.scope?.all_hats ? 'All current and future hats' : (g.scope?.hat_ids ?? (g.hat_id ? [g.hat_id] : [])).map(id => <bdi key={id}>{id} </bdi>)}</p>
+      {g.scope?.all_hosts && <p>All workspaces on all current and future hosts.</p>}
       {g.roots.map(r => <p key={r.host_id + r.root}><bdi>{r.host_id}: {r.root}</bdi></p>)}
       <p>{g.existing_sessions ? 'Existing sessions included' : 'Created by this client only'}; {g.read_metadata ? 'metadata enabled' : 'discovery only'}.</p>
       <p>{g.read_transcript ? 'Conversation access enabled' : 'No conversation access'}; {g.control_sessions ? 'session control enabled' : 'no session control'}.</p>

@@ -136,6 +136,8 @@ pub(crate) struct Consent {
     #[serde(default)]
     pub roots: Vec<RootGrant>,
     #[serde(default)]
+    pub scope: Option<external_clients::GrantScope>,
+    #[serde(default)]
     pub read_metadata: bool,
     #[serde(default)]
     pub read_transcript: bool,
@@ -191,7 +193,7 @@ fn pending(conn: &rusqlite::Connection, owner: &str, id: &str) -> Result<Option<
       params![owner,id,unix_now()],|r|Ok(Pending{request_id:r.get(0)?,client_id:r.get(1)?,client_name:r.get(2)?,redirect_uri:r.get(3)?,resource:r.get(4)?,scope:r.get(5)?,state:r.get(6)?,expires_at:r.get(7)?})).optional()?)
 }
 fn valid_grant(conn: &rusqlite::Connection, owner: &str, grant: &str) -> Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM external_clients c JOIN hats h ON h.owner_id = c.owner_id AND h.id=c.hat_id WHERE c.owner_id = ?1 AND c.id=?2 AND c.revoked_at IS NULL AND c.expires_at>?3 AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = c.owner_id AND p.hat_id=c.hat_id))",params![owner,grant,unix_now()],|r|r.get(0))?)
+    external_clients::active_grant(conn, owner, grant)
 }
 fn revoke(conn: &rusqlite::Connection, owner: &str, grant: &str) -> Result<()> {
     conn.execute("UPDATE external_clients SET revoked_at=COALESCE(revoked_at,?3),revision=revision+CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END WHERE owner_id = ?1 AND id=?2",params![owner,grant,unix_now()])?;
@@ -344,6 +346,7 @@ impl Store {
             );
         }
         let input = NewClient {
+            scope: c.scope.clone(),
             label: p.client_name,
             hat_id: c.hat_id.clone(),
             roots: c.roots.clone(),
@@ -567,6 +570,7 @@ mod tests {
         }
         fn consent(&self, id: &str) -> Consent {
             Consent {
+                scope: None,
                 request_id: id.into(),
                 allow: true,
                 hat_id: self.hat.clone(),
@@ -1017,6 +1021,115 @@ mod tests {
             .unwrap();
         assert!(w.store.external_roots(&identity).is_err());
     }
+    #[test]
+    fn multi_hat_oauth_consent_refresh_reopen_and_partial_purge_preserve_the_exact_selection() {
+        use crate::external_clients::GrantScope;
+        use hennery_kernel::hats::HatChange;
+        let w = World::new();
+        let HatChange::Done(second) = w.host.create_hat("Second", None, 0).unwrap() else {
+            panic!()
+        };
+        let HatChange::Done(excluded) = w.host.create_hat("Excluded", None, 0).unwrap() else {
+            panic!()
+        };
+        let m = w.client();
+        let mut a = w.authorization(&m);
+        a.scope = Some(format!("{SCOPE} {CONTROL_SCOPE} {TRANSCRIPT_SCOPE} offline_access"));
+        let request = w.store.begin_oauth(&a, &m, RESOURCE).unwrap();
+        let mut consent = w.consent(&request);
+        consent.hat_id.clear();
+        consent.roots.clear();
+        consent.scope = Some(GrantScope {
+            hat_ids: vec![w.hat.clone(), second.id.clone()],
+            all_hats: false,
+            roots: vec![RootGrant {
+                host_id: "host".into(),
+                root: "/".into(),
+            }],
+            all_hosts: false,
+        });
+        consent.read_transcript = true;
+        consent.control_sessions = true;
+        consent.existing_sessions = true;
+        let callback = w.store.consent_oauth(&consent, RESOURCE, ISSUER).unwrap();
+        let code = Url::parse(&callback)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+        let request = TokenRequest {
+            grant_type: "authorization_code".into(),
+            client_id: a.client_id.clone(),
+            resource: RESOURCE.into(),
+            code: Some(code),
+            redirect_uri: Some(a.redirect_uri),
+            code_verifier: Some("a".repeat(43)),
+            refresh_token: None,
+            scope: None,
+            client_secret: None,
+        };
+        let first = w.store.exchange_oauth(&request, RESOURCE).unwrap();
+        let identity = w
+            .store
+            .authenticate_external_resource(&first.access_token, RESOURCE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.client.scope.hat_ids.len(), 2);
+        assert!(identity.client.hat_id.is_none());
+        assert!(!identity.client.allows_hat(&excluded.id));
+        w.store
+            .create_session("second-session", "host", "fake", "/project", &second.id, None)
+            .unwrap();
+        w.store
+            .create_session("excluded-session", "host", "fake", "/project", &excluded.id, None)
+            .unwrap();
+        assert_eq!(w.store.external_sessions(&identity, "", None, 50).unwrap().len(), 1);
+        w.store
+            .conn()
+            .execute(
+                "INSERT INTO purged_hats(owner_id,hat_id,purged_at) VALUES(?1,?2,0)",
+                params![w.store.owner_id(), w.hat],
+            )
+            .unwrap();
+        let refreshed = w
+            .store
+            .exchange_oauth(
+                &TokenRequest {
+                    grant_type: "refresh_token".into(),
+                    client_id: a.client_id,
+                    resource: RESOURCE.into(),
+                    code: None,
+                    redirect_uri: None,
+                    code_verifier: None,
+                    refresh_token: first.refresh_token,
+                    scope: None,
+                    client_secret: None,
+                },
+                RESOURCE,
+            )
+            .unwrap();
+        let reopened = Store::open(&w.dir.path().join("test.db")).unwrap();
+        let id = reopened
+            .authenticate_external_resource(&refreshed.access_token, RESOURCE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(id.client.scope, identity.client.scope);
+        assert!(id.client.control_sessions && id.client.read_transcript);
+        assert_eq!(
+            reopened.external_sessions(&id, "", None, 50).unwrap()[0].session_id,
+            "second-session"
+        );
+        reopened.revoke_external_client(&id.client.client_id).unwrap();
+        assert!(
+            w.store
+                .authenticate_external_resource(&refreshed.access_token, RESOURCE)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn current_hat_root_checks_apply_at_consent_and_existing_access_requires_opt_in() {
         let w = World::new();

@@ -477,6 +477,7 @@ END;",
     include_str!("external_oauth.sql"),
     include_str!("external_control.sql"),
     include_str!("external_tools.sql"),
+    include_str!("external_scope.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -5716,6 +5717,119 @@ mod tests {
     fn a_search_escapes_like_wildcards() {
         assert_eq!(like_pattern("100%_a\\b"), "%100\\%\\_a\\\\b%");
         assert_eq!(like_pattern("plain"), "%plain%");
+    }
+
+    #[test]
+    fn external_scope_upgrade_preserves_legacy_authority_and_all_dependent_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("migration.db");
+        let mut conn = hennery_kernel::db::open(&db).unwrap();
+        let owner = hennery_kernel::db::kernel_owner(&mut conn).unwrap();
+        hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
+        let hat: String = conn
+            .query_row("SELECT id FROM hats WHERE owner_id=?1 LIMIT 1", [&owner], |r| r.get(0))
+            .unwrap();
+        let credential = format!("hnry_external_{}", "a".repeat(64));
+        conn.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at,read_transcript,control_sessions) VALUES(?1,'old','Old grant',?2,?3,1,1,7,9999999999,1,1)",params![owner,hat,hennery_kernel::secret::sha256_hex(credential.as_bytes())]).unwrap();
+        conn.execute_batch(&format!("
+          INSERT INTO external_client_roots VALUES('{owner}','old','host','/project');
+          INSERT INTO external_client_sessions VALUES('{owner}','old','session');
+          INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,state,args,created_at) VALUES('{owner}','op','old',7,'key','digest','session_create','session','queued','{{}}',0);
+          INSERT INTO external_oauth_tokens VALUES('{owner}','old','app','resource','scope','access',9999999999,'refresh',9999999999);
+          INSERT INTO external_oauth_refresh_history VALUES('{owner}','history','old',9999999999);
+          INSERT INTO external_uploads VALUES('{owner}','upload','old','session','image/png','hash',1,1,1,9999999999);
+          INSERT INTO external_upload_chunks VALUES('{owner}','upload',0,'digest',X'00');
+          INSERT INTO external_operation_uploads VALUES('{owner}','op','upload');
+        ")).unwrap();
+        hennery_kernel::db::migrate(&mut conn, MIGRATIONS).unwrap();
+        for table in [
+            "external_clients",
+            "external_client_roots",
+            "external_client_sessions",
+            "external_operations",
+            "external_oauth_tokens",
+            "external_oauth_refresh_history",
+            "external_uploads",
+            "external_upload_chunks",
+            "external_operation_uploads",
+            "external_client_hats",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1,
+                "{table}"
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT target_hat_id FROM external_operations WHERE id='op'", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            hat
+        );
+        assert!(!conn.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
+        drop(conn);
+        let store = Store::open(&db).unwrap();
+        let identity = store.authenticate_external(&credential).unwrap().unwrap();
+        assert_eq!(identity.client.revision, 7);
+        assert_eq!(identity.client.scope.hat_ids, [hat]);
+        assert!(!identity.client.scope.all_hats && !identity.client.scope.all_hosts);
+        assert!(identity.client.read_transcript && identity.client.control_sessions);
+        // The rebuilt parent's revocation triggers still cancel queued work
+        // and scrub staging; its foreign keys still remove dependent receipts.
+        store.revoke_external_client("old").unwrap();
+        let conn = store.conn();
+        assert_eq!(
+            conn.query_row("SELECT state FROM external_operations WHERE id='op'", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM external_uploads", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        conn.execute("DELETE FROM external_clients WHERE id='old'", []).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM external_oauth_tokens", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM external_operations", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn external_scope_upgrade_scrubs_uncreated_work_for_an_already_frozen_hat() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("frozen-upgrade.db");
+        let mut conn = hennery_kernel::db::open(&db).unwrap();
+        let owner = hennery_kernel::db::kernel_owner(&mut conn).unwrap();
+        hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
+        let hat: String = conn
+            .query_row("SELECT id FROM hats WHERE owner_id=?1 LIMIT 1", [&owner], |r| r.get(0))
+            .unwrap();
+        conn.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at) VALUES(?1,'frozen-client','Frozen fixture',?2,'hash',1,1,1,9999999999)",params![owner,hat]).unwrap();
+        conn.execute("INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,state,args,created_at) VALUES(?1,'queued-create','frozen-client',1,'key','digest','session_create','uncreated','queued',?2,0)",params![&owner,serde_json::json!({"cwd":"/sensitive-project"}).to_string()]).unwrap();
+        conn.execute(
+            "INSERT INTO purged_hats(owner_id,hat_id,purged_at) VALUES(?1,?2,0)",
+            params![owner, hat],
+        )
+        .unwrap();
+        hennery_kernel::db::migrate(&mut conn, MIGRATIONS).unwrap();
+        let row: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT state,args,target_hat_id FROM external_operations WHERE owner_id=?1 AND id='queued-create'",
+                [&owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("failed".into(), "{}".into(), None));
+        assert!(!conn.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
     }
 
     /// Plan 6b decision 5: every stamp has the same width, so comparing

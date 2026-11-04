@@ -102,7 +102,7 @@ fn tools(identity: &ExternalIdentity) -> Vec<Value> {
         json!({"name":"workspace_list","description":"List explicitly granted canonical roots, not arbitrary files or other projects.","inputSchema":{"type":"object","properties":{"host_id":{"type":"string"}},"required":["host_id"],"additionalProperties":false}}),
     ];
     if identity.client.read_metadata {
-        tools.push(json!({"name":"session_list","description":"Read bounded session metadata in this client's hat/host/root and created-or-existing session grant; never acknowledges unseen activity.","inputSchema":{"type":"object","properties":{"after":{"type":"string","maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50},"filters":{"type":"object","properties":{"host_id":{"type":"string"},"agent":{"type":"string"},"cwd":{"type":"string"},"lifecycle":{"type":"string"},"activity":{"type":"string"},"query":{"type":"string"},"agent_session_id":{"type":"string"},"sidebar_pinned":{"type":"boolean"}},"additionalProperties":false}},"additionalProperties":false}}));
+        tools.push(json!({"name":"session_list","description":"Read bounded session metadata in this client's hat/host/root and created-or-existing session grant; never acknowledges unseen activity.","inputSchema":{"type":"object","properties":{"after":{"type":"string","maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":50},"filters":{"type":"object","properties":{"hat_id":{"type":"string"},"host_id":{"type":"string"},"agent":{"type":"string"},"cwd":{"type":"string"},"lifecycle":{"type":"string"},"activity":{"type":"string"},"query":{"type":"string"},"agent_session_id":{"type":"string"},"sidebar_pinned":{"type":"boolean"}},"additionalProperties":false}},"additionalProperties":false}}));
         tools.push(json!({"name":"session_get","description":"Read one authorized session's metadata. Transcript and permission answers are not exposed.","inputSchema":{"type":"object","properties":{"session_id":{"type":"string","minLength":1,"maxLength":128}},"required":["session_id"],"additionalProperties":false}}));
     }
     for tool in &mut tools {
@@ -161,7 +161,7 @@ fn invoke(state: &AppState, identity: &ExternalIdentity, call: Call) -> anyhow::
         "hennery_capabilities" => {
             let _: std::collections::BTreeMap<String, Value> = arguments(call.arguments.clone())?;
             anyhow::ensure!(call.arguments == json!({}), "invalid_arguments");
-            json!({"client_id":identity.client.client_id,"hat_id":identity.client.hat_id,"revision":identity.client.revision,"expires_at":identity.client.expires_at,"existing_sessions":identity.client.existing_sessions,"read_metadata":identity.client.read_metadata,"read_transcript":identity.client.read_transcript,"execution":identity.client.control_sessions,"max_page":50,"permissions":"operator_ui","source_policy":"server_resolved_per_hat_actual_acp"})
+            json!({"client_id":identity.client.client_id,"hat_id":identity.client.hat_id,"scope":identity.client.scope,"hats":state.store.external_hats(identity)?,"revision":identity.client.revision,"expires_at":identity.client.expires_at,"existing_sessions":identity.client.existing_sessions,"read_metadata":identity.client.read_metadata,"read_transcript":identity.client.read_transcript,"execution":identity.client.control_sessions,"max_page":50,"permissions":"operator_ui","source_policy":"server_resolved_per_hat_actual_acp"})
         }
         "host_list" => {
             anyhow::ensure!(call.arguments == json!({}), "invalid_arguments");

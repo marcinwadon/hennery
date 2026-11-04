@@ -98,10 +98,10 @@ the external client does not collect those credentials.
 Consent shows the untrusted application name, client ID, exact callback and
 callback host, with a loopback warning where relevant. Nothing is granted by
 visiting a link or by discovering/registering a client. The operator must choose
-a hat, host, canonical root and expiry, then explicitly allow. The current
-screen selects one host/root pair per connection; the operator API can issue
-multiple pairs. Existing-session access is unchecked by default and needs its
-own explicit choice within the selected boundaries. Denial issues no grant.
+one or more hats, hosts, canonical roots and an expiry, then explicitly allow.
+Selected hats intersect with selected host/root pairs. Existing-session access
+is unchecked by default and needs its own explicit choice within those boundaries.
+Denial issues no grant. The scope choices and migration rules are detailed below.
 
 Issuance checks owner/hat/purge, paired non-revoked hosts and server path-rule
 resolution in the same transaction as code admission. Execution additionally
@@ -140,6 +140,75 @@ scope set in any order. Expansion and downscoping are rejected; a new explicit
 consent is needed to change scope. Cached principals are revalidated at the database
 gate and before publishing collected results; expiration, grant revocation,
 hat purge and host revocation cannot be bypassed by reconnecting or replaying.
+
+## Multiple hats and hosts in one connection
+
+One external connection can cover multiple hats and host/root pairs. The
+consent UI offers three independent choices for hats and hosts:
+
+- **Selected**: choose one or more named objects.
+- **All current**: snapshot exactly the IDs displayed on the consent screen.
+  Newly created hats or newly paired hosts are not included.
+- **All current and future**: explicitly opt into every owned hat or paired
+  non-revoked host, including objects added later. These are separate choices;
+  allowing future hosts does not implicitly allow future hats.
+
+For selected/current hosts, choose a common workspace root or explicitly select
+all workspaces (`/`). The API supports different roots per host. Future-host
+access covers all workspaces on those hosts, still intersecting with the allowed
+hats. Every query and command remains restricted to the credential owner's
+objects; "all" never means other operators' objects.
+
+The operator API and OAuth consent accept the following `scope` instead of the
+legacy `hat_id` and `roots` fields (mixing the two formats is rejected):
+
+```json
+{
+  "scope": {
+    "hat_ids": ["personal-hat", "work-hat"],
+    "all_hats": false,
+    "roots": [
+      { "host_id": "laptop", "root": "/projects" },
+      { "host_id": "server", "root": "/srv/projects" }
+    ],
+    "all_hosts": false
+  }
+}
+```
+
+Selected lists must be nonempty, contain at most 128 hats and 128 root pairs,
+and refer to current owned objects. Roots must be canonical absolute paths.
+To explicitly include future hats, use `all_hats:true` with an empty `hat_ids`;
+to include future hosts, use `all_hosts:true` with empty `roots`. A wildcard
+and a populated selection for the same dimension are rejected as ambiguous.
+The ordinary metadata/transcript/control/existing-session permissions and finite
+expiry are independent of these scope choices.
+
+Existing grants migrate as their original single hat and explicit roots; token
+hashes, revision, expiry, OAuth refresh families, accepted operations and image
+staging survive without broadening. Changing scope requires new consent, and
+refresh never expands a grant. Purging/removing one selected hat excludes it
+immediately, including from cached principals, while other selected live hats
+remain accessible. A grant with no remaining live allowed hats cannot authenticate
+or refresh. A purge immediately scrubs accepted creation/clone payloads that do
+not yet have a session for the normal deletion hooks to enumerate. The upgrade
+also scrubs this work for hats already frozen before migration. Existing sessions
+use their ordinary deletion hooks; sessions reassigned to another live hat and
+that hat's queued work remain intact. Revoking the whole grant invalidates all
+its hats and hosts.
+
+Session creation and cloning resolve the actual hat from the selected host/path,
+snapshot that hat at admission, and fence it through host dispatch. A path-rule
+change cannot redirect already accepted creation into another hat, even if both
+hats are allowed. Runtime catalogs use that same actual-hat source policy and
+recheck it across asynchronous probes. Host-side canonical path and normal
+workspace limits remain enforced.
+
+`hennery_capabilities` reports `scope` and the currently live allowed `hats`
+(with IDs and names). Its legacy `hat_id` is null for newly issued multi-scope
+grants. `host_list` and `workspace_list` enumerate the permitted live hosts/roots;
+`session_list.filters.hat_id` can narrow the grant to one hat, never widen it.
+Grant management displays the full saved selection and explicit future access.
 
 ## Read tools
 

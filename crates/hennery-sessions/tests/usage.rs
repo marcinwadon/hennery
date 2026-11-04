@@ -38,8 +38,8 @@ fn external_migrations_preserve_v37_usage_and_are_idempotent() {
     assert_eq!(before["session"]["tokens"]["total_tokens"], 100);
     drop(store);
     let conn = rusqlite::Connection::open(&path).unwrap();
-    // Main's last schema already owns the usage columns and indexes. Only the
-    // two unpublished external migrations are absent from an upgrading DB.
+    // A v37 database already owns the usage columns and indexes. Reapply all
+    // subsequent external migrations without changing historical usage.
     conn.execute_batch(concat!(
         include_str!("fixtures/undo_external.sql"),
         "PRAGMA user_version=37;"
@@ -53,11 +53,11 @@ fn external_migrations_preserve_v37_usage_and_are_idempotent() {
         );
         let count: u32 = conn.query_row(
             "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN (
-              'external_clients','external_client_roots','external_client_sessions',
+              'external_clients','external_client_roots','external_client_hats','external_client_sessions',
               'external_oauth_clients','external_oauth_requests','external_oauth_tokens','external_oauth_refresh_history')",
             [], |row| row.get(0),
         ).unwrap();
-        assert_eq!(count, 7);
+        assert_eq!(count, 8);
     }
 }
 
