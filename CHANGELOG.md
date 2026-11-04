@@ -4,6 +4,12 @@
 
 ## 0.5.2
 
+- Accept shared OAuth client metadata documents that list additional grant
+  types, fixing Claude's external MCP sign-in without enabling unsupported grants.
+- Reuse fully qualified main archives, crates and images for the exact signed
+  release source; retain native installation proofs and fresh tag-time audits.
+- Avoid repeating OpenSSL's upstream tests when starting a development shell;
+  production Nix packages retain their full upstream test suite.
 - Select Nix package checks independently from source tests and README recipes;
   avoid rebuilding archives for unrelated CI workflow and tooling changes.
 - Add a read-only CI watcher with exact-source run binding, atomic checkpoints,
@@ -15,6 +21,9 @@
   matching source/input digests and complete reports from all three host platforms.
 
 ## 0.5.1
+
+Publication did not complete because GitHub could not assign a macOS ARM runner.
+The signed tag is retained; these changes ship with 0.5.2.
 
 - Replace unsupported bundled OpenSSL 3.6.3 with checksum-pinned OpenSSL
   3.5.9 LTS in static release archives and the Nix package. Cargo source
