@@ -87,16 +87,14 @@ verification bridge. Authenticate source before evaluating a release flake.
 
 ## Workflow and credentials
 
-Read-only `packaging.yml` shares construction between packaging-input PRs,
-main and tags. PRs use Linux only, including the Nix and README recipes in core
-CI. Main retains macOS smoke and native packaging/recipes; scheduled maintenance
-runs the full macOS/ARM suites weekly. Prepare builds UI/audits once; native
-builders reuse musl binaries for images. The expensive seven-crate acceptance
-runs on release tags and PRs changing package metadata/version, dist configuration
-or crate packaging scripts. Dependency-only Cargo changes and unrelated
-`packaging/**` changes do not select it; there is no duplicate main-push crates
-acceptance. Assembly still accepts installers/formula and OCI using the archives
-that actually ran, with native installer/Homebrew checks for those platforms.
+Read-only `packaging.yml` constructs packaging-input PR and main candidates.
+PRs use Linux only. Main qualifies all three native archives and installers;
+scheduled maintenance runs the full macOS/ARM suites weekly. Prepare builds
+UI/audits once; native builders reuse musl binaries for images. Stable main
+candidates qualify all seven crates and retain all four channels' payloads.
+PRs select crate acceptance for package metadata/version, dist configuration or
+crate packaging script changes. Assembly accepts installers/formula and OCI
+using the archives that actually ran, with native Homebrew checks on every target.
 Selected failures stop consumers; intentional crates skips permit assembly.
 Actionlint and a small static test cover tag-only publication, permissions,
 one protected publisher and pinned actions.
@@ -106,7 +104,13 @@ Local acceptance follows the platform/crate selection above. Unselected crate/OC
 materials are removed from the publishable payload before freezing. PRs have no
 publication secrets, OIDC or attestation authority. Release prepare authenticates
 the signed tag/version/source and waits for main-push CI for the exact commit.
-No restored project build caches are used. A build or attestation rerun cannot
+It performs fresh audits and promotes a successful main packaging run for that
+exact SHA, downloading the payload and all three native acceptance proofs by
+immutable IDs and verifying their ZIP digests. Native proofs must bind the
+original payload's private checksum list. Public archives/crates/images are
+unchanged; new private metadata binds the authenticated tag object, and the
+attested payload records the main input IDs/digests and fresh audit reports.
+Tags require no second macOS build. A build or attestation rerun cannot
 rebuild an old version; retries target only the publisher.
 
 The separate tag-only attester records final digests and immutable artifact IDs.

@@ -1,4 +1,4 @@
-# Shared read-only packaging. PRs qualify Linux; main and tags add macOS; only release.yml can attest or publish.
+# Read-only packaging. Main qualifies all platforms; tags promote those exact bytes.
 name: packaging
 'on':
   workflow_call:
@@ -11,7 +11,7 @@ name: packaging
       channels:
         value: ${{ jobs.prepare.outputs.channels }}
       artifact_id:
-        value: ${{ jobs.assemble.outputs.artifact_id }}
+        value: ${{ jobs.reuse.outputs.artifact_id || jobs.assemble.outputs.artifact_id }}
   pull_request:
     paths:
     - .github/workflows/packaging.yml
@@ -122,6 +122,7 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: nix develop .#release -c python3 packaging/release/core_ci.py
     - name: Build the UI and collect frontend licences once
+      if: ${{ !inputs.release }}
       run: |
         nix develop .#web -c pnpm --dir web install --frozen-lockfile
         nix develop .#web -c pnpm --dir web build
@@ -132,8 +133,9 @@ jobs:
           --frontend-licences "$RUNNER_TEMP/frontend-licences.json" --output "$RUNNER_TEMP/package-inputs/frontend"
     - name: Audit dependencies once; findings stop packaging
       run: |
+        mkdir -p release-materials
         sh packaging/release/advisory-materials.sh
-        mkdir "$RUNNER_TEMP/package-inputs/advisories"
+        mkdir -p "$RUNNER_TEMP/package-inputs/advisories"
         cp release-materials/* "$RUNNER_TEMP/package-inputs/advisories/"
     - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
@@ -142,6 +144,7 @@ jobs:
         if-no-files-found: error
         retention-days: 90
   archive:
+    if: ${{ !inputs.release }}
     needs:
     - prepare
     strategy:
@@ -241,7 +244,7 @@ jobs:
     env:
       RELEASE_SOURCE_SHA: ${{ github.sha }}
   crates:
-    if: needs.prepare.outputs.crates == 'true'
+    if: ${{ !inputs.release && needs.prepare.outputs.crates == 'true' }}
     needs:
     - prepare
     runs-on: ubuntu-24.04
@@ -305,7 +308,7 @@ jobs:
     permissions:
       contents: read
   assemble:
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.archive.result == 'success' && (needs.crates.result == 'success' || needs.crates.result == 'skipped') }}
+    if: ${{ !cancelled() && !inputs.release && needs.prepare.result == 'success' && needs.archive.result == 'success' && (needs.crates.result == 'success' || needs.crates.result == 'skipped') }}
     needs:
     - prepare
     - archive
@@ -355,7 +358,7 @@ jobs:
     permissions:
       contents: read
   native:
-    if: ${{ !cancelled() && needs.assemble.result == 'success' }}
+    if: ${{ !cancelled() && !inputs.release && needs.assemble.result == 'success' }}
     needs:
     - prepare
     - assemble
@@ -390,3 +393,37 @@ jobs:
         if-no-files-found: error
     permissions:
       contents: read
+  reuse:
+    if: inputs.release
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.payload.outputs.artifact-id }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+      with:
+        github_access_token: ${{ github.token }}
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      with:
+        name: release-inputs
+        path: fresh-inputs
+    - name: Promote exact main payload with all three native acceptance proofs
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: nix develop .#release -c python3 packaging/release/qualified_main.py payload --advisories fresh-inputs/advisories
+    - id: payload
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: release-payload-${{ github.run_id }}
+        path: payload/
+        retention-days: 90
+        if-no-files-found: error

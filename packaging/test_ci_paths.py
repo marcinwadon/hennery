@@ -246,6 +246,16 @@ class PackagingSelection(unittest.TestCase):
         main = self.select(event='push')
         self.assertEqual(len(json.loads(main['archive_matrix'])['include']), 3)
         self.assertIn('aarch64-apple-darwin', main['targets'])
+        self.assertEqual(main['crates'], 'true')
+
+    def test_only_main_candidate_retains_all_stable_channels_without_tag_authority(self):
+        env = self.env | {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/main',
+                          'GITHUB_SHA': self.git('rev-parse', 'HEAD').strip()}
+        result = subprocess.run([sys.executable, str(SCRIPT.parent / 'release/package_context.py'), 'prepare'],
+                                cwd=self.root, env=env, capture_output=True, text=True, check=True)
+        outputs = dict(line.split('=', 1) for line in result.stdout.splitlines())
+        self.assertEqual(json.loads(outputs['channels']), ['crates', 'ghcr', 'github', 'homebrew'])
+        self.assertEqual(json.loads(self.select()['channels']), ['github'])
 
 
 class PackagingTriggers(unittest.TestCase):

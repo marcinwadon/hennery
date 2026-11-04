@@ -168,14 +168,29 @@ cargo-binstall `signer-identity` tag URL. Check them with
 `nix develop -c node --test packaging/binstall-policy.test.mjs`
 and `nix develop -c pnpm --dir web test src/lib/releaseVersions.test.ts`.
 
-The tag-only `release.yml` calls read-only reusable `packaging.yml`. Prepare
-requires successful main-push core CI for the exact signed commit, builds the UI
-and audits dependencies once. Native builders share their archives with image,
-installer and Homebrew acceptance; Linux qualifies all seven crate tarballs.
-PRs run Linux packaging only; main/release add macOS. Core macOS smoke runs on
-main, with full macOS/ARM suites weekly. Crate acceptance runs on tags and PRs
-changing package metadata/version, dist configuration or crate packaging scripts;
-dependency-only Cargo and unrelated packaging edits skip it. No restored project build cache is used in releases.
+The tag-only `release.yml` calls read-only reusable `packaging.yml`. Main builds
+the UI, audits dependencies and qualifies all three native archives, their OCI
+images, installers and Homebrew operations. Stable main candidates also qualify
+all seven crate tarballs and retain every selected channel's complete payload.
+PRs run Linux packaging only, with crate acceptance selected by package metadata,
+dist configuration and crate packaging changes. Core macOS smoke runs on main,
+with full macOS/ARM suites weekly.
+
+Before tagging, require successful core CI and packaging for the exact main SHA.
+Tags run fresh dependency audits, then reuse that successful main run's immutable
+payload and all three Homebrew proof artifacts. The selector refuses another
+source, workflow, event or branch, expired/ambiguous artifacts, changed ZIP
+digests, incomplete channels/targets or native proofs for different checksums.
+Archive, crate, installer and image bytes remain unchanged. Only the unsigned
+candidate's metadata and private checksum list are replaced to bind the verified
+signed tag object; a receipt records the original main artifact IDs/digests and
+fresh tag audit reports are included in the attested closure. No macOS runner or
+second native build is needed after tagging. Missing qualification requires a
+new main preparation commit, rather than a fallback build under the tag.
+
+The development shell skips repeated OpenSSL upstream tests at shell startup;
+the production Nix package still runs the complete upstream suite on each
+qualified platform. This does not change native archive acceptance.
 Actions remain commit-pinned. Native YAML dependencies and actionlint replace
 custom job-name, DAG and command-order policing.
 

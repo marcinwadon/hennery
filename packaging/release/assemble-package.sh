@@ -4,7 +4,7 @@ set -eu
 sh packaging/install-dist.sh "$RUNNER_TEMP/dist-bin"
 python3 packaging/release/assemble.py candidates target/distrib --targets "$PACKAGING_TARGETS"
 if [ "$PACKAGING_CRATES" = true ]; then
-    nix develop -c node packaging/prepare-crates.mjs --stage crates-flat target/distrib
+    nix develop .#release -c node packaging/prepare-crates.mjs --stage crates-flat target/distrib
 fi
 # cargo-dist imports every *dist-manifest.json. Its stdout must stay outside
 # the input directory until generation succeeds (alpha.3 regression).

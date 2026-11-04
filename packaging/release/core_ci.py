@@ -3,6 +3,7 @@
 import os
 import subprocess
 import time
+import uuid
 from urllib.parse import urlencode
 
 import gate
@@ -15,7 +16,7 @@ def main():
     query = urlencode({'event': 'push', 'branch': 'main', 'head_sha': source})
     deadline = time.monotonic() + 45 * 60
     while True:
-        runs = api.get('/actions/workflows/ci.yml/runs?' + query)['workflow_runs']
+        runs = api.get('/actions/workflows/ci.yml/runs?' + query + '&_=' + uuid.uuid4().hex)['workflow_runs']
         exact = [run for run in runs if run.get('head_sha') == source and run.get('head_branch') == 'main'
                  and run.get('event') == 'push']
         if any(run.get('status') == 'completed' and run.get('conclusion') == 'success' for run in exact):

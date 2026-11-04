@@ -22,7 +22,10 @@
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
         pkgs = import nixpkgs { inherit system; overlays = [ (import ./nix/node-security-overlay.nix) ]; };
-        henneryOpenSSL = import ./nix/openssl.nix pkgs;
+        # Shell startup must not repeat OpenSSL's full upstream suite in every
+        # Rust/cache job. The actual Nix application imports the checked variant
+        # independently in nix/package.nix, on all three qualified platforms.
+        henneryOpenSSL = (import ./nix/openssl.nix pkgs).overrideAttrs { doCheck = false; };
         web = import nixpkgs-web { inherit system; overlays = [ (import ./nix/node-security-overlay.nix) ]; };
         # The web UI (plan 7e-ii-b), built with nixpkgs-web's Node and pnpm.
         webUi = import ./nix/web.nix { pkgs = web; };

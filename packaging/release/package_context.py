@@ -15,7 +15,9 @@ def context(release):
     source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     gate.require(source == os.environ['GITHUB_SHA'], 'packaging source differs from checkout')
     version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
-    value = release_run.configuration() if release else {'channels': ['github'], 'tag_object': '0' * 40}
+    main = os.environ.get('GITHUB_EVENT_NAME') == 'push' and os.environ.get('GITHUB_REF') == 'refs/heads/main'
+    value = release_run.configuration() if release else {
+        'channels': release_run.channels('v' + version) if main else ['github'], 'tag_object': '0' * 40}
     return value | {'tag': 'v' + version, 'source': source}
 
 
@@ -27,7 +29,7 @@ def selection(release, base):
     ]
     if not pr:
         archives.append({'target': 'aarch64-apple-darwin', 'runner': 'macos-15'})
-    crates = release
+    crates = release or (not pr and '-' not in tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version'])
     if not crates and pr and base and set(base) != {'0'}:
         paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, 'HEAD', '--']).decode().split('\0')
         scripts = ('dist-workspace.toml', 'packaging/prepare-crates.mjs', 'packaging/crate-release.mjs',
