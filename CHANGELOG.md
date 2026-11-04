@@ -4,6 +4,8 @@
 
 ## 0.5.2
 
+- Keep the app viewport fixed while scrolling panels, including short desktop
+  and mobile windows, and prevent hidden live regions from enlarging the page.
 - Accept shared OAuth client metadata documents that list additional grant
   types, fixing Claude's external MCP sign-in without enabling unsupported grants.
 - Reuse fully qualified main archives, crates and images for the exact signed
