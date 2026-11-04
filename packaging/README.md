@@ -82,9 +82,14 @@ changes. Its branch identifies the proposed versions, so unchanged upstream
 versions do not open a new PR each hour. It never downgrades pins or selects
 prereleases. `nix develop .#release -c python3 packaging/pins_watch.py discover`
 prints a read-only proposal without creating branches or contacting GitHub.
-Pins CI also qualifies the actual Claude adapter/CLI MCP source isolation and
-collision contract on Linux x64 with a synthetic local model provider and the
-pinned Node version. This needs no account credentials.
+Pins CI checks package integrity, signatures and contracts without starting
+real adapter/CLI sessions. The actual Claude MCP source-isolation/collision
+probe, including its synthetic-provider mode, belongs to external acceptance.
+Coding agents do not run real agents locally as routine verification. The
+operator or a separately configured automation in the operator's Hennery owns
+those tests on its native hosts, using local credentials. See the
+[explicit acceptance driver](../docs/runtime-acceptance.md). Missing external
+acceptance is reported as unverified, never as a passing live check.
 The workflow updates the candidate Codex version automatically; its source and
 deletion contract must still be reviewed before merging.
 

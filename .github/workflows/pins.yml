@@ -6,8 +6,9 @@
 # uploaded, nothing is cached (no `actions/cache`, no `setup-node` cache),
 # and `node_modules` is removed after each platform.
 #
-# Not run here: the live e2e gate (umbrella §14), which needs logged-in
-# agents. The operator runs it on every pin bump.
+# Real adapter/CLI sessions, including synthetic-provider MCP probes, run only
+# through operator-owned acceptance outside CI. This workflow checks packages,
+# signatures, pins and contracts without starting real agents.
 name: pins
 
 on:
@@ -119,11 +120,6 @@ jobs:
                 # An error object ({"error": …}) has neither list, so it fails.
                 jq -e '.invalid == [] and .missing == []' "$RUNNER_TEMP/audit.json"
                 jq -r '.packages | keys[] | select(. != "")' node_modules/.package-lock.json | sort > "$RUNNER_TEMP/installed"
-                # This runner is Linux x64. Qualify the actual native CLI's
-                # source isolation/collision contract without provider credentials.
-                if [ "$agent" = claude ] && [ "$platform" = linux-x64 ]; then
-                  node ../../packaging/test-mcp-source-policy.mjs node_modules "$RUNNER_TEMP/mcp-source-proof"
-                fi
               )
               jq -r --arg agent "$agent" --arg platform "$platform" \
                 '.adapters[$agent].platforms[$platform][].path' crates/hennery-host/manifest.json | sort > "$RUNNER_TEMP/pinned"

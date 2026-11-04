@@ -8,6 +8,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CiSecurity(unittest.TestCase):
+    def test_pins_ci_does_not_start_real_agent_sessions(self):
+        jobs = self.workflow('pins.yml')['jobs']
+        commands = '\n'.join(step.get('run', '') for job in jobs.values() for step in job['steps'])
+        self.assertNotIn('test-mcp-source-policy.mjs', commands)
+        self.assertNotIn('runtime_acceptance.py run', commands)
+        self.assertNotIn('--ignored', commands)
+
     def workflow(self, name):
         return yaml.safe_load((ROOT / '.github/workflows' / name).read_bytes())
 
