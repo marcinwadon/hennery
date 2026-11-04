@@ -16,6 +16,7 @@ import unittest
 
 import assets
 import gate
+import openssl_source
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -109,14 +110,18 @@ class FrontendMaterials(unittest.TestCase):
             for name in ('rust-advisories.json', 'rust-advisory-revision.txt', 'web-advisories.json'):
                 (advisories / name).write_text('prepared advisory\n')
             self.assertFalse((archive / 'web/node_modules').exists())
+            native = archive / 'openssl'; native.mkdir()
+            (native / 'hennery-source.json').write_text(json.dumps(openssl_source.source()))
+            (native / 'LICENSE.txt').write_text('OpenSSL Apache-2.0 fixture')
             result = subprocess.run(['sh', str(ROOT / 'packaging/release/native-materials.sh')],
-                cwd=archive, env=env | {'RELEASE_SOURCE_SHA': 'a' * 40, 'TARGET': 'aarch64-apple-darwin'},
+                cwd=archive, env=env | {'RELEASE_SOURCE_SHA': 'a' * 40, 'TARGET': 'aarch64-apple-darwin', 'OPENSSL_DIR': str(native)},
                 capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             materials = archive / 'release-materials'
             self.assertIn('frontend fixture licence text', (materials / 'THIRD-PARTY-NOTICES.txt').read_text())
             packages = gate.strict_json((materials / 'hennery-aarch64-apple-darwin.spdx.json').read_bytes())['packages']
-            self.assertEqual([(p['name'], p['versionInfo']) for p in packages], [('frontend-fixture', '1.2.3')])
+            self.assertEqual([(p['name'], p['versionInfo']) for p in packages],
+                             [('OpenSSL', openssl_source.source()['version']), ('frontend-fixture', '1.2.3')])
             self.assertEqual(gate.strict_json((materials / 'licence-findings.json').read_bytes())['findings'], [])
             notices = (materials / 'THIRD-PARTY-NOTICES.txt').read_text()
             self.assertIn('AGPL-3.0-only', notices)
@@ -139,10 +144,10 @@ class FrontendMaterials(unittest.TestCase):
             files = assets.files(public, sorted(gate.TARGETS))
             self.assertEqual(len(files), 6)
             self.assertEqual(files['SHA256SUMS'].read_bytes(), (public / assets.PUBLIC_CHECKSUMS).read_bytes())
-            self.assertEqual([p['name'] for p in gate.strict_json((public / assets.SBOM).read_bytes())['packages']], ['frontend-fixture'])
+            self.assertEqual({p['name'] for p in gate.strict_json((public / assets.SBOM).read_bytes())['packages']}, {'OpenSSL', 'frontend-fixture'})
             shutil.copytree(archive / 'missing-frontend', archive / 'inputs/frontend', dirs_exist_ok=True)
             result = subprocess.run(['sh', str(ROOT / 'packaging/release/native-materials.sh')],
-                cwd=archive, env=env | {'RELEASE_SOURCE_SHA': 'a' * 40, 'TARGET': 'aarch64-apple-darwin'},
+                cwd=archive, env=env | {'RELEASE_SOURCE_SHA': 'a' * 40, 'TARGET': 'aarch64-apple-darwin', 'OPENSSL_DIR': str(native)},
                 capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(gate.strict_json((materials / 'licence-findings.json').read_bytes())['findings'],

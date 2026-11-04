@@ -57,6 +57,7 @@ export function inspectPackage(root,name,source) {
 }
 export function inspectProductionFeatures(tree) {
   requireThat(typeof tree==='string' && tree.trim().length>0 && !/\btest-hooks\b|\bhennery-(?:testkit|pins)\b/.test(tree),'test-only production dependency or missing feature evidence');
+  requireThat(!/\bopenssl-src\b/.test(tree),'unreviewed bundled OpenSSL in production dependency graph');
 }
 export function checkSourceTree(root, expected) {
   const actual=files(root);

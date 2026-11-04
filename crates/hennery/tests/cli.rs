@@ -66,6 +66,10 @@ fn long_version_records_release_identity() {
     for field in ["source: ", "UI SHA-256: ", "adapter manifest SHA-256: "] {
         assert!(version.contains(field), "missing {field}: {version}");
     }
+    assert_eq!(
+        version.lines().find_map(|line| line.strip_prefix("crypto: ")),
+        Some(openssl::version::version())
+    );
 }
 
 #[test]

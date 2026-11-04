@@ -25,6 +25,7 @@ tar -cJf "target/distrib/$archive.tar.xz" -C unpacked "$archive"
 sh packaging/check-archive.sh "target/distrib/$archive.tar.xz" "$TARGET" --notices
 binary="$PWD/unpacked/$archive/hennery"
 sh packaging/check-linkage.sh "$binary"
+python3 packaging/release/openssl_source.py check "$binary"
 sh packaging/check-web-ui.sh "$binary"
 python3 packaging/release/check_source.py "$binary" release-materials/build-identity.json
 "$binary" --version

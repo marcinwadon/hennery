@@ -49,7 +49,7 @@ jobs:
     - name: Git path classification regressions
       run: nix develop .#release -c python3 -m unittest discover -s packaging -p test_ci_paths.py
     - name: Private intake workflow regressions
-      run: nix develop -c node --test .agents/skills/hennery-work/scripts/intake.test.mjs
+      run: nix develop .#release -c node --test .agents/skills/hennery-work/scripts/intake.test.mjs
     - name: Execute the exact README bootstrap against signed offline releases
       run: |
         sh packaging/readme-blocks.sh README.md release-bootstrap > "$RUNNER_TEMP/release-bootstrap.sh"
@@ -262,8 +262,9 @@ jobs:
           SH
           sh -eux "$RUNNER_TEMP/build.sh"
 
-  # The alternative README build: no Nix, no global pnpm install and no
-  # system OpenSSL. Main and weekly runs cover both supported OSes.
+  # The alternative README build: no Nix or global pnpm install.
+  # Platform OpenSSL is a source-build prerequisite.
+  # Main and weekly runs cover both supported OSes.
 
   readme-without-nix:
     needs: checks
@@ -291,12 +292,15 @@ jobs:
           add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-bin: false
-      - name: Vendored OpenSSL build tools (ubuntu)
+      - name: Platform OpenSSL build inputs (ubuntu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential perl
-      - name: Vendored OpenSSL build tools (macOS)
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev
+      - name: Platform OpenSSL build inputs (macOS)
         if: runner.os == 'macOS'
-        run: xcode-select -p && cc --version && make --version && perl -v
+        run: |
+          xcode-select -p
+          brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
       # Run the UI check in the same shell as the block's PATH export.
       - name: The README's build without Nix block
         run: |

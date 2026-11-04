@@ -11,19 +11,12 @@ description = "Self-hosted cockpit for ACP coding agents"
 repository.workspace = true
 homepage.workspace = true
 
-[features]
-default = ["vendored-openssl"]
-# Release builds (plan 7a): build OpenSSL, which `webauthn-rs-core` links,
-# from source and link it statically, so the binary needs no system OpenSSL
-# (distribution spec §1.1). Nix opts out for its system-library build.
-vendored-openssl = ["dep:openssl", "openssl/vendored"]
-
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 libc = "0.2"
-openssl = { workspace = true, optional = true }
+openssl.workspace = true
 # `doctor`'s requests to the collector (plan 7d-ii): the host's own client.
 reqwest.workspace = true
 rcgen = "=0.14.10"
@@ -53,8 +46,8 @@ tokio = { workspace = true, features = ["test-util"] }
 # cargo-dist ships the same CLI as the Cargo package.
 [package.metadata.dist]
 dist = true
-# OpenSSL built in for release archives (distribution §1.1).
-features = ["vendored-openssl"]
+# Release CI supplies the pinned static OpenSSL (packaging/release/openssl_source.py).
+features = []
 
 # Upstream archives only. GNU users receive the qualified musl archives.
 [package.metadata.binstall]
@@ -67,7 +60,7 @@ disabled-strategies = ["crate-meta-data", "quick-install", "compile"]
 [package.metadata.hennery-release]
 verification = "external-signed-tag-sigstore"
 maintainer-fingerprint = "F26C7F594DFE84D131703AFC23E5A318AE8D2861"
-signer-identity = "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.5.0"
+signer-identity = "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.5.1"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/hennery-x86_64-unknown-linux-musl.tar.xz"

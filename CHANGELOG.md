@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.5.1
+
+- Replace unsupported bundled OpenSSL 3.6.3 with checksum-pinned OpenSSL
+  3.5.9 LTS in static release archives and the Nix package. Cargo source
+  installs now require platform OpenSSL development files; remove the old
+  `vendored-openssl` build flag. Prebuilt archives remain self-contained.
+  `hennery --version` reports the actual linked crypto library.
+- Update managed Claude Code to 2.1.318 (ACP 0.100.0, Agent SDK 0.3.318)
+  and Codex to 0.166.0 (ACP 2.5.0); retain Node 24.22.2.
+- Refresh Rust, web and GitHub Actions dependencies, preserving ACP startup
+  compatibility and the Nix web dependency integrity check.
+- Allow external MCP grants to cover multiple hats and hosts within the
+  client's approved scope.
+- Preserve existing grant scopes and credentials during the collector's grant
+  migration. Back up collector data before upgrading; downgrades require a
+  compatible backup.
+- Qualify all four Claude/Codex parent-child combinations and native Codex
+  deletion on every supported host platform. Linux x64 provider checks use
+  emulation; native CI separately verifies its MCP sources and installers.
+
 ## 0.5.0
 
 - Expose external session management through the public HTTPS MCP endpoint,

@@ -127,7 +127,8 @@ test('tarball inspection refuses repository integration harnesses', () => {
   }
 });
 test('production dependency audit refuses active hooks and private test crates', () => {
-  assert.doesNotThrow(() => release.inspectProductionFeatures('hennery v0.1.0-alpha.1 [default,vendored-openssl]\nhennery-sessions v0.1.0-alpha.1 []\n'));
+  assert.doesNotThrow(() => release.inspectProductionFeatures('hennery v0.1.0-alpha.1 []\nhennery-sessions v0.1.0-alpha.1 []\n'));
+  assert.throws(() => release.inspectProductionFeatures('hennery v0.5.1 []\nopenssl-src v300.6.1+3.6.3 []\n'), /bundled OpenSSL/);
   for (const tree of ['', 'hennery-host feature "test-hooks"', 'hennery-sessions v0.1.0-alpha.1 [test-hooks]', 'hennery-testkit v0.1.0-alpha.1 []', 'hennery-pins v0.1.0-alpha.1 []']) {
     assert.throws(() => release.inspectProductionFeatures(tree), /test-only production dependency/);
   }

@@ -13,5 +13,5 @@ assert.deepEqual(Object.values(plan.artifacts).filter(a=>a.kind==='installer').m
 // A workspace feature list applies to every selected package. Keep CLI-only features local.
 assert.doesNotMatch(readFileSync('dist-workspace.toml','utf8'),/^features\s*=/m);
 const metadata=JSON.parse(execFileSync('cargo',['metadata','--no-deps','--format-version=1','--locked'],{encoding:'utf8'}));
-assert.deepEqual(metadata.packages.find(p=>p.name==='hennery').metadata.dist.features,['vendored-openssl']);
+assert.deepEqual(metadata.packages.find(p=>p.name==='hennery').metadata.dist.features,[]);
 console.log('cargo-dist 0.30.4: only hennery; 3 archives, 2 installers; CLI-only features');

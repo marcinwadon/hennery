@@ -22,6 +22,7 @@
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
         pkgs = import nixpkgs { inherit system; overlays = [ (import ./nix/node-security-overlay.nix) ]; };
+        henneryOpenSSL = import ./nix/openssl.nix pkgs;
         web = import nixpkgs-web { inherit system; overlays = [ (import ./nix/node-security-overlay.nix) ]; };
         # The web UI (plan 7e-ii-b), built with nixpkgs-web's Node and pnpm.
         webUi = import ./nix/web.nix { pkgs = web; };
@@ -81,7 +82,7 @@
             rustup
             sqlite
             # `webauthn-rs` links OpenSSL (plan 3c).
-            openssl
+            henneryOpenSSL
             pkg-config
             # The PATH-capture tests run each login shell (plan 7c).
             bashInteractive

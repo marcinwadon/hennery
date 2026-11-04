@@ -6,6 +6,7 @@
 { pkgs, crane, advisory-db, webUi, sourceRevision ? "unrecorded (development build)" }:
 let
   inherit (pkgs) lib stdenv;
+  openssl = import ./openssl.nix pkgs;
   craneLib = crane.mkLib pkgs;
   workspace = (builtins.fromTOML (builtins.readFile ../Cargo.toml)).workspace.package;
   # Only what cargo reads: the crates, the manifests and the lock, and the
@@ -58,7 +59,7 @@ let
     pname = "hennery";
     inherit (workspace) version;
     nativeBuildInputs = [ pkgs.pkg-config ];
-    buildInputs = [ pkgs.openssl ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+    buildInputs = [ openssl ] ++ lib.optionals stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
   };
   # Match the shipped package's feature graph. Tests and workspace lint run
   # outside Nix in CI; compiling their dependencies here duplicates that work.

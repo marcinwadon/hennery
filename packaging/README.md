@@ -27,32 +27,33 @@ being applied in stacked steps.
 [R4's collector-image guide](images.md) describes the release target, labels,
 reviewed notices and binary/image SBOMs, native OCI inputs, gated GHCR
 publication, digest deployment, volume upgrades and maintainer-only setup.
-The shared verifier and registered GHCR acceptance job are integrated; publication
-remains disabled pending independent review and maintainer qualification.
-PR/main images are never promoted to releases.
+The shared verifier and registered GHCR acceptance job are integrated. Publication
+uses the signed-tag workflow and its protected maintainer approval. PR/main images
+are never promoted to releases.
 
-Every archive builds with the `vendored-openssl` feature
-(`dist-workspace.toml`). OpenSSL, which `webauthn-rs-core` links, is then
-compiled in from source. Without it, the macOS binary would load Homebrew's
-`libssl` and fail on a Mac without it, and a static musl build would not
-link at all (distribution §1.1). Cargo builds now enable vendored OpenSSL by default (R3); Nix opts out with
-`--no-default-features` and uses its system-library inputs.
+Every archive links the supported static OpenSSL built by
+`release/openssl_source.py` from the checksum-pinned `openssl.json` source.
+CI sets `OPENSSL_DIR` and `OPENSSL_STATIC=1` before cargo-dist. Native linkage
+checks reject external OpenSSL, and the executable must report the pinned
+library version through the native OpenSSL API in `--version`. Cargo source installs use platform OpenSSL; Nix supplies
+the same pinned LTS through `nix/openssl.nix`.
 
 Third-party actions are pinned by commit, every image by its multi-arch
 digest, and cargo-dist by the SHA-256 in `install-dist.sh`.
 
 ## OpenSSL
 
-The release binaries carry their own OpenSSL: 3.6.3, from `openssl-src`
-300.6.1+3.6.3 in `Cargo.lock`. Updating the system's OpenSSL does not
-reach them. An OpenSSL fix reaches users only when `openssl-src` is bumped
-in `Cargo.lock` and a new release is made. `webauthn-rs` passes what a
+The release binaries carry their own OpenSSL 3.5.9 LTS. Updating the system's
+OpenSSL does not reach them. Update `openssl.json`, qualify native builds and
+make a new release to deliver a library fix. `webauthn-rs` passes what a
 browser sends (attestation and assertion data) through it, so OpenSSL's
 advisories are this project's to follow.
 
-OpenSSL 3.6 is not a long-term-support line. Check its end of support
-against openssl.org's release strategy before the first release, and move
-to a supported line if it ends first.
+OpenSSL 3.5 LTS is supported until 8 April 2030. The build refuses an expired
+support pin; review new upstream security patches before every release. SBOMs
+and notices include the actual native version, source URL, SHA-256 and licence.
+The Cargo `openssl-src` provider was removed in 0.5.1: its available 300.x
+source is OpenSSL 3.6.3, whose branch reached end of support on 1 November 2026.
 
 ## Locally
 
@@ -61,7 +62,7 @@ release build is for trying out, not for handing on; `check-linkage.sh` says
 so. Linux archives and the image are built in CI only.
 
 ```sh
-nix develop -c cargo build --profile dist -p hennery --features vendored-openssl
+nix develop -c cargo build --profile dist -p hennery
 sh packaging/check-linkage.sh target/dist/hennery
 ```
 
@@ -175,8 +176,10 @@ run in weekly maintenance. CI caches compilation between candidates. The install
 run in disposable homes with Node/pnpm absent from PATH, serve all HTML-referenced
 assets and render the app in the pinned Chromium. Native macOS acceptance uses
 the release archive already built for that platform.
-Source installs need Rust, a C compiler, make and Perl (macOS: Xcode Command
-Line Tools); default vendored OpenSSL removes the system OpenSSL prerequisite.
+Source installs need Rust, a C compiler and maintained OpenSSL development
+files (macOS: Xcode Command Line Tools and Homebrew `openssl@3`; Debian/Ubuntu:
+`build-essential pkg-config libssl-dev`). The default graph contains no
+`openssl-src`; network-isolated Cargo builds cannot download a native library.
 
 Native cargo-binstall is disabled. Pinned 1.24.0 refusal tests offer real loopback
 archives, but all seven attempts must refuse without fetching or installing an

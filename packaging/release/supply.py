@@ -18,6 +18,7 @@ import urllib.parse
 
 import gate
 import contract
+import openssl_source
 from adapter_manifest import read_manifest
 
 
@@ -147,6 +148,21 @@ def spdx(packages, source_sha, target):
                                                    'relatedSpdxElement': p['SPDXID']} for p in packages]}
 
 
+def static_openssl(prefix):
+    pin = openssl_source.source()
+    gate.require(gate.strict_json((prefix / 'hennery-source.json').read_bytes()) == pin,
+                 'static OpenSSL source differs from reviewed pin')
+    package, texts = component('OpenSSL', pin['version'], 'Apache-2.0', prefix, 'generic')
+    gate.require(any(name == 'LICENSE.txt' for name, _ in texts), 'static OpenSSL licence missing')
+    package['downloadLocation'] = pin['url']
+    package['checksums'] = [{'algorithm': 'SHA256', 'checksumValue': pin['sha256']}]
+    package['sourceInfo'] = 'Statically linked from the checksum-pinned upstream source; not openssl-src.'
+    notice = '\n===== Static OpenSSL ' + pin['version'] + ' (Apache-2.0) =====\n'
+    notice += 'Source: ' + pin['url'] + '\nSHA-256: ' + pin['sha256'] + '\n'
+    notice += '\n'.join(text for _, text in texts)
+    return package, notice
+
+
 def checksums(root):
     root = Path(root)
     entries = [(p.name, gate.digest(contract.regular(p))) for p in sorted(root.iterdir()) if p.name != contract.CHECKSUMS]
@@ -238,6 +254,7 @@ def main():
     parser.add_argument('--cargo-metadata', type=Path)
     parser.add_argument('--frontend-licences', type=Path)
     parser.add_argument('--frontend-materials', type=Path)
+    parser.add_argument('--openssl-prefix', type=Path)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if args.operation == 'frontend':
@@ -254,6 +271,9 @@ def main():
         cargo = gate.strict_json(args.cargo_metadata.read_bytes())
         frontend = gate.strict_json(args.frontend_licences.read_bytes()) if args.frontend_licences else {}
         packages, notices, findings = components(cargo, frontend)
+        gate.require(args.openssl_prefix is not None, 'native materials require the pinned static OpenSSL')
+        native, native_notice = static_openssl(args.openssl_prefix)
+        packages.append(native); notices += native_notice
         if args.frontend_materials is not None:
             prepared = gate.strict_json((args.frontend_materials / 'frontend.json').read_bytes())
             packages += prepared['packages']; notices += prepared['notices']; findings += prepared['findings']

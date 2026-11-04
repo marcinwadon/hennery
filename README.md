@@ -119,7 +119,7 @@ permission requests still require the operator's answer in hennery.
 
 ## Verify a release installer before running it
 
-This procedure targets the 0.5.0 stable release. You need trusted, already installed
+This procedure targets the 0.5.1 stable release. You need trusted, already installed
 `curl`, Git, GnuPG, `jq`, `gh`, and either `sha256sum` or `shasum`.
 
 The release signing subkey's **full fingerprint** is
@@ -153,7 +153,7 @@ printed directory for inspection. Only the authenticated installer is executed.
 (
 set -eu
 release_fingerprint=F26C7F594DFE84D131703AFC23E5A318AE8D2861
-release_tag=v0.5.0
+release_tag=v0.5.1
 release_dir=$(mktemp -d "${TMPDIR:-/tmp}/hennery-release.XXXXXXXX") || exit 1
 printf 'Release verification directory: %s\n' "$release_dir"
 mkdir "$release_dir/keyring" || exit 1
@@ -265,14 +265,14 @@ HENNERY_RELEASE_CHECKSUMS="$release_checksums" HENNERY_ATTESTATION_BUNDLE="$rele
 
 ## Installing
 
-**Stable releases use all four channels below.** The examples target v0.5.0.
+**Stable releases use all four channels below.** The examples target v0.5.1.
 Use the verification procedure above for GitHub downloads:
 
 | Channel | Install |
 |---|---|
-| Homebrew | `brew install marcinwadon/tap/hennery` (0.5.0) from the project's tap. |
-| crates.io | `cargo install hennery --version 0.5.0`; the `hennery` crate installs the binary with its embedded UI. |
-| GHCR | `docker pull ghcr.io/marcinwadon/hennery:0.5.0`; the collector-only image. Agent hosts run separately on your machines. |
+| Homebrew | `brew install marcinwadon/tap/hennery` (0.5.1) from the project's tap. |
+| crates.io | `cargo install hennery --version 0.5.1`; the `hennery` crate installs the binary with its embedded UI. |
+| GHCR | `docker pull ghcr.io/marcinwadon/hennery:0.5.1`; the collector-only image. Agent hosts run separately on your machines. |
 | GitHub Releases | Platform archives and `hennery-installer.sh` on the [Releases page](https://github.com/marcinwadon/hennery/releases), with `SHA256SUMS`, one combined SBOM. Attestations are stored on GitHub. Use the verification procedure above before running the installer. |
 
 Stable releases receive their version tag and `latest`
@@ -459,20 +459,23 @@ instead.
 
 Prerequisites (plus Git to get the source above):
 
-- **Linux:** a C compiler, `make` and `perl` (including its core modules).
-- **macOS:** Xcode Command Line Tools; macOS supplies `perl`.
+- **Linux:** a C compiler, `pkg-config` and your distribution's maintained
+  OpenSSL development package (Debian/Ubuntu: `build-essential pkg-config libssl-dev`).
+- **macOS:** Xcode Command Line Tools and Homebrew's `openssl@3`.
+  Set `OPENSSL_DIR="$(brew --prefix openssl@3)"` before building.
 - **Both:** Rust via [rustup](https://rustup.rs/) (latest stable, the
   toolchain CI uses), and Node 24 with its `npm`/`npx` on `PATH`.
 
 From the source directory, build the web UI with the flake's pinned pnpm
-12.3.4 through `npx`, without installing pnpm globally. OpenSSL is built
-and linked into the binary; no system OpenSSL is needed.
+12.3.4 through `npx`, without installing pnpm globally. Source builds link the
+platform's OpenSSL. Distributed release archives carry their own static
+OpenSSL 3.5.9 LTS and need no system OpenSSL.
 
 <!-- check: build-without-nix -->
 ```sh
 npx --yes pnpm@12.3.4 --dir web install --frozen-lockfile
 npx --yes pnpm@12.3.4 --dir web build
-HENNERY_WEB_REQUIRE=1 cargo build --release --locked -p hennery --features vendored-openssl
+HENNERY_WEB_REQUIRE=1 cargo build --release --locked -p hennery
 export PATH="$PWD/target/release:$PATH"
 ```
 

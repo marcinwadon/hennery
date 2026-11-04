@@ -13,6 +13,7 @@ from unittest.mock import patch
 import assemble
 import gate
 import supply
+import openssl_source
 import test_assemble
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -32,7 +33,7 @@ class NativeDist(unittest.TestCase):
             target = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
         (root / 'src').mkdir()
         (root / 'src/main.rs').write_text(
-            'fn main() { println!("hennery 0.1.0-alpha.3\\nsource: {}", '
+            'fn main() { println!("hennery 0.1.0-alpha.3\\ncrypto: OpenSSL ' + openssl_source.source()['version'] + ' fixture\\nsource: {}", '
             'option_env!("HENNERY_BUILD_SOURCE_SHA").unwrap_or("unrecorded")); }\n')
         (root / 'Cargo.toml').write_text(
             '[package]\nname="hennery"\nversion="0.1.0-alpha.3"\nedition="2024"\n'

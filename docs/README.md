@@ -42,6 +42,9 @@ state stays outside Git; public issues are separate approved projections.
    - [Distribution and releases](specs/2026-10-15-distribution-release-design.md) — proposed publication contract, crates.io with packaged UI, platform qualification, channel rollout and maintainer-only setup; six operator questions remain.
    - [Remote hosts over WSS](specs/2026-10-14-wss-design.md) — approved design per the fleet parent, including the three re-confirmed amendments; verified TLS/private-CA trust, tunnel migration and reconnect/doctor parity are W1; reverse-proxy attribution/public deployment remain W2.
 3. Evidence:
+   - [OpenSSL supply for 0.5.1](verification/2026-11-04-release-openssl.md)
+     — supported static LTS source, Nix input, Cargo source-build prerequisites
+     and native-library qualification requirements.
    - [Spike: per-session MCP over ACP](spikes/2026-09-25-per-session-mcp.md)
      and its [harness](../spikes/2026-09-25-mcp-per-session/).
    - [Managed runtime acceptance (#305)](verification/2026-11-04-runtime-305.md)

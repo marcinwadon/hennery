@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 import contextlib
 import io
+import json
 import tarfile
 
 import gate
@@ -54,9 +55,12 @@ class Supply(unittest.TestCase):
         (root / 'web/dist').mkdir(parents=True)
         (root / 'web/dist/index.html').write_text('UI fixture')
         (root / 'web/pnpm-lock.yaml').write_text('web lock fixture')
+        native = root / 'openssl'; native.mkdir()
+        (native / 'hennery-source.json').write_text(json.dumps(supply.openssl_source.source()))
+        (native / 'LICENSE.txt').write_text('OpenSSL Apache-2.0 fixture')
         argv = ['supply.py', 'materials', '--output', 'out', '--source-sha', 'a' * 40,
                 '--target', 'aarch64-apple-darwin', '--cargo-metadata', 'metadata.json',
-                '--frontend-licences', 'frontend.json']
+                '--frontend-licences', 'frontend.json', '--openssl-prefix', str(native)]
         with contextlib.chdir(root), patch('sys.argv', argv):
             supply.main()
 

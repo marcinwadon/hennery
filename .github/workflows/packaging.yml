@@ -162,6 +162,11 @@ jobs:
       with:
         name: release-inputs
         path: inputs
+    - name: Build the pinned supported static OpenSSL
+      run: |
+        python3 packaging/release/openssl_source.py build --target '${{ matrix.target }}' --prefix "$RUNNER_TEMP/hennery-openssl"
+        echo "OPENSSL_DIR=$RUNNER_TEMP/hennery-openssl" >> "$GITHUB_ENV"
+        echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
     - name: Pinned dist and source and licence inputs
       run: |
         sh packaging/install-dist.sh "$RUNNER_TEMP/dist-bin"

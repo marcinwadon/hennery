@@ -6,14 +6,16 @@ a self-hosted ACP cockpit, licensed under AGPL-3.0-only (see LICENSE).
 The internal libraries support the application and have pre-1.0 compatibility;
 they are not a separately stable SDK. All seven production crates use one version.
 
-Source installation requires Rust at the workspace rust-version, a C compiler,
-make and Perl. On macOS install Xcode Command Line Tools. OpenSSL is built by
-default; system-library builders may use `--no-default-features`. Node and pnpm
-are not required: the kernel package carries the compiled UI.
+Source installation requires Rust at the workspace rust-version, a C compiler
+and a maintained OpenSSL development package. On Debian/Ubuntu install
+`build-essential pkg-config libssl-dev`; on macOS use Xcode Command Line Tools
+and Homebrew `openssl@3`, setting `OPENSSL_DIR="$(brew --prefix openssl@3)"`.
+Since 0.5.1, Cargo builds use platform OpenSSL; the old `vendored-openssl`
+feature is removed because its source crate supplies an unsupported library.
+Node and pnpm are not required: the kernel package carries the compiled UI.
 
-Before the first non-prerelease publication, bare `cargo install hennery` is not
-a supported installation path. Use an explicitly published version and `--locked`
-once publication is approved. No packages have been published by this plan.
+Use an explicitly published version and `--locked` for source installation.
+The release pipeline qualifies installation from the actual packaged crates.
 
 Native cargo-binstall stays disabled pending a reviewed verification bridge.
 Release consumers first authenticate the exact inventory with the independently

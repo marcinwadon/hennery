@@ -22,8 +22,8 @@ test('host includes its canonical package-local manifest and generator writes it
   assert.match(read('crates/hennery-pins/src/main.rs'), /crates\/hennery-host\/manifest.json/);
   assert.doesNotThrow(() => JSON.parse(read('crates/hennery-host/manifest.json')));
 });
-test('source builders opt out of default vendored OpenSSL', () => {
-  assert.match(read('crates/hennery/Cargo.toml'), /default = \["vendored-openssl"\]/);
+test('Cargo source builders use maintained platform OpenSSL', () => {
+  assert.doesNotMatch(read('crates/hennery/Cargo.toml'), /vendored-openssl|openssl\/vendored/);
   const phase = execFileSync('nix', ['eval', '--raw', '.#checks.x86_64-linux.package.buildPhase'], { encoding: 'utf8' });
   assert.match(phase, /cargoWithProfile build .*--locked -p hennery --no-default-features/);
 });
