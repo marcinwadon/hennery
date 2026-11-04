@@ -83,3 +83,21 @@ the Rust/web/Nix qualification jobs; their crypto coverage remains enabled.
 
 This amends the original distribution plan's `vendored-openssl` implementation;
 the self-contained, statically linked release archive contract is preserved.
+
+## Hosted macOS Nix qualification
+
+The merged source `f1abef18` passed the full Rust/web suites, 47 native macOS
+smoke tests, both README build recipes, all three native archives and their
+installer/Homebrew checks. Its Nix package, source-input and embedded-UI checks
+also passed locally on macOS, including five source-input tests; the installed
+binary reports that source revision and OpenSSL 3.5.9.
+
+Hosted Nix builds twice stopped with `No buffer space available` while OpenSSL
+compilation and web dependency fetching emitted interleaved progress
+([first failure](https://github.com/marcinwadon/hennery/actions/runs/41891162469/job/126814071082),
+[second failure](https://github.com/marcinwadon/hennery/actions/runs/41891162469/job/126837634942)).
+The local Nix client is 2.31.3+1; the hosted client is 2.35.4, so the local pass
+does not qualify that hosted logging path. CI now limits macOS to one Nix builder,
+saves complete build output to an artifact, preserves the build's exit status
+and gives that serial build 60 minutes. All package, source, UI and README checks
+remain required. Hosted acceptance after this change is required before tagging.
