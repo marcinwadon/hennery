@@ -26,45 +26,45 @@
   "adapters": {
     "claude": {
       "package": "@agentclientprotocol/claude-agent-acp",
-      "version": "0.99.0",
+      "version": "0.100.0",
       "entry": "node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
       "platforms": {
         "darwin-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/claude-agent-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.99.0.tgz",
-            "integrity": "sha512-xT6Ajub9fa9LeMpQU6a+/nHEqI5lefvgWAP8liiD1EZBv3vTXKEnKq5mRpKCu2089CHpFXu7Y/PEHCH5iPWfPw==",
-            "archive_size": 569853,
-            "unpacked_size": 2137427
+            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.100.0.tgz",
+            "integrity": "sha512-X+f2M5RiehzSzWRJjDSf0Sbzoc8JK66l85YnYW5TAdHJX53CLQV00v2M72bfCKJ4IZ11qt+WQ/Yg9NVKcuDAhQ==",
+            "archive_size": 596525,
+            "unpacked_size": 2241262
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.1.0.tgz",
-            "integrity": "sha512-IuKjJmHLPzbmbg26eK9Jopd8AVxgLuu8fX114YzYAU6tLYclCo2DUzLL4vbCpYGr9mzvs2T0kigE3ZCueL06tg==",
-            "archive_size": 748150,
-            "unpacked_size": 8322078
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.4.0.tgz",
+            "integrity": "sha512-7qJ8nnyj7WesC5ve185ioTpB2/svQoeGV4HA4nLEhgDUrcmBe54/08VcXc/oL4p14tDbxxECZzdYmUYQ+4l+Wg==",
+            "archive_size": 809820,
+            "unpacked_size": 8904246
           },
           {
             "path": "node_modules/@anthropic-ai/claude-agent-sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.312.tgz",
-            "integrity": "sha512-Ilj5Agx3ak/Z0UPZNLS7+CTnYMa+Ijf8+FKelh9MKGRwHVYyfvmJgL0fsmooI78SdkZwqjI5a4CwOAsJurdjJA==",
-            "archive_size": 1410313,
-            "unpacked_size": 4899642
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.318.tgz",
+            "integrity": "sha512-z5WHCUeW52SKQ3rnvI3zt8X5h2QQ5o3Cgg5xarO5Rimfe67f3pOJt2aOh00S8t/nRzqfs+8nCb9o1EoXe+yccA==",
+            "archive_size": 1475971,
+            "unpacked_size": 5086044
           },
           {
             "path": "node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64",
-            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-darwin-arm64/-/claude-agent-sdk-darwin-arm64-0.3.312.tgz",
-            "integrity": "sha512-AVmdMOuoeE3Y9f4wAIPcEAAS0OFaZw1L6l11YuyqfS0B/+DYxkWxS/ZYZ1NbUy57eaIW/vdEgz9Q5M99Pl6ZJw==",
-            "archive_size": 122871422,
-            "unpacked_size": 275989096,
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-darwin-arm64/-/claude-agent-sdk-darwin-arm64-0.3.318.tgz",
+            "integrity": "sha512-AWoXeDXzAMD3RaA21lWuHvCrKd8xmbTTmKjovninn4j07jheoVSMzFbCFjpp4kk5TdhT36JtWPkAxvjNMbcO8w==",
+            "archive_size": 145803517,
+            "unpacked_size": 319599048,
             "cli": true
           },
           {
             "path": "node_modules/@anthropic-ai/sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.3.0.tgz",
-            "integrity": "sha512-k7z9BlLLPxfZH+ov7dS6EnaN/wiZeV8YNT1LZfrpAHIy7oY7pHr4UzirF9f2OlHtFEnRBOX+AZQ91Y5fK+TPTw==",
-            "archive_size": 2605339,
-            "unpacked_size": 15740193
+            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.4.0.tgz",
+            "integrity": "sha512-tyuibnhQL57kLOx5oomY4Ld7jOVOPNC5v3IiyRtR3l+Friv66tI4VbuZYF2NMel/T0WMuQMBFOMKDBUbUh8gPA==",
+            "archive_size": 2675485,
+            "unpacked_size": 16490598
           },
           {
             "path": "node_modules/@babel/runtime",
@@ -75,10 +75,10 @@
           },
           {
             "path": "node_modules/@hono/node-server",
-            "url": "https://registry.npmjs.org/@hono/node-server/-/node-server-2.1.5.tgz",
-            "integrity": "sha512-MgP/I06GdvsilDspMk/qmRzpk8LOUStP6jFAbSRi40W09DhoyUn+Mj7eyKICPqeYKybOjVFLVIAQzvu1bfIa7Q==",
-            "archive_size": 37872,
-            "unpacked_size": 138339
+            "url": "https://registry.npmjs.org/@hono/node-server/-/node-server-2.1.6.tgz",
+            "integrity": "sha512-p/KH9MnfNcsm3sR6x4lNgm5j+QN4Et8srKredl9DZfXiyZ1UQ3aQ2YVpFLbqktYN5JI+DB+VZFKM2PqE5hLKjQ==",
+            "archive_size": 38206,
+            "unpacked_size": 140053
           },
           {
             "path": "node_modules/@modelcontextprotocol/sdk",
@@ -236,10 +236,10 @@
           },
           {
             "path": "node_modules/encodeurl",
-            "url": "https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.0.tgz",
-            "integrity": "sha512-Q0n9HRi4m6JuGIV1eFlmvJB7ZEVxu93IrMyiMsGC0lrMJMWzRgx6WGquyfQgZVb31vhGgXnfmPNNXmxnOkRBrg==",
-            "archive_size": 3020,
-            "unpacked_size": 6980
+            "url": "https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.1.tgz",
+            "integrity": "sha512-Ev/hIyePLZtpL98x562lvPtenrUfGr0lfaf44HFZ+hDEwso7ccV9QAZrEVLg0hxNAzygaAFxy2dYaAKKM0G06A==",
+            "archive_size": 3234,
+            "unpacked_size": 7582
           },
           {
             "path": "node_modules/es-define-property",
@@ -299,10 +299,10 @@
           },
           {
             "path": "node_modules/express-rate-limit",
-            "url": "https://registry.npmjs.org/express-rate-limit/-/express-rate-limit-8.7.1.tgz",
-            "integrity": "sha512-2FXbqkygil3mZiXzEtM0IjE/UBmBNot0J1GEVrJT4JbrvwOSoEtqtO+wHbiMQELWe1eNvHoYRg2dkjOid+6JkA==",
-            "archive_size": 33020,
-            "unpacked_size": 154719
+            "url": "https://registry.npmjs.org/express-rate-limit/-/express-rate-limit-8.7.3.tgz",
+            "integrity": "sha512-zPLqDI2f0gV2WmGnacLf9XSSqn4VldRyP5LCzOwx0BKH40mO6+2PCFkoSsRO2jePx87/Kf6NUF6P2QOTKXHbQA==",
+            "archive_size": 33085,
+            "unpacked_size": 155143
           },
           {
             "path": "node_modules/express/node_modules/content-type",
@@ -397,10 +397,10 @@
           },
           {
             "path": "node_modules/hono",
-            "url": "https://registry.npmjs.org/hono/-/hono-4.13.14.tgz",
-            "integrity": "sha512-yhRLQ21U6qa9Hsu2N7Qcbh8tE+WKEcoErjIo56LeSGiGXGp9sA7UpE86Ui9uexb61KakiGwuHMn2QdV7w6i6kQ==",
-            "archive_size": 245823,
-            "unpacked_size": 1296954
+            "url": "https://registry.npmjs.org/hono/-/hono-4.13.16.tgz",
+            "integrity": "sha512-AOLOEhvrV+iH92xXCnFr/5+3KjPKcI3xP63XJtX5spAnkznPdHijlIsUTpi7/9EhWqrTCekw5c5zh1K+YsVw7A==",
+            "archive_size": 246805,
+            "unpacked_size": 1300518
           },
           {
             "path": "node_modules/http-errors",
@@ -425,10 +425,10 @@
           },
           {
             "path": "node_modules/ip-address",
-            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.5.tgz",
-            "integrity": "sha512-t2v0rkILYv9WXmSL7TpAaU3HXgaFYOPUcH3QHgwQ++gpJuH3bqyMy4Fvt/DJCTKwzH3Cf+bAp5W/mFL39KPLzA==",
-            "archive_size": 85503,
-            "unpacked_size": 368787
+            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.6.tgz",
+            "integrity": "sha512-00LYkM6byILa9eQIx6qoaXCM40xTLd56AZ4vyaPW3YTyb49VZYPo5xsiAq4tuQ54GH4R7gVdYScJ1B7B77PuTg==",
+            "archive_size": 85558,
+            "unpacked_size": 368972
           },
           {
             "path": "node_modules/ipaddr.js",
@@ -453,10 +453,10 @@
           },
           {
             "path": "node_modules/jose",
-            "url": "https://registry.npmjs.org/jose/-/jose-6.2.13.tgz",
-            "integrity": "sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==",
-            "archive_size": 49879,
-            "unpacked_size": 218445
+            "url": "https://registry.npmjs.org/jose/-/jose-6.2.15.tgz",
+            "integrity": "sha512-qdF6ewcZARtef63fJ9AKKZPgxw+t7USH6HLXYcD4CrdmSvDp79rpJSPFEKc90QBeGS63u1KQtN2MZQHC0yDIzA==",
+            "archive_size": 50313,
+            "unpacked_size": 221809
           },
           {
             "path": "node_modules/json-schema-to-ts",
@@ -600,10 +600,10 @@
           },
           {
             "path": "node_modules/qs",
-            "url": "https://registry.npmjs.org/qs/-/qs-6.17.0.tgz",
-            "integrity": "sha512-5LK5BZ2XDHMvcUJaf0CQ5HL3aVgKbpklvByC7qLSxYkfE8COEEbJg5xCHWCTqzqi0Gs4Jn5Mv5v3R38W6edscA==",
-            "archive_size": 91371,
-            "unpacked_size": 450716
+            "url": "https://registry.npmjs.org/qs/-/qs-6.17.1.tgz",
+            "integrity": "sha512-jd3COkaKVgGUW+ZHyEHCG9bH7RoaaiWuMgzsIBjUMVjLAaWGWpoUAVwljVvBHxRu/2qEHnadLGZrkutYUBPQJA==",
+            "archive_size": 92904,
+            "unpacked_size": 459008
           },
           {
             "path": "node_modules/range-parser",
@@ -791,39 +791,39 @@
         "linux-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/claude-agent-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.99.0.tgz",
-            "integrity": "sha512-xT6Ajub9fa9LeMpQU6a+/nHEqI5lefvgWAP8liiD1EZBv3vTXKEnKq5mRpKCu2089CHpFXu7Y/PEHCH5iPWfPw==",
-            "archive_size": 569853,
-            "unpacked_size": 2137427
+            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.100.0.tgz",
+            "integrity": "sha512-X+f2M5RiehzSzWRJjDSf0Sbzoc8JK66l85YnYW5TAdHJX53CLQV00v2M72bfCKJ4IZ11qt+WQ/Yg9NVKcuDAhQ==",
+            "archive_size": 596525,
+            "unpacked_size": 2241262
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.1.0.tgz",
-            "integrity": "sha512-IuKjJmHLPzbmbg26eK9Jopd8AVxgLuu8fX114YzYAU6tLYclCo2DUzLL4vbCpYGr9mzvs2T0kigE3ZCueL06tg==",
-            "archive_size": 748150,
-            "unpacked_size": 8322078
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.4.0.tgz",
+            "integrity": "sha512-7qJ8nnyj7WesC5ve185ioTpB2/svQoeGV4HA4nLEhgDUrcmBe54/08VcXc/oL4p14tDbxxECZzdYmUYQ+4l+Wg==",
+            "archive_size": 809820,
+            "unpacked_size": 8904246
           },
           {
             "path": "node_modules/@anthropic-ai/claude-agent-sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.312.tgz",
-            "integrity": "sha512-Ilj5Agx3ak/Z0UPZNLS7+CTnYMa+Ijf8+FKelh9MKGRwHVYyfvmJgL0fsmooI78SdkZwqjI5a4CwOAsJurdjJA==",
-            "archive_size": 1410313,
-            "unpacked_size": 4899642
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.318.tgz",
+            "integrity": "sha512-z5WHCUeW52SKQ3rnvI3zt8X5h2QQ5o3Cgg5xarO5Rimfe67f3pOJt2aOh00S8t/nRzqfs+8nCb9o1EoXe+yccA==",
+            "archive_size": 1475971,
+            "unpacked_size": 5086044
           },
           {
             "path": "node_modules/@anthropic-ai/claude-agent-sdk-linux-arm64",
-            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-linux-arm64/-/claude-agent-sdk-linux-arm64-0.3.312.tgz",
-            "integrity": "sha512-jebsXksKh7g7u1x+RxjYQXM50TCN0e7GthebXa+n5IebF3pPqtmyWGVIiEEjvpajn3P6Zh8BWUVuufUpXn8ccA==",
-            "archive_size": 133294188,
-            "unpacked_size": 293462797,
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-linux-arm64/-/claude-agent-sdk-linux-arm64-0.3.318.tgz",
+            "integrity": "sha512-mBm4su17aMitLBBCQj3bHdejyUDY6z/ormGih+HG24N689RSbdKECjGjkT87tDBIR/4jyoqmuSeHqM1DI8TJlg==",
+            "archive_size": 158364303,
+            "unpacked_size": 337438733,
             "cli": true
           },
           {
             "path": "node_modules/@anthropic-ai/sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.3.0.tgz",
-            "integrity": "sha512-k7z9BlLLPxfZH+ov7dS6EnaN/wiZeV8YNT1LZfrpAHIy7oY7pHr4UzirF9f2OlHtFEnRBOX+AZQ91Y5fK+TPTw==",
-            "archive_size": 2605339,
-            "unpacked_size": 15740193
+            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.4.0.tgz",
+            "integrity": "sha512-tyuibnhQL57kLOx5oomY4Ld7jOVOPNC5v3IiyRtR3l+Friv66tI4VbuZYF2NMel/T0WMuQMBFOMKDBUbUh8gPA==",
+            "archive_size": 2675485,
+            "unpacked_size": 16490598
           },
           {
             "path": "node_modules/@babel/runtime",
@@ -834,10 +834,10 @@
           },
           {
             "path": "node_modules/@hono/node-server",
-            "url": "https://registry.npmjs.org/@hono/node-server/-/node-server-2.1.5.tgz",
-            "integrity": "sha512-MgP/I06GdvsilDspMk/qmRzpk8LOUStP6jFAbSRi40W09DhoyUn+Mj7eyKICPqeYKybOjVFLVIAQzvu1bfIa7Q==",
-            "archive_size": 37872,
-            "unpacked_size": 138339
+            "url": "https://registry.npmjs.org/@hono/node-server/-/node-server-2.1.6.tgz",
+            "integrity": "sha512-p/KH9MnfNcsm3sR6x4lNgm5j+QN4Et8srKredl9DZfXiyZ1UQ3aQ2YVpFLbqktYN5JI+DB+VZFKM2PqE5hLKjQ==",
+            "archive_size": 38206,
+            "unpacked_size": 140053
           },
           {
             "path": "node_modules/@modelcontextprotocol/sdk",
@@ -995,10 +995,10 @@
           },
           {
             "path": "node_modules/encodeurl",
-            "url": "https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.0.tgz",
-            "integrity": "sha512-Q0n9HRi4m6JuGIV1eFlmvJB7ZEVxu93IrMyiMsGC0lrMJMWzRgx6WGquyfQgZVb31vhGgXnfmPNNXmxnOkRBrg==",
-            "archive_size": 3020,
-            "unpacked_size": 6980
+            "url": "https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.1.tgz",
+            "integrity": "sha512-Ev/hIyePLZtpL98x562lvPtenrUfGr0lfaf44HFZ+hDEwso7ccV9QAZrEVLg0hxNAzygaAFxy2dYaAKKM0G06A==",
+            "archive_size": 3234,
+            "unpacked_size": 7582
           },
           {
             "path": "node_modules/es-define-property",
@@ -1058,10 +1058,10 @@
           },
           {
             "path": "node_modules/express-rate-limit",
-            "url": "https://registry.npmjs.org/express-rate-limit/-/express-rate-limit-8.7.1.tgz",
-            "integrity": "sha512-2FXbqkygil3mZiXzEtM0IjE/UBmBNot0J1GEVrJT4JbrvwOSoEtqtO+wHbiMQELWe1eNvHoYRg2dkjOid+6JkA==",
-            "archive_size": 33020,
-            "unpacked_size": 154719
+            "url": "https://registry.npmjs.org/express-rate-limit/-/express-rate-limit-8.7.3.tgz",
+            "integrity": "sha512-zPLqDI2f0gV2WmGnacLf9XSSqn4VldRyP5LCzOwx0BKH40mO6+2PCFkoSsRO2jePx87/Kf6NUF6P2QOTKXHbQA==",
+            "archive_size": 33085,
+            "unpacked_size": 155143
           },
           {
             "path": "node_modules/express/node_modules/content-type",
@@ -1156,10 +1156,10 @@
           },
           {
             "path": "node_modules/hono",
-            "url": "https://registry.npmjs.org/hono/-/hono-4.13.14.tgz",
-            "integrity": "sha512-yhRLQ21U6qa9Hsu2N7Qcbh8tE+WKEcoErjIo56LeSGiGXGp9sA7UpE86Ui9uexb61KakiGwuHMn2QdV7w6i6kQ==",
-            "archive_size": 245823,
-            "unpacked_size": 1296954
+            "url": "https://registry.npmjs.org/hono/-/hono-4.13.16.tgz",
+            "integrity": "sha512-AOLOEhvrV+iH92xXCnFr/5+3KjPKcI3xP63XJtX5spAnkznPdHijlIsUTpi7/9EhWqrTCekw5c5zh1K+YsVw7A==",
+            "archive_size": 246805,
+            "unpacked_size": 1300518
           },
           {
             "path": "node_modules/http-errors",
@@ -1184,10 +1184,10 @@
           },
           {
             "path": "node_modules/ip-address",
-            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.5.tgz",
-            "integrity": "sha512-t2v0rkILYv9WXmSL7TpAaU3HXgaFYOPUcH3QHgwQ++gpJuH3bqyMy4Fvt/DJCTKwzH3Cf+bAp5W/mFL39KPLzA==",
-            "archive_size": 85503,
-            "unpacked_size": 368787
+            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.6.tgz",
+            "integrity": "sha512-00LYkM6byILa9eQIx6qoaXCM40xTLd56AZ4vyaPW3YTyb49VZYPo5xsiAq4tuQ54GH4R7gVdYScJ1B7B77PuTg==",
+            "archive_size": 85558,
+            "unpacked_size": 368972
           },
           {
             "path": "node_modules/ipaddr.js",
@@ -1212,10 +1212,10 @@
           },
           {
             "path": "node_modules/jose",
-            "url": "https://registry.npmjs.org/jose/-/jose-6.2.13.tgz",
-            "integrity": "sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==",
-            "archive_size": 49879,
-            "unpacked_size": 218445
+            "url": "https://registry.npmjs.org/jose/-/jose-6.2.15.tgz",
+            "integrity": "sha512-qdF6ewcZARtef63fJ9AKKZPgxw+t7USH6HLXYcD4CrdmSvDp79rpJSPFEKc90QBeGS63u1KQtN2MZQHC0yDIzA==",
+            "archive_size": 50313,
+            "unpacked_size": 221809
           },
           {
             "path": "node_modules/json-schema-to-ts",
@@ -1359,10 +1359,10 @@
           },
           {
             "path": "node_modules/qs",
-            "url": "https://registry.npmjs.org/qs/-/qs-6.17.0.tgz",
-            "integrity": "sha512-5LK5BZ2XDHMvcUJaf0CQ5HL3aVgKbpklvByC7qLSxYkfE8COEEbJg5xCHWCTqzqi0Gs4Jn5Mv5v3R38W6edscA==",
-            "archive_size": 91371,
-            "unpacked_size": 450716
+            "url": "https://registry.npmjs.org/qs/-/qs-6.17.1.tgz",
+            "integrity": "sha512-jd3COkaKVgGUW+ZHyEHCG9bH7RoaaiWuMgzsIBjUMVjLAaWGWpoUAVwljVvBHxRu/2qEHnadLGZrkutYUBPQJA==",
+            "archive_size": 92904,
+            "unpacked_size": 459008
           },
           {
             "path": "node_modules/range-parser",
@@ -1550,39 +1550,39 @@
         "linux-x64": [
           {
             "path": "node_modules/@agentclientprotocol/claude-agent-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.99.0.tgz",
-            "integrity": "sha512-xT6Ajub9fa9LeMpQU6a+/nHEqI5lefvgWAP8liiD1EZBv3vTXKEnKq5mRpKCu2089CHpFXu7Y/PEHCH5iPWfPw==",
-            "archive_size": 569853,
-            "unpacked_size": 2137427
+            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.100.0.tgz",
+            "integrity": "sha512-X+f2M5RiehzSzWRJjDSf0Sbzoc8JK66l85YnYW5TAdHJX53CLQV00v2M72bfCKJ4IZ11qt+WQ/Yg9NVKcuDAhQ==",
+            "archive_size": 596525,
+            "unpacked_size": 2241262
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.1.0.tgz",
-            "integrity": "sha512-IuKjJmHLPzbmbg26eK9Jopd8AVxgLuu8fX114YzYAU6tLYclCo2DUzLL4vbCpYGr9mzvs2T0kigE3ZCueL06tg==",
-            "archive_size": 748150,
-            "unpacked_size": 8322078
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.4.0.tgz",
+            "integrity": "sha512-7qJ8nnyj7WesC5ve185ioTpB2/svQoeGV4HA4nLEhgDUrcmBe54/08VcXc/oL4p14tDbxxECZzdYmUYQ+4l+Wg==",
+            "archive_size": 809820,
+            "unpacked_size": 8904246
           },
           {
             "path": "node_modules/@anthropic-ai/claude-agent-sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.312.tgz",
-            "integrity": "sha512-Ilj5Agx3ak/Z0UPZNLS7+CTnYMa+Ijf8+FKelh9MKGRwHVYyfvmJgL0fsmooI78SdkZwqjI5a4CwOAsJurdjJA==",
-            "archive_size": 1410313,
-            "unpacked_size": 4899642
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.318.tgz",
+            "integrity": "sha512-z5WHCUeW52SKQ3rnvI3zt8X5h2QQ5o3Cgg5xarO5Rimfe67f3pOJt2aOh00S8t/nRzqfs+8nCb9o1EoXe+yccA==",
+            "archive_size": 1475971,
+            "unpacked_size": 5086044
           },
           {
             "path": "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64",
-            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-linux-x64/-/claude-agent-sdk-linux-x64-0.3.312.tgz",
-            "integrity": "sha512-UOsqza2uo5gqlX2OU72LhkQvIaNJKUQMJIi1poX2NtYqaWACqNo/TZPWfOBzxhyWmX8BLWaOlcuZGPLgcCJOTg==",
-            "archive_size": 132751493,
-            "unpacked_size": 293593021,
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-linux-x64/-/claude-agent-sdk-linux-x64-0.3.318.tgz",
+            "integrity": "sha512-+mE+ueBD3oRFdaG16rd0h+LMjdeivGxL0pr/+FZK7JeLWVu+yPSw/f/X02b9oK36/DWykiFTu2G6HnJ9/+YO6w==",
+            "archive_size": 157335074,
+            "unpacked_size": 337814621,
             "cli": true
           },
           {
             "path": "node_modules/@anthropic-ai/sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.3.0.tgz",
-            "integrity": "sha512-k7z9BlLLPxfZH+ov7dS6EnaN/wiZeV8YNT1LZfrpAHIy7oY7pHr4UzirF9f2OlHtFEnRBOX+AZQ91Y5fK+TPTw==",
-            "archive_size": 2605339,
-            "unpacked_size": 15740193
+            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.4.0.tgz",
+            "integrity": "sha512-tyuibnhQL57kLOx5oomY4Ld7jOVOPNC5v3IiyRtR3l+Friv66tI4VbuZYF2NMel/T0WMuQMBFOMKDBUbUh8gPA==",
+            "archive_size": 2675485,
+            "unpacked_size": 16490598
           },
           {
             "path": "node_modules/@babel/runtime",
@@ -1593,10 +1593,10 @@
           },
           {
             "path": "node_modules/@hono/node-server",
-            "url": "https://registry.npmjs.org/@hono/node-server/-/node-server-2.1.5.tgz",
-            "integrity": "sha512-MgP/I06GdvsilDspMk/qmRzpk8LOUStP6jFAbSRi40W09DhoyUn+Mj7eyKICPqeYKybOjVFLVIAQzvu1bfIa7Q==",
-            "archive_size": 37872,
-            "unpacked_size": 138339
+            "url": "https://registry.npmjs.org/@hono/node-server/-/node-server-2.1.6.tgz",
+            "integrity": "sha512-p/KH9MnfNcsm3sR6x4lNgm5j+QN4Et8srKredl9DZfXiyZ1UQ3aQ2YVpFLbqktYN5JI+DB+VZFKM2PqE5hLKjQ==",
+            "archive_size": 38206,
+            "unpacked_size": 140053
           },
           {
             "path": "node_modules/@modelcontextprotocol/sdk",
@@ -1754,10 +1754,10 @@
           },
           {
             "path": "node_modules/encodeurl",
-            "url": "https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.0.tgz",
-            "integrity": "sha512-Q0n9HRi4m6JuGIV1eFlmvJB7ZEVxu93IrMyiMsGC0lrMJMWzRgx6WGquyfQgZVb31vhGgXnfmPNNXmxnOkRBrg==",
-            "archive_size": 3020,
-            "unpacked_size": 6980
+            "url": "https://registry.npmjs.org/encodeurl/-/encodeurl-2.0.1.tgz",
+            "integrity": "sha512-Ev/hIyePLZtpL98x562lvPtenrUfGr0lfaf44HFZ+hDEwso7ccV9QAZrEVLg0hxNAzygaAFxy2dYaAKKM0G06A==",
+            "archive_size": 3234,
+            "unpacked_size": 7582
           },
           {
             "path": "node_modules/es-define-property",
@@ -1817,10 +1817,10 @@
           },
           {
             "path": "node_modules/express-rate-limit",
-            "url": "https://registry.npmjs.org/express-rate-limit/-/express-rate-limit-8.7.1.tgz",
-            "integrity": "sha512-2FXbqkygil3mZiXzEtM0IjE/UBmBNot0J1GEVrJT4JbrvwOSoEtqtO+wHbiMQELWe1eNvHoYRg2dkjOid+6JkA==",
-            "archive_size": 33020,
-            "unpacked_size": 154719
+            "url": "https://registry.npmjs.org/express-rate-limit/-/express-rate-limit-8.7.3.tgz",
+            "integrity": "sha512-zPLqDI2f0gV2WmGnacLf9XSSqn4VldRyP5LCzOwx0BKH40mO6+2PCFkoSsRO2jePx87/Kf6NUF6P2QOTKXHbQA==",
+            "archive_size": 33085,
+            "unpacked_size": 155143
           },
           {
             "path": "node_modules/express/node_modules/content-type",
@@ -1915,10 +1915,10 @@
           },
           {
             "path": "node_modules/hono",
-            "url": "https://registry.npmjs.org/hono/-/hono-4.13.14.tgz",
-            "integrity": "sha512-yhRLQ21U6qa9Hsu2N7Qcbh8tE+WKEcoErjIo56LeSGiGXGp9sA7UpE86Ui9uexb61KakiGwuHMn2QdV7w6i6kQ==",
-            "archive_size": 245823,
-            "unpacked_size": 1296954
+            "url": "https://registry.npmjs.org/hono/-/hono-4.13.16.tgz",
+            "integrity": "sha512-AOLOEhvrV+iH92xXCnFr/5+3KjPKcI3xP63XJtX5spAnkznPdHijlIsUTpi7/9EhWqrTCekw5c5zh1K+YsVw7A==",
+            "archive_size": 246805,
+            "unpacked_size": 1300518
           },
           {
             "path": "node_modules/http-errors",
@@ -1943,10 +1943,10 @@
           },
           {
             "path": "node_modules/ip-address",
-            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.5.tgz",
-            "integrity": "sha512-t2v0rkILYv9WXmSL7TpAaU3HXgaFYOPUcH3QHgwQ++gpJuH3bqyMy4Fvt/DJCTKwzH3Cf+bAp5W/mFL39KPLzA==",
-            "archive_size": 85503,
-            "unpacked_size": 368787
+            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.6.tgz",
+            "integrity": "sha512-00LYkM6byILa9eQIx6qoaXCM40xTLd56AZ4vyaPW3YTyb49VZYPo5xsiAq4tuQ54GH4R7gVdYScJ1B7B77PuTg==",
+            "archive_size": 85558,
+            "unpacked_size": 368972
           },
           {
             "path": "node_modules/ipaddr.js",
@@ -1971,10 +1971,10 @@
           },
           {
             "path": "node_modules/jose",
-            "url": "https://registry.npmjs.org/jose/-/jose-6.2.13.tgz",
-            "integrity": "sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==",
-            "archive_size": 49879,
-            "unpacked_size": 218445
+            "url": "https://registry.npmjs.org/jose/-/jose-6.2.15.tgz",
+            "integrity": "sha512-qdF6ewcZARtef63fJ9AKKZPgxw+t7USH6HLXYcD4CrdmSvDp79rpJSPFEKc90QBeGS63u1KQtN2MZQHC0yDIzA==",
+            "archive_size": 50313,
+            "unpacked_size": 221809
           },
           {
             "path": "node_modules/json-schema-to-ts",
@@ -2118,10 +2118,10 @@
           },
           {
             "path": "node_modules/qs",
-            "url": "https://registry.npmjs.org/qs/-/qs-6.17.0.tgz",
-            "integrity": "sha512-5LK5BZ2XDHMvcUJaf0CQ5HL3aVgKbpklvByC7qLSxYkfE8COEEbJg5xCHWCTqzqi0Gs4Jn5Mv5v3R38W6edscA==",
-            "archive_size": 91371,
-            "unpacked_size": 450716
+            "url": "https://registry.npmjs.org/qs/-/qs-6.17.1.tgz",
+            "integrity": "sha512-jd3COkaKVgGUW+ZHyEHCG9bH7RoaaiWuMgzsIBjUMVjLAaWGWpoUAVwljVvBHxRu/2qEHnadLGZrkutYUBPQJA==",
+            "archive_size": 92904,
+            "unpacked_size": 459008
           },
           {
             "path": "node_modules/range-parser",
@@ -2310,37 +2310,37 @@
     },
     "codex": {
       "package": "@agentclientprotocol/codex-acp",
-      "version": "2.3.0",
+      "version": "2.5.0",
       "entry": "node_modules/@agentclientprotocol/codex-acp/dist/index.js",
       "platforms": {
         "darwin-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.3.0.tgz",
-            "integrity": "sha512-VdTYaOGXqLh/aVuAKIgFG7BIzbeq537FHGo28kgBhybDbeOdFVFTtc43k/tCpScFhZyqPQWHuWf8w/QQd0qtXQ==",
-            "archive_size": 374004,
-            "unpacked_size": 2005353
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.5.0.tgz",
+            "integrity": "sha512-7e/4OhJwpvSTqsjiokoVYRV7O1XGem1CAsQgO1opmGYbRD5LvmydwDlJrldzQYO5TcPWueGzQ2Jdvyvp6l3qDw==",
+            "archive_size": 393763,
+            "unpacked_size": 2100748
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.0.2.tgz",
-            "integrity": "sha512-jLywRB42hZMRMc4aUgt0uRjkY9FQnMdybv4XgLl+ddi75QuJn8Vbl0+CHcVHJDC0+WDfi1KQXRWtHaR5vp6gHw==",
-            "archive_size": 695680,
-            "unpacked_size": 7938833
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.1.0.tgz",
+            "integrity": "sha512-IuKjJmHLPzbmbg26eK9Jopd8AVxgLuu8fX114YzYAU6tLYclCo2DUzLL4vbCpYGr9mzvs2T0kigE3ZCueL06tg==",
+            "archive_size": 748150,
+            "unpacked_size": 8322078
           },
           {
             "path": "node_modules/@openai/codex",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.165.0.tgz",
-            "integrity": "sha512-aiwtQVp2KBhJld966CuU5bVfQ46VNB4mNTl6giX3WGZdt4euI3tv2RUqJpnupPNA8DXHg2z+RoQ0Zfw87dy8Lw==",
-            "archive_size": 4902,
-            "unpacked_size": 13206
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0.tgz",
+            "integrity": "sha512-2Szlp1l1cz5TX1ccpX4Zok3DZrot9xeZe0km+6/1v8JmqxADwyJxKBJah4dBymkwtS25j/u6dipJusTOI97Z8Q==",
+            "archive_size": 4992,
+            "unpacked_size": 13570
           },
           {
             "path": "node_modules/@openai/codex-darwin-arm64",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.165.0-darwin-arm64.tgz",
-            "integrity": "sha512-MQ/Z0Xw9v08DHunnzodi9NwA844MI3+RO72IM8o0Lr/UemnlEoBMCxpojstxX6mf5ZQwUrIg0yekDd9cFZ29hg==",
-            "archive_size": 141326129,
-            "unpacked_size": 355995806,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0-darwin-arm64.tgz",
+            "integrity": "sha512-5fWH6qqUInACcRADIewjlnRxDb4QLe0uriwehiZz0+viuAAB8I+WWefqw4xwHvyKaxeiGX4uK56+vrgfvFk3FQ==",
+            "archive_size": 147077955,
+            "unpacked_size": 363353438,
             "cli": true
           },
           {
@@ -2494,31 +2494,31 @@
         "linux-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.3.0.tgz",
-            "integrity": "sha512-VdTYaOGXqLh/aVuAKIgFG7BIzbeq537FHGo28kgBhybDbeOdFVFTtc43k/tCpScFhZyqPQWHuWf8w/QQd0qtXQ==",
-            "archive_size": 374004,
-            "unpacked_size": 2005353
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.5.0.tgz",
+            "integrity": "sha512-7e/4OhJwpvSTqsjiokoVYRV7O1XGem1CAsQgO1opmGYbRD5LvmydwDlJrldzQYO5TcPWueGzQ2Jdvyvp6l3qDw==",
+            "archive_size": 393763,
+            "unpacked_size": 2100748
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.0.2.tgz",
-            "integrity": "sha512-jLywRB42hZMRMc4aUgt0uRjkY9FQnMdybv4XgLl+ddi75QuJn8Vbl0+CHcVHJDC0+WDfi1KQXRWtHaR5vp6gHw==",
-            "archive_size": 695680,
-            "unpacked_size": 7938833
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.1.0.tgz",
+            "integrity": "sha512-IuKjJmHLPzbmbg26eK9Jopd8AVxgLuu8fX114YzYAU6tLYclCo2DUzLL4vbCpYGr9mzvs2T0kigE3ZCueL06tg==",
+            "archive_size": 748150,
+            "unpacked_size": 8322078
           },
           {
             "path": "node_modules/@openai/codex",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.165.0.tgz",
-            "integrity": "sha512-aiwtQVp2KBhJld966CuU5bVfQ46VNB4mNTl6giX3WGZdt4euI3tv2RUqJpnupPNA8DXHg2z+RoQ0Zfw87dy8Lw==",
-            "archive_size": 4902,
-            "unpacked_size": 13206
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0.tgz",
+            "integrity": "sha512-2Szlp1l1cz5TX1ccpX4Zok3DZrot9xeZe0km+6/1v8JmqxADwyJxKBJah4dBymkwtS25j/u6dipJusTOI97Z8Q==",
+            "archive_size": 4992,
+            "unpacked_size": 13570
           },
           {
             "path": "node_modules/@openai/codex-linux-arm64",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.165.0-linux-arm64.tgz",
-            "integrity": "sha512-qdrYdcabxn3biX2qTtb/GuuMk20ZAQYxcmY7lHcp6CkAzyqsXbL0vIJFwWJr83/pNM+CUZH4YaTPns2kN7ZIfA==",
-            "archive_size": 158389090,
-            "unpacked_size": 400182924,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0-linux-arm64.tgz",
+            "integrity": "sha512-w0ScAsBr9aZKtIFrh6HN6KU2yjKKeSCzYfbb7DB0Ccj4BYPzeZtUeQprbycLCwuX3AFQdbdjapmLho2iot74jQ==",
+            "archive_size": 164402913,
+            "unpacked_size": 408635948,
             "cli": true
           },
           {
@@ -2672,31 +2672,31 @@
         "linux-x64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.3.0.tgz",
-            "integrity": "sha512-VdTYaOGXqLh/aVuAKIgFG7BIzbeq537FHGo28kgBhybDbeOdFVFTtc43k/tCpScFhZyqPQWHuWf8w/QQd0qtXQ==",
-            "archive_size": 374004,
-            "unpacked_size": 2005353
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.5.0.tgz",
+            "integrity": "sha512-7e/4OhJwpvSTqsjiokoVYRV7O1XGem1CAsQgO1opmGYbRD5LvmydwDlJrldzQYO5TcPWueGzQ2Jdvyvp6l3qDw==",
+            "archive_size": 393763,
+            "unpacked_size": 2100748
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.0.2.tgz",
-            "integrity": "sha512-jLywRB42hZMRMc4aUgt0uRjkY9FQnMdybv4XgLl+ddi75QuJn8Vbl0+CHcVHJDC0+WDfi1KQXRWtHaR5vp6gHw==",
-            "archive_size": 695680,
-            "unpacked_size": 7938833
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.1.0.tgz",
+            "integrity": "sha512-IuKjJmHLPzbmbg26eK9Jopd8AVxgLuu8fX114YzYAU6tLYclCo2DUzLL4vbCpYGr9mzvs2T0kigE3ZCueL06tg==",
+            "archive_size": 748150,
+            "unpacked_size": 8322078
           },
           {
             "path": "node_modules/@openai/codex",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.165.0.tgz",
-            "integrity": "sha512-aiwtQVp2KBhJld966CuU5bVfQ46VNB4mNTl6giX3WGZdt4euI3tv2RUqJpnupPNA8DXHg2z+RoQ0Zfw87dy8Lw==",
-            "archive_size": 4902,
-            "unpacked_size": 13206
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0.tgz",
+            "integrity": "sha512-2Szlp1l1cz5TX1ccpX4Zok3DZrot9xeZe0km+6/1v8JmqxADwyJxKBJah4dBymkwtS25j/u6dipJusTOI97Z8Q==",
+            "archive_size": 4992,
+            "unpacked_size": 13570
           },
           {
             "path": "node_modules/@openai/codex-linux-x64",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.165.0-linux-x64.tgz",
-            "integrity": "sha512-FotDc7bVHwaommtsdDP8PPrH0a5IwC/t8H/LhdEcH4EBqgeYFRCtptiHcuwgvNRCLbTbOyFE/Ur6GzYCljgaSQ==",
-            "archive_size": 166008118,
-            "unpacked_size": 445947042,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0-linux-x64.tgz",
+            "integrity": "sha512-CxDm3+D1cpbGJeHrdzINoG+3wn9BVncP4qpZaaNYkxe8iPtRJOYyCJnnPoVjWRIBvI9vPKbRoifsMSA5xDaUpw==",
+            "archive_size": 172325449,
+            "unpacked_size": 456152362,
             "cli": true
           },
           {
@@ -2851,7 +2851,7 @@
     }
   },
   "codex_app_server": {
-    "codex_version": "0.165.0",
+    "codex_version": "0.166.0",
     "bin": "node_modules/@openai/codex/bin/codex.js",
     "initialize": {
       "clientInfo": {

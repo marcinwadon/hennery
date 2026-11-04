@@ -44,6 +44,9 @@ state stays outside Git; public issues are separate approved projections.
 3. Evidence:
    - [Spike: per-session MCP over ACP](spikes/2026-09-25-per-session-mcp.md)
      and its [harness](../spikes/2026-09-25-mcp-per-session/).
+   - [Managed runtime acceptance (#305)](verification/2026-11-04-runtime-305.md)
+     — exact-pin macOS provider/delegation/deletion acceptance, Linux process
+     identity regression and Codex source audit; cross-platform status in PR #305.
 4. Plans:
    - [Stable Recent positions](plans/2026-10-22-stable-recent.md) — operator-approved fixed positions for six visible visited sessions, position-based numbered shortcuts and independent window-local Back history. Implementation, regression probes and replay are recorded in the plan; independent review and CI remain parent-owned.
    - [New like this](plans/2026-10-22-new-like-this.md) — create a standalone empty session from the source's last reported launch settings, from header and list menus; server-side hat validation, configuration read-back and focus on its empty composer. Implemented and verified locally; independent review and platform CI remain parent-owned.

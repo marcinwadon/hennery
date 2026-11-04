@@ -1270,6 +1270,70 @@ impl Harness {
     }
 }
 
+fn process_executable(pid: u32, reported: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        // Linux comm is a mutable task name: Node reports MainThread here.
+        let _ = reported;
+        let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        if executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("qemu-"))
+        {
+            // Under binfmt emulation exe names the interpreter; its next argv
+            // entry is the executable being tested. Never retain raw argv.
+            let arguments = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+            let guest = arguments.split(|byte| *byte == 0).nth(1)?;
+            Path::new(OsStr::from_bytes(guest)).canonicalize().ok()
+        } else {
+            Some(executable)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Some(PathBuf::from(reported))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn process_identity_survives_a_renamed_linux_task() -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf MainThread > /proc/self/comm; printf 'ready\\n'; read -r value",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let result = (|| -> Result<()> {
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().context("child output")?).read_line(&mut ready)?;
+        ensure!(ready == "ready\n", "renamed process ready");
+        let reported = Command::new("/bin/ps")
+            .args(["-p", &child.id().to_string(), "-o", "comm="])
+            .output()?;
+        ensure!(reported.status.success(), "inspect renamed process");
+        let reported = String::from_utf8(reported.stdout)?;
+        ensure!(reported.trim() == "MainThread", "task name actually changed");
+        ensure!(
+            process_executable(child.id(), reported.trim()) == Some(std::fs::canonicalize("/bin/sh")?),
+            "task name must not replace executable identity"
+        );
+        Ok(())
+    })();
+    child.kill()?;
+    child.wait()?;
+    result
+}
+
 fn node_pids() -> Result<Vec<u32>> {
     let output = std::process::Command::new("/bin/ps")
         .args(["-Ao", "pid=,ppid=,comm="])
@@ -1281,8 +1345,11 @@ fn node_pids() -> Result<Vec<u32>> {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse().ok()?;
             let parent: u32 = fields.next()?.parse().ok()?;
-            let binary = fields.next()?;
-            (parent == std::process::id() && Path::new(binary).file_name()?.to_str()? == "node").then_some(pid)
+            if parent != std::process::id() {
+                return None;
+            }
+            let binary = process_executable(pid, fields.next()?)?;
+            (binary.file_name()?.to_str()? == "node").then_some(pid)
         })
         .collect())
 }
@@ -1316,12 +1383,17 @@ fn process_token_exposure() -> Result<Vec<Value>> {
         }
     }
     let mut result = vec![];
-    for (pid, _, binary) in rows {
-        if !own.contains(&pid)
-            || !Path::new(&binary)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| matches!(name, "node" | "codex" | "claude"))
+    for (pid, _, reported) in rows {
+        if !own.contains(&pid) {
+            continue;
+        }
+        let Some(binary) = process_executable(pid, &reported) else {
+            continue;
+        };
+        if !binary
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "node" | "codex" | "claude"))
         {
             continue;
         }
@@ -1337,10 +1409,7 @@ fn process_token_exposure() -> Result<Vec<Value>> {
         } else if arguments.contains("@agentclientprotocol/codex-acp/") {
             "codex_adapter"
         } else {
-            Path::new(&binary)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("runtime")
+            binary.file_name().and_then(|name| name.to_str()).unwrap_or("runtime")
         };
         // Raw argv never leaves this function. Only presence booleans are evidence.
         result.push(json!({"process":role,"bearer_in_argv":arguments.to_ascii_lowercase().contains("bearer "),"authorization_header_in_argv":arguments.to_ascii_lowercase().contains("authorization")}));
@@ -1724,7 +1793,10 @@ async fn pinned_runtime_process_token_exposure_without_inference() -> Result<()>
         ensure!(!h.state.store.events(&h.parent,0,1000)?.iter().any(|event|event.kind=="user_turn"),"exposure inspection must submit no prompt");
         h.wait("pinned inputSchema discovery", || h.trace.lock().unwrap().iter().any(|r|r["caller"]==h.parent && r["method"]=="tools/list").then_some(())).await?;
         ensure!(h.trace.lock().unwrap().iter().filter(|r|r["method"]=="tools/list").all(|r|r["schemas_valid"]==true), "pinned adapter received an invalid inputSchema contract");
-        println!("{}",json!({"case":"process_token_exposure","runtime":runtime,"advertised_input_schemas_valid":true,"provider_inference":false,"processes":process_token_exposure()?}));
+        ensure!(node_pids()?.len() == 1, "identify the attached adapter by executable");
+        let processes = process_token_exposure()?;
+        ensure!(processes.iter().any(|row| row["process"] == format!("{runtime}_adapter")), "exposure inspection must include the actual adapter");
+        println!("{}",json!({"case":"process_token_exposure","runtime":runtime,"advertised_input_schemas_valid":true,"provider_inference":false,"processes":processes}));
         Ok(())
     }.await;
     let cleanup = h.finish().await;
