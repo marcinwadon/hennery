@@ -31,6 +31,7 @@ def classify(paths, event="push"):
         'rust': code, 'macos': code and event != 'pull_request', 'web': code,
         'nix': event != 'pull_request' or any(matches(path, (
             'flake.nix', 'flake.lock', 'Cargo.lock', 'nix/*',
+            'web/package.json', 'web/pnpm-lock.yaml', 'web/.npmrc',
         )) for path in paths),
         'recipes': recipes,
         'audit_rust': any(path == 'Cargo.lock' for path in paths),

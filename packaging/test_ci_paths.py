@@ -91,6 +91,14 @@ class ChangedPaths(unittest.TestCase):
         self.assertEqual(outputs['audit_rust'], 'false')
         self.assertEqual(outputs['audit_web'], 'true')
 
+    def test_web_dependency_changes_select_nix_on_pull_requests(self):
+        for path in ('web/package.json', 'web/pnpm-lock.yaml', 'web/.npmrc'):
+            with self.subTest(path=path):
+                base = self.git('rev-parse', 'HEAD').strip()
+                self.write(path)
+                self.commit()
+                self.assertEqual(self.select(base, event='pull_request')['nix'], 'true')
+
     def test_source_renamed_into_docs_keeps_deletion_in_selection(self):
         self.git('mv', 'web/src/main.ts', 'docs/moved.md')
         self.commit()
