@@ -50,7 +50,8 @@
 .ui-radio input { accent-color:var(--hn-accent); }
 .ui-appearance { display:flex; gap:8px; flex-wrap:wrap; margin-top:20px; }
 .ui-appearance legend { color:var(--hn-fg-3); }
-.ui-theme-announcement { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+/* Hidden live regions must not extend the document beyond a scroll panel. */
+.ui-theme-announcement { position:absolute; top:0; left:0; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
 .auth .auth-card { padding:24px; border-radius:var(--radius-lg); box-shadow:var(--shadow-xs); }
 .auth-card h1 { font:500 24px/1.2 var(--font-display); }
 .auth-card .brand-name { font-weight:500; }

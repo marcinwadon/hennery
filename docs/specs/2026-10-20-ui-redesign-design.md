@@ -287,6 +287,10 @@ page, navigation, forms and composer must not.
 Use `100dvh`, `min-height:0`/`min-width:0`, actual scroll containers,
 `viewport-fit=cover` and safe-area padding. The device border, fake clock,
 signal/Wi-Fi/battery and home indicator are prototype framing, not app UI.
+Disable viewport overscroll on both axes so native rubber-banding cannot shift
+the whole installed app; ordinary document and panel scrolling stays available.
+Anchor visually hidden live regions explicitly so their static positions cannot
+extend the document beyond a nested scroll panel.
 Bottom answer/composer controls remain reachable with the onscreen keyboard.
 Sheets scroll within the available viewport; they do not assume the
 prototype's fixed height or top offset. One responsive component tree owns

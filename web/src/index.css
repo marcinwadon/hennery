@@ -5,7 +5,8 @@
 @import "./components/ui/ui.css";
 
 * { box-sizing:border-box; }
-html,body { margin:0; height:100%; overflow-x:hidden; }
+/* Keep native overscroll from shifting the entire installed app window. */
+html,body { margin:0; height:100%; overflow-x:hidden; overscroll-behavior:none; }
 body {
   background:var(--bg); color:var(--fg-1);
   font-family:var(--font-body); font-size:15px; line-height:1.55;

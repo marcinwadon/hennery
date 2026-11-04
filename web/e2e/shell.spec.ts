@@ -132,6 +132,49 @@ test('the password signs in, and a step-up from the page is accepted', async () 
   expect(status).toBe(204)
 })
 
+test('panel scrolling keeps the app viewport fixed at scroll boundaries', async () => {
+  await page.goto('/settings')
+  await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible()
+  try {
+    // A short desktop window also makes the navigation rail scrollable.
+    for (const viewport of [{ width: 1280, height: 360 }, { width: 390, height: 600 }]) {
+      await page.setViewportSize(viewport)
+      expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBe(viewport.height)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(viewport.width)
+      await page.evaluate(() => window.scrollTo(10_000, 10_000))
+      expect(await page.evaluate(() => [scrollX, scrollY])).toEqual([0, 0])
+      // Headless Chromium does not draw macOS's native rubber-band effect.
+      // Guard the viewport policy too: wheel assertions alone miss that bug.
+      expect(await page.evaluate(() => {
+        const root = getComputedStyle(document.documentElement)
+        return [root.overscrollBehaviorX, root.overscrollBehaviorY]
+      })).toEqual(['none', 'none'])
+      const panels = viewport.width === 1280 ? ['.main', '.rail'] : ['.main']
+      for (const selector of panels) {
+        const panel = page.locator(selector)
+        const box = (await panel.boundingBox())!
+        expect(await panel.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(0)
+        await panel.evaluate(el => { el.scrollTop = 0 })
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+        await page.mouse.wheel(0, 150)
+        await expect.poll(() => panel.evaluate(el => el.scrollTop)).toBeGreaterThan(0)
+        for (const delta of [10_000, -10_000]) {
+          await panel.evaluate((el, down) => { el.scrollTop = down ? el.scrollHeight : 0 }, delta > 0)
+          // Two gestures: reach the boundary, then attempt to pass it.
+          await page.mouse.wheel(0, delta)
+          await page.mouse.wheel(0, delta)
+          await expect.poll(() => page.evaluate(() => [scrollX, scrollY])).toEqual([0, 0])
+          expect(await panel.boundingBox()).toEqual(box)
+        }
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBe(viewport.height)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(viewport.width)
+    }
+  } finally {
+    await page.setViewportSize({ width: 1280, height: 800 })
+  }
+})
+
 test('the pages broke no Content-Security-Policy rule', async () => {
   expect(await cspViolations()).toEqual([])
 })

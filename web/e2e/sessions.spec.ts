@@ -734,6 +734,7 @@ test.describe('redesigned session', () => {
         await shot('parking-menu')
         await page.keyboard.press('Escape')
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+        expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(true)
         expect(mutations.filter(m => m.path.endsWith('/prompt'))).toHaveLength(0)
         // The same view with a running child and a retained parked draft.
         question.answerable = false; question.answered = true; question.state = 'delivered'
