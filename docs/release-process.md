@@ -147,6 +147,19 @@ already-existing identical versions under renewed approval while the original ar
 scoped bootstrap token and, when required, a new signed version. Never replace a
 published crate or treat a registry error as absence.
 
+## Waiting for required CI
+
+Use `packaging/ci_watch.py` with the full source SHA and explicit run IDs to
+monitor core CI and packaging together. See [the watcher guide](ci-watcher.md).
+Its process polls internally and persists changes; the agent should inspect the
+actionable result instead of repeatedly interpreting unchanged logs. A failed
+job can be investigated while other jobs finish. An unchanged status does not
+justify another build or a broader test run.
+
+Use a supervised job and an owning-session callback when the agent can park.
+The watcher alone does not keep shell background jobs alive or wake a session.
+Keep existing publication authority and exact-source qualification unchanged.
+
 ## One tagged run, one protected publisher
 
 Before tagging, synchronize the workspace and web package versions, exact
