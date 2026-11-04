@@ -6,6 +6,22 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// Finish ACP initialization before sending session traffic. The SDK rejects
+/// requests received before the initialize response has been sent.
+fn initialize_then_send(stdin: &mut impl Write, stdout: &mut impl BufRead, requests: &[Value]) -> Value {
+    assert_eq!(requests[0]["method"], "initialize");
+    writeln!(stdin, "{}", requests[0]).unwrap();
+    let mut line = String::new();
+    assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "initialize closed stdout");
+    let initialized: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(initialized["id"], requests[0]["id"], "{initialized}");
+    assert!(initialized.get("result").is_some(), "initialize failed: {initialized}");
+    for request in &requests[1..] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    initialized
+}
+
 fn exchange(script: Option<&str>, requests: &[Value]) -> Vec<Value> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"));
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -14,11 +30,8 @@ fn exchange(script: Option<&str>, requests: &[Value]) -> Vec<Value> {
     }
     let mut child = cmd.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    for r in requests {
-        writeln!(stdin, "{r}").unwrap();
-    }
-    let reader = BufReader::new(child.stdout.take().unwrap());
-    let mut out = Vec::new();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut out = vec![initialize_then_send(&mut stdin, &mut reader, requests)];
     for line in reader.lines() {
         let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let done = msg["id"] == json!(3);
@@ -71,14 +84,14 @@ fn exit_after_chunks_crashes_mid_turn_without_answering_the_prompt() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    for r in session_requests() {
-        writeln!(stdin, "{r}").unwrap();
-    }
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut out = vec![initialize_then_send(&mut stdin, &mut reader, &session_requests())];
     // Read until EOF: the process exits, so stdout closes.
-    let out: Vec<Value> = BufReader::new(child.stdout.take().unwrap())
-        .lines()
-        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
-        .collect();
+    out.extend(
+        reader
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(&l.unwrap()).unwrap()),
+    );
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(hennery_testkit::CRASH_EXIT_CODE));
     let updates = out.iter().filter(|m| m["method"] == "session/update").count();
@@ -169,11 +182,11 @@ fn exchange_until(script: &str, requests: &[Value], last: i64) -> Vec<Value> {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    for r in requests {
-        writeln!(stdin, "{r}").unwrap();
-    }
-    let mut out = Vec::new();
-    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let initialized = initialize_then_send(&mut stdin, &mut reader, requests);
+    let initialized_is_last = initialized["id"] == json!(last);
+    let mut out = vec![initialized];
+    for line in reader.lines().take(if initialized_is_last { 0 } else { usize::MAX }) {
         let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
         let done = msg["id"] == json!(last);
         out.push(msg);
@@ -472,10 +485,7 @@ fn a_hung_config_switch_never_answers_while_other_traffic_is_served() {
     requests.push(set_config(3, "model", json!("large")));
     requests.push(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt",
                          "params":{"sessionId":"fake-session-1","prompt":[{"type":"text","text":"hi"}]}}));
-    for r in &requests {
-        writeln!(stdin, "{r}").unwrap();
-    }
-    drop(stdin);
+    writeln!(stdin, "{}", requests[0]).unwrap();
 
     // Read replies on a background thread so the main thread can enforce a
     // wall-clock window on the switch without also timing out the process's
@@ -500,7 +510,14 @@ fn a_hung_config_switch_never_answers_while_other_traffic_is_served() {
     // Other traffic sent right after the hung switch must still be served.
     // Wait generously for it (this leg is dominated by process start-up, not
     // by the switch), while watching that id 3 never sneaks in alongside it.
-    let mut out = Vec::new();
+    let initialized = rx.recv_timeout(Duration::from_secs(10)).expect("initialize answered");
+    assert_eq!(initialized["id"], requests[0]["id"], "{initialized}");
+    assert!(initialized.get("result").is_some(), "{initialized}");
+    for request in &requests[1..] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let mut out = vec![initialized];
     loop {
         let msg = rx
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -597,12 +614,11 @@ fn converse_with(
         }
     });
     let mut stdin = child.stdin.take().unwrap();
-    for r in &requests {
-        writeln!(stdin, "{r}").unwrap();
-    }
-    let mut messages = Vec::new();
-    let mut answered = false;
-    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let initialized = initialize_then_send(&mut stdin, &mut stdout, &requests);
+    let mut answered = initialized["id"] == last;
+    let mut messages = vec![initialized];
+    for line in stdout.lines().take(if answered { 0 } else { usize::MAX }) {
         let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
         if msg.get("method").is_some() && msg.get("id").is_some() {
             for reply in on_request(&msg) {
@@ -829,9 +845,8 @@ fn ask_on_load_waits_drive(script: &FakeScript) -> Value {
             .unwrap(),
     );
     let mut stdin = child.0.stdin.take().unwrap();
-    for r in &load_requests("agent-7") {
-        writeln!(stdin, "{r}").unwrap();
-    }
+    let requests = load_requests("agent-7");
+    writeln!(stdin, "{}", requests[0]).unwrap();
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -847,6 +862,8 @@ fn ask_on_load_waits_drive(script: &FakeScript) -> Value {
     });
     let init = rx.recv_timeout(Duration::from_secs(5)).expect("initialize answered");
     assert_eq!(init["id"], json!(1), "{init}");
+    assert!(init.get("result").is_some(), "{init}");
+    writeln!(stdin, "{}", requests[1]).unwrap();
     let ask = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("asked before the load answered");

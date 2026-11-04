@@ -7,9 +7,9 @@
 //! an adapter error that quotes the servers, and a frame that does not
 //! decode, which the host logs by its error's kind and place only. The fake
 //! adapter also prints a stray (non-JSON-RPC) stdout line quoting the token
-//! and the URL key, which the ACP crate cannot parse and so quotes whole in
-//! a `warn` event of its own (`agent-client-protocol` 2.2.0) — the reason
-//! that target is held at `error`, not `info`.
+//! and the URL key. SDK 3.6 sanitizes its parse warning but echoes the raw line
+//! in the traced error response. The target remains conservatively capped at
+//! `error`, as earlier SDKs also exposed the line in their warning.
 //! Run twice: once under a plain
 //! subscriber, which proves they do, and once under the one the process
 //! installs (`logging::capped`), which must not show it. Each run's
@@ -97,7 +97,7 @@ async fn run_sessions_with_the_token() {
     let mut claude = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
     // A stray (non-JSON-RPC) line on its stdout, quoting the token and the
     // URL key, right before it answers `session/new`: the ACP crate cannot
-    // parse it and quotes it whole in a `warn` event of its own.
+    // parse it and echoes it in the traced JSON-RPC error response.
     let claude_script = hennery_testkit::FakeScript {
         stdout_lines: vec![format!("debug: servers [{TOKEN}] {URL_KEY}")],
         ..Default::default()
@@ -227,13 +227,29 @@ async fn a_sessions_token_is_never_logged_even_at_trace() {
             );
         }
     }
-    // The ACP crate's own `warn`, quoting the adapter's stray stdout whole:
-    // the probe for capping that target at `error`.
+    // The malformed line still reaches the SDK's warning path, now without
+    // disclosing the line. Its traced error response still carries both
+    // secrets, so the process's cap must continue to cover that path.
+    let warnings: Vec<_> = control
+        .lines()
+        .filter(|line| line.contains("agent_client_protocol") && line.contains("Invalid transport input"))
+        .collect();
+    assert!(!warnings.is_empty(), "no warning for the malformed adapter output");
+    assert!(
+        warnings
+            .iter()
+            .all(|line| !line.contains(TOKEN) && !line.contains(URL_KEY)),
+        "the SDK warning disclosed malformed adapter output"
+    );
     assert!(
         control.lines().any(|line| {
-            line.contains("agent_client_protocol") && line.contains("Invalid transport input") && line.contains(TOKEN)
+            line.contains("agent_client_protocol")
+                && line.contains("Sending JSON-RPC message")
+                && line.contains("\"code\":-32700")
+                && line.contains(TOKEN)
+                && line.contains(URL_KEY)
         }),
-        "no agent_client_protocol warn line quoting the stray stdout's token in the plain log: {control}"
+        "no traced parse-error response quoting the malformed adapter output"
     );
 
     // ...and the process's own subscriber, which logs, never shows it.

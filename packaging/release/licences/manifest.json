@@ -13,6 +13,13 @@
       "source": "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/LICENSE"
     }
   ],
+  "cargo:agent-client-protocol-schema@1.13.0": [
+    {
+      "file": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221.txt",
+      "sha256": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221",
+      "source": "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/97fcb0f5b88567dd91d585ea6885761365a6aa7b/LICENSE"
+    }
+  ],
   "cargo:agent-client-protocol-schema@1.9.1": [
     {
       "file": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221.txt",
