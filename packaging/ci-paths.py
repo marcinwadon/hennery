@@ -22,14 +22,23 @@ def classify(paths, event="push"):
         return (path == 'LICENSE'
                 or path.endswith('.md') and ('/' not in path or path.startswith('docs/'))
                 or matches(path, ('docs/*.svg', 'docs/*.png')))
-    code = any(not documentation(path) for path in paths)
+    # These files are exercised by checks, or by the reusable Nix job below.
+    # Keep the allowlist exact: unrecognised inputs still select product tests.
+    infrastructure = {
+        'packaging/ci-paths.py', 'packaging/test_ci_paths.py',
+        'packaging/ci_watch.py', 'packaging/tests/test_ci_watch.py',
+        'packaging/runtime_acceptance.py', 'packaging/tests/test_runtime_acceptance.py',
+        '.github/workflows/nix-package.yml',
+    }
+    code = any(not documentation(path) and path not in infrastructure for path in paths)
+    nix_workflow = '.github/workflows/nix-package.yml' in paths
     platforms = any(matches(path, (
         'flake.*', 'nix/*', '.cargo/*', 'rust-toolchain*',
         '.github/workflows/ci.yml', '.github/workflows/nix.yml',
-    )) for path in paths)
+    )) for path in paths) or nix_workflow
     result = {name: str(value).lower() for name, value in {
         'rust': code, 'macos': code and event != 'pull_request', 'web': code,
-        'nix': event != 'pull_request' or any(matches(path, (
+        'nix': nix_workflow or (event != 'pull_request' and (code or recipes)) or any(matches(path, (
             'flake.nix', 'flake.lock', 'Cargo.lock', 'nix/*',
             'web/package.json', 'web/pnpm-lock.yaml', 'web/.npmrc',
         )) for path in paths),

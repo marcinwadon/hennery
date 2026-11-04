@@ -195,51 +195,10 @@ jobs:
   nix:
     needs: checks
     if: needs.checks.outputs.nix == 'true'
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.checks.outputs.nix_matrix) }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.system == 'aarch64-darwin' && 60 || 45 }}
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      with:
-        persist-credentials: false
-    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
-      with:
-        github_access_token: ${{ github.token }}
-    - name: Check rendered Cargo arguments
-      run: nix develop .#release -c python3 packaging/check-nix-args.py
-    - name: Package, source inputs and embedded UI (Rust lint and audits run elsewhere)
-      env:
-        SYSTEM: ${{ matrix.system }}
-      run: |
-        # Hosted macOS exhausts its buffers when concurrent builders stream
-        # OpenSSL compiler output and pnpm download progress into Actions.
-        set --
-        if [ "$SYSTEM" = aarch64-darwin ]; then
-          set -- --max-jobs 1
-        fi
-        build_log="$RUNNER_TEMP/nix-build.log"
-        nix build "$@" -L ".#checks.$SYSTEM.package" ".#checks.$SYSTEM.source-inputs" ".#checks.$SYSTEM.web-ui" > "$build_log" 2>&1 || {
-          build_exit=$?
-          tail -n 200 "$build_log"
-          exit "$build_exit"
-        }
-        tail -n 40 "$build_log"
-        nix run . -- --version
-    - name: Preserve the complete Nix build log
-      if: always()
-      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-      with:
-        name: nix-${{ matrix.system }}-build-log
-        path: ${{ runner.temp }}/nix-build.log
-        if-no-files-found: ignore
-        retention-days: 7
-    - name: The README Nix recipe
-      if: needs.checks.outputs.recipes == 'true'
-      run: |
-        sh packaging/readme-blocks.sh README.md nix > "$RUNNER_TEMP/nix.sh"
-        sh -eux "$RUNNER_TEMP/nix.sh"
+    uses: ./.github/workflows/nix-package.yml
+    with:
+      matrix: ${{ needs.checks.outputs.nix_matrix }}
+      recipes: ${{ needs.checks.outputs.recipes == 'true' }}
 
   readme:
     needs: checks

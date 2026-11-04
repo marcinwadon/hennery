@@ -1,11 +1,14 @@
 """Exercise selection through the real git diff producer and CLI output."""
 import json
+import fnmatch
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+
+import yaml
 
 SCRIPT = Path(__file__).with_name('ci-paths.py')
 
@@ -48,7 +51,49 @@ class ChangedPaths(unittest.TestCase):
         outputs = self.select(event='pull_request')
         for key in ('rust', 'macos', 'web', 'nix', 'recipes', 'audit_rust', 'audit_web'):
             self.assertEqual(outputs[key], 'false', key)
-        self.assertEqual(self.select(event='push')['nix'], 'true')
+        self.assertEqual(self.select(event='push')['nix'], 'false')
+
+    def test_nix_workflow_changes_select_only_nix_and_portable_checks(self):
+        self.write('.github/workflows/nix-package.yml')
+        self.commit()
+        for event in ('push', 'pull_request'):
+            with self.subTest(event=event):
+                outputs = self.select(event=event)
+                self.assertEqual(outputs['nix'], 'true')
+                for key in ('rust', 'web', 'macos', 'recipes'):
+                    self.assertEqual(outputs[key], 'false', key)
+                systems = {item['system'] for item in json.loads(outputs['nix_matrix'])['include']}
+                expected = {'x86_64-linux', 'aarch64-linux'}
+                if event == 'push':
+                    expected.add('aarch64-darwin')
+                self.assertEqual(systems, expected)
+
+    def test_selector_changes_run_its_regressions_without_rebuilding_the_product(self):
+        self.write('packaging/ci-paths.py')
+        self.write('packaging/test_ci_paths.py')
+        self.write('packaging/ci_watch.py')
+        self.write('packaging/tests/test_ci_watch.py')
+        self.write('packaging/runtime_acceptance.py')
+        self.write('packaging/tests/test_runtime_acceptance.py')
+        self.commit()
+        outputs = self.select()
+        for key in ('rust', 'web', 'macos', 'nix', 'recipes'):
+            self.assertEqual(outputs[key], 'false', key)
+
+    def test_shared_workflow_still_selects_all_affected_jobs(self):
+        self.write('.github/workflows/ci.yml')
+        self.commit()
+        outputs = self.select()
+        for key in ('rust', 'web', 'macos', 'nix', 'recipes'):
+            self.assertEqual(outputs[key], 'true', key)
+
+    def test_nix_workflow_does_not_hide_an_application_change(self):
+        self.write('.github/workflows/nix-package.yml')
+        self.write('crates/hennery/src/main.rs')
+        self.commit()
+        outputs = self.select()
+        for key in ('rust', 'web', 'macos', 'nix'):
+            self.assertEqual(outputs[key], 'true', key)
 
     def test_source_and_unknown_paths_select_all_core_jobs(self):
         for path in ('crates/hennery-view/src/new.rs', 'web/src/new.ts', 'new-build-input',
@@ -201,3 +246,27 @@ class PackagingSelection(unittest.TestCase):
         main = self.select(event='push')
         self.assertEqual(len(json.loads(main['archive_matrix'])['include']), 3)
         self.assertIn('aarch64-apple-darwin', main['targets'])
+
+
+class PackagingTriggers(unittest.TestCase):
+    def test_only_packaging_workflows_trigger_archive_rebuilds(self):
+        workflow = yaml.safe_load((SCRIPT.parent.parent / '.github/workflows/packaging.yml').read_text())
+        triggers = workflow.get('on', workflow.get(True))
+        for event in ('push', 'pull_request'):
+            patterns = triggers[event]['paths']
+            def selected(path):
+                result = False
+                for pattern in patterns:
+                    if fnmatch.fnmatchcase(path, pattern.removeprefix('!')):
+                        result = not pattern.startswith('!')
+                return result
+            for path in ('.github/workflows/nix-package.yml', '.github/workflows/ci.yml',
+                         '.github/workflows/pins.yml', 'packaging/ci-paths.py',
+                         'packaging/test_ci_paths.py', 'packaging/ci_watch.py',
+                         'packaging/tests/test_ci_watch.py', 'packaging/runtime_acceptance.py',
+                         'packaging/tests/test_runtime_acceptance.py'):
+                self.assertFalse(selected(path), path)
+            for path in ('.github/workflows/packaging.yml', '.github/workflows/release.yml',
+                         'packaging/release/package_context.py', 'Cargo.lock', 'flake.lock',
+                         'adapters/pins.toml', 'web/pnpm-lock.yaml'):
+                self.assertTrue(selected(path), path)

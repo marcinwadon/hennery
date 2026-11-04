@@ -14,9 +14,16 @@ name: packaging
         value: ${{ jobs.assemble.outputs.artifact_id }}
   pull_request:
     paths:
-    - .github/workflows/**
+    - .github/workflows/packaging.yml
+    - .github/workflows/release.yml
     - .github/actions/**
     - packaging/**
+    - '!packaging/ci-paths.py'
+    - '!packaging/test_ci_paths.py'
+    - '!packaging/ci_watch.py'
+    - '!packaging/tests/test_ci_watch.py'
+    - '!packaging/runtime_acceptance.py'
+    - '!packaging/tests/test_runtime_acceptance.py'
     - Cargo.toml
     - Cargo.lock
     - dist-workspace.toml
@@ -41,9 +48,16 @@ name: packaging
     branches:
     - main
     paths:
-    - .github/workflows/**
+    - .github/workflows/packaging.yml
+    - .github/workflows/release.yml
     - .github/actions/**
     - packaging/**
+    - '!packaging/ci-paths.py'
+    - '!packaging/test_ci_paths.py'
+    - '!packaging/ci_watch.py'
+    - '!packaging/tests/test_ci_watch.py'
+    - '!packaging/runtime_acceptance.py'
+    - '!packaging/tests/test_runtime_acceptance.py'
     - Cargo.toml
     - Cargo.lock
     - dist-workspace.toml
