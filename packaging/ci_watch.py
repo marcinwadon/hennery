@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 class WatchError(Exception):
@@ -18,6 +19,8 @@ class WatchError(Exception):
 
 
 def api(repo, route):
+    # Intermediary caches can retain a queued response after the run completes.
+    route += ('&' if '?' in route else '?') + '_=' + uuid.uuid4().hex
     result = subprocess.run(
         ['gh', 'api', '--paginate', '--slurp', f'repos/{repo}/{route}'],
         capture_output=True, text=True, timeout=30,

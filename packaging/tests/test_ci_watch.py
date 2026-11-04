@@ -7,6 +7,8 @@ import tempfile
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 spec = importlib.util.spec_from_file_location('ci_watch', Path(__file__).resolve().parents[1] / 'ci_watch.py')
 watcher = importlib.util.module_from_spec(spec)
@@ -15,6 +17,24 @@ SHA = 'a' * 40
 
 
 class Watch(unittest.TestCase):
+    def test_api_observes_new_status_despite_a_response_cache(self):
+        for route in ('actions/runs/12', 'actions/runs/12/attempts/2/jobs?per_page=100'):
+            with self.subTest(route=route):
+                cache = {}
+                current = {'status': 'queued'}
+                def transport(command, **kwargs):
+                    endpoint = command[-1]
+                    parsed = urlsplit(endpoint)
+                    self.assertEqual(parsed.path, 'repos/owner/repo/' + route.split('?')[0])
+                    if '?' in route:
+                        self.assertEqual(parse_qs(parsed.query)['per_page'], ['100'])
+                    raw = cache.setdefault(endpoint, json.dumps([dict(current)]))
+                    return subprocess.CompletedProcess(command, 0, raw, '')
+                with patch.object(watcher.subprocess, 'run', side_effect=transport):
+                    self.assertEqual(watcher.api('owner/repo', route)[0]['status'], 'queued')
+                    current['status'] = 'completed'
+                    self.assertEqual(watcher.api('owner/repo', route)[0]['status'], 'completed')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
