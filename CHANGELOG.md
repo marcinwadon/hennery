@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.5.3
+
+- Accept OAuth client metadata documents that support public authentication
+  alongside `private_key_jwt`, fixing ChatGPT external MCP authorization.
+- Keep private-key-only clients rejected and retain PKCE, redirect validation
+  and explicit operator consent for public clients.
+
 ## 0.5.2
 
 - Keep the app viewport fixed while scrolling panels, including short desktop
