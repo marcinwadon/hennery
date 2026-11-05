@@ -270,8 +270,31 @@ async fn metadata(state: &AppState, id: &str) -> anyhow::Result<Metadata> {
         .map_err(|_| anyhow::anyhow!("invalid_client"))?;
     metadata_document(&bytes, id)
 }
+#[derive(serde::Deserialize)]
+struct MetadataDocument {
+    #[serde(flatten)]
+    metadata: Metadata,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Vec<String>,
+}
 fn metadata_document(bytes: &[u8], id: &str) -> anyhow::Result<Metadata> {
-    let parsed: Metadata = serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid_client_metadata"))?;
+    let document: MetadataDocument =
+        serde_json::from_slice(bytes).map_err(|_| anyhow::anyhow!("invalid_client_metadata"))?;
+    // A client may prefer a confidential method and still support "none"
+    // (ChatGPT prefers private_key_jwt). We advertise only "none", so such a
+    // client is a public client here; PKCE still binds the code.
+    let public = document
+        .token_endpoint_auth_methods_supported
+        .iter()
+        .any(|a| a == "none");
+    let parsed = Metadata {
+        token_endpoint_auth_method: if public {
+            Some("none".into())
+        } else {
+            document.metadata.token_endpoint_auth_method.clone()
+        },
+        ..document.metadata
+    };
     anyhow::ensure!(parsed.client_id.as_deref() == Some(id), "invalid_client");
     // The client hosts this document for every server it talks to, so it may
     // list grants we never issue (Claude lists jwt-bearer). Keep only ours;
@@ -436,6 +459,17 @@ mod tests {
         assert_eq!(m.grant_types, ["authorization_code", "refresh_token"]);
         let only_unsupported = json!({"client_id":id,"client_name":"Claude","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"grant_types":["urn:ietf:params:oauth:grant-type:jwt-bearer"],"token_endpoint_auth_method":"none"});
         assert!(metadata_document(&serde_json::to_vec(&only_unsupported).unwrap(), id).is_err());
+    }
+    #[test]
+    fn cimd_that_prefers_private_key_jwt_but_supports_none_is_a_public_client() {
+        // ChatGPT's published document (fetched 2026-11-05) prefers
+        // private_key_jwt and also lists "none" as supported.
+        let id = "https://chatgpt.com/oauth/client.json";
+        let chatgpt = json!({"client_id":id,"client_uri":"https://chatgpt.com/","redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],"token_endpoint_auth_method":"private_key_jwt","token_endpoint_auth_methods_supported":["none","private_key_jwt"],"grant_types":["authorization_code","refresh_token"],"response_types":["code"],"client_name":"ChatGPT","logo_uri":"https://persistent.oaistatic.com/sonic/misc/openai-logo.png","token_endpoint_auth_signing_alg":"RS256","jwks_uri":"https://chatgpt.com/oauth/jwks.json"});
+        let m = metadata_document(&serde_json::to_vec(&chatgpt).unwrap(), id).unwrap();
+        assert_eq!(m.token_endpoint_auth_method.as_deref(), Some("none"));
+        let no_public = json!({"client_id":id,"client_name":"ChatGPT","redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],"token_endpoint_auth_method":"private_key_jwt","token_endpoint_auth_methods_supported":["private_key_jwt"]});
+        assert!(metadata_document(&serde_json::to_vec(&no_public).unwrap(), id).is_err());
     }
     #[test]
     fn cimd_identity_and_redirects_are_verified_without_trusting_extra_branding() {
