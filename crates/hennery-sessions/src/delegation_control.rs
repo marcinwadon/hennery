@@ -276,6 +276,29 @@ impl Store {
         cursor: Option<&str>,
         limit: u16,
     ) -> Result<ChildList> {
+        let page = self.child_list_snapshot(identity, revision, cursor, limit, false)?;
+        Ok(ChildList {
+            children: page.children.into_iter().map(|row| row.summary).collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+    pub fn child_work_list(
+        &self,
+        identity: &SessionIdentity,
+        revision: i64,
+        cursor: Option<&str>,
+        limit: u16,
+    ) -> Result<hennery_view::work::WorkChildList> {
+        self.child_list_snapshot(identity, revision, cursor, limit, true)
+    }
+    fn child_list_snapshot(
+        &self,
+        identity: &SessionIdentity,
+        revision: i64,
+        cursor: Option<&str>,
+        limit: u16,
+        with_work: bool,
+    ) -> Result<hennery_view::work::WorkChildList> {
         ensure!((1..=100).contains(&limit), "invalid_arguments");
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -322,13 +345,35 @@ impl Store {
                 },
             )?
             .collect::<rusqlite::Result<_>>()?;
-        let next_cursor = if children.len() > limit as usize {
+        let mut next_cursor = if children.len() > limit as usize {
             children.pop();
             Some(format!("{scope}.{}", children.last().unwrap().child_id))
         } else {
             None
         };
-        Ok(ChildList { children, next_cursor })
+        drop(stmt);
+        let mut observations: Vec<hennery_view::work::WorkChildSummary> = Vec::new();
+        // Reserve the envelope and cursor as well as array separators.
+        let mut bytes = 256;
+        for summary in children {
+            let work = if with_work {
+                crate::work::snapshot_in(&tx, self.owner_id(), &summary.child_id, true, None)?
+            } else {
+                None
+            };
+            let row = hennery_view::work::WorkChildSummary { summary, work };
+            let size = serde_json::to_vec(&row)?.len() + 1;
+            if !observations.is_empty() && bytes + size > 192 * 1024 {
+                next_cursor = observations.last().map(|row| format!("{scope}.{}", row.child_id));
+                break;
+            }
+            bytes += size;
+            observations.push(row);
+        }
+        Ok(hennery_view::work::WorkChildList {
+            children: observations,
+            next_cursor,
+        })
     }
     pub fn child_status(
         &self,

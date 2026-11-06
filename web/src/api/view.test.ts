@@ -7,6 +7,7 @@ import {
   itemStreamPath,
   listStreamPath,
   sessionDetail,
+  sessionWork,
   summaries,
   undeliveredTurn,
 } from './view'
@@ -37,11 +38,12 @@ describe('the view client', () => {
     expect(s.calls[0].path).toBe(`/api/view/sessions/${ENC}/turns/t%2F1%252`)
   })
 
-  it('catalog and sessionDetail encode the id', async () => {
+  it('catalog, sessionDetail and sessionWork encode the id', async () => {
     const s = server()
     await catalog(s.client, ID)
     await sessionDetail(s.client, ID)
-    expect(s.calls.map((c) => c.path)).toEqual([`/api/sessions/${ENC}/catalog`, `/api/sessions/${ENC}`])
+    await sessionWork(s.client, ID)
+    expect(s.calls.map((c) => c.path)).toEqual([`/api/sessions/${ENC}/catalog`, `/api/sessions/${ENC}`, `/api/view/sessions/${ENC}/work`])
   })
 
   it('the item stream path encodes the id', () => {

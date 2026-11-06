@@ -3,7 +3,7 @@
 // and the streams' paths. Every id in a path is encoded: ids are server
 // data, never trusted to be path-safe.
 import type { Client } from './client'
-import type { FamilyPage, Item, ItemPage, SummaryPage, TurnContent } from '../generated/view'
+import type { FamilyPage, Item, ItemPage, SessionWork, SummaryPage, TurnContent } from '../generated/view'
 import type { SessionCatalog, SessionDetail } from '../generated/protocol'
 
 const enc = encodeURIComponent
@@ -75,6 +75,11 @@ export function summaries(client: Client, q: SummaryQuery = {}, signal?: AbortSi
     })}`,
     undefined, { signal },
   )
+}
+
+/** Bounded session observations; reading does not acknowledge activity. */
+export function sessionWork(client: Client, id: string, signal?: AbortSignal): Promise<SessionWork> {
+  return client.request<SessionWork>('GET', `/api/view/sessions/${enc(id)}/work`, undefined, { signal })
 }
 
 /** `GET /api/view/sessions/{id}/turns/{turn_id}`: a prompt that was not

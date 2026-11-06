@@ -80,6 +80,7 @@ pub struct ExternalIdentity {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMetadata {
+    pub work: Option<hennery_view::work::SessionWork>,
     pub agent_session_id: Option<String>,
     pub sidebar_pinned: bool,
     pub config: hennery_proto::frames::SessionConfig,
@@ -325,7 +326,7 @@ impl Store {
           AND (?12 IS NULL OR s.agent_session_id=?12) AND (?13 IS NULL OR s.sidebar_pinned=?13)
           AND (?14 IS NULL OR s.hat_id=?14)
           ORDER BY s.id LIMIT ?5")?;
-        Ok(stmt
+        let mut sessions: Vec<SessionMetadata> = stmt
             .query_map(
                 params![
                     self.owner_id(),
@@ -345,6 +346,7 @@ impl Store {
                 ],
                 |r| {
                     Ok(SessionMetadata {
+                        work: None,
                         session_id: r.get(0)?,
                         host_id: r.get(1)?,
                         hat_id: r.get(2)?,
@@ -374,7 +376,18 @@ impl Store {
                     })
                 },
             )?
-            .collect::<rusqlite::Result<_>>()?)
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        for row in &mut sessions {
+            row.work = crate::work::snapshot_in(
+                &conn,
+                self.owner_id(),
+                &row.session_id,
+                identity.client.read_transcript,
+                Some(&identity.client.client_id),
+            )?;
+        }
+        Ok(sessions)
     }
 }
 
@@ -853,6 +866,92 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn shared_work_observations_respect_transcript_consent_and_revocation() {
+        use hennery_proto::frames::{Indexed, SessionBody};
+        let w = World::new();
+        w.session("visible", "/project", &w.hat);
+        w.store
+            .ingest("visible", 1, &SessionBody::session_started("start", "native"))
+            .unwrap();
+        for (seq, update) in [
+            (
+                2,
+                serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"private response"}}),
+            ),
+            (
+                3,
+                serde_json::json!({"sessionUpdate":"plan","entries":[{"content":"private plan","status":"pending"}]}),
+            ),
+        ] {
+            w.store
+                .ingest(
+                    "visible",
+                    seq,
+                    &SessionBody::AcpUpdate {
+                        indexed: Indexed::default(),
+                        payload: serde_json::json!({"update":update}),
+                    },
+                )
+                .unwrap();
+        }
+        let (_, token) = w.store.issue_external_client(&w.grant(true)).unwrap();
+        let metadata = w.store.authenticate_external(&token).unwrap().unwrap();
+        let rows = w.store.external_sessions(&metadata, "", None, 25).unwrap();
+        let work = rows[0].work.as_ref().unwrap();
+        assert!(work.last_message_at.is_some());
+        assert!(work.content.is_none());
+        let serialized = serde_json::to_string(&rows).unwrap();
+        assert!(!serialized.contains("private response"));
+        assert!(!serialized.contains("private plan"));
+        let mut grant = w.grant(true);
+        grant.read_transcript = true;
+        let (record, token) = w.store.issue_external_client(&grant).unwrap();
+        let transcript = w.store.authenticate_external(&token).unwrap().unwrap();
+        let rows = w.store.external_sessions(&transcript, "", None, 25).unwrap();
+        let work = rows[0].work.as_ref().unwrap();
+        assert_eq!(
+            work.revision,
+            w.store.session_work("visible").unwrap().unwrap().revision
+        );
+        let content = work.content.as_ref().unwrap();
+        assert_eq!(content.last_message.as_ref().unwrap().text, "private response");
+        assert_eq!(content.plan.as_ref().unwrap().entries[0].content, "private plan");
+        w.store.revoke_external_client(&record.client_id).unwrap();
+        assert!(w.store.external_sessions(&transcript, "", None, 25).is_err());
+    }
+
+    #[test]
+    fn shared_work_counts_only_the_external_clients_own_queued_prompts() {
+        let w = World::new();
+        w.session("visible", "/project", &w.hat);
+        let mut identities = Vec::new();
+        for id in ["first", "second"] {
+            let (record, token) = w.store.issue_external_client(&w.grant(true)).unwrap();
+            let conn = w.store.conn();
+            for (suffix, tool) in [("prompt", "session_prompt"), ("configuration", "session_config")] {
+                let key = format!("{id}-{suffix}");
+                conn.execute("INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,state,args,created_at)
+                    VALUES(?1,?2,?3,?4,?2,'digest',?5,'visible','queued','{}',0)",
+                    params![w.store.owner_id(),key,record.client_id,record.revision,tool]).unwrap();
+            }
+            drop(conn);
+            identities.push(w.store.authenticate_external(&token).unwrap().unwrap());
+        }
+        let operator = w.store.session_work("visible").unwrap().unwrap();
+        assert_eq!(operator.queue.external, 2);
+        assert_eq!(
+            operator.queue.external_scope,
+            hennery_view::work::ExternalQueueScope::Session
+        );
+        for identity in identities {
+            let rows = w.store.external_sessions(&identity, "", None, 25).unwrap();
+            let queue = &rows[0].work.as_ref().unwrap().queue;
+            assert_eq!(queue.external, 1);
+            assert_eq!(queue.external_scope, hennery_view::work::ExternalQueueScope::Client);
+        }
     }
     #[test]
     fn credential_survives_reopen_but_never_revocation_or_expiry() {

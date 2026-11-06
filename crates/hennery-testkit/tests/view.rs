@@ -66,6 +66,89 @@ async fn session_detail_exposes_the_native_id_and_both_list_apis_find_it() {
     }
 }
 
+#[tokio::test]
+async fn work_snapshot_http_matches_list_metadata_and_does_not_acknowledge_results() {
+    use hennery_proto::frames::{Indexed, SessionBody, TurnOutcome};
+    let c = Collector::start().await;
+    c.state
+        .store
+        .create_session("work-session", "h", "fake", "/tmp", "hat", None)
+        .unwrap();
+    c.state
+        .store
+        .ingest("work-session", 1, &SessionBody::session_started("start", "native"))
+        .unwrap();
+    assert!(
+        c.state
+            .store
+            .open_turn("work-session", "turn", &[json!({"type":"text","text":"work"})])
+            .unwrap()
+    );
+    for (n,body) in [
+        SessionBody::TurnStarted {request_id:"turn".into(),turn_id:"turn".into()},
+        SessionBody::AcpUpdate {indexed:Indexed {turn_id:Some("turn".into()),..Default::default()},
+            payload:json!({"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Finished this turn"}}})},
+        SessionBody::TurnEnded {usage:None,turn_id:"turn".into(),outcome:TurnOutcome::Completed,stop_reason:None,error:None},
+    ].iter().enumerate() {
+        c.state.store.ingest("work-session",n as u64+2,body).unwrap();
+    }
+    let before = c.state.store.events("work-session", 0, 100).unwrap();
+    let client = c.client();
+    let mut work: Value = client
+        .get(c.url("/api/view/sessions/work-session/work"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(work["content"]["last_message"]["text"], "Finished this turn");
+    assert_eq!(work["last_turn"]["outcome"], "completed");
+    assert_eq!(work["background"], "not_reported");
+    work.as_object_mut().unwrap().remove("content");
+    let page: Value = client
+        .get(c.url("/api/view/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["sessions"][0]["work"], work);
+    assert!(
+        c.state
+            .store
+            .family_summary("work-session")
+            .unwrap()
+            .unwrap()
+            .review
+            .is_some()
+    );
+    assert_eq!(c.state.store.events("work-session", 0, 100).unwrap(), before);
+    assert_eq!(
+        client
+            .get(c.url("/api/view/sessions/unknown/work"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        reqwest::Client::new()
+            .get(c.url("/api/view/sessions/work-session/work"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
 fn complete_review_turn(c: &Collector, session: &str, name: &str, seq: u64) -> i64 {
     use hennery_proto::frames::{SessionBody, TurnOutcome};
     assert!(

@@ -213,13 +213,68 @@ epoch: string,
  */
 older: boolean, };
 
+export type SessionWork = { 
+/**
+ * Greatest applied event included in this read. Reading never acknowledges it.
+ */
+revision: number, lifecycle: string, activity: string | null, presumed_parked: boolean, close_requested: boolean, configuration_error: string | null, current_turn_id: string | null, last_activity_at: string | null, 
+/**
+ * Latest assistant text update, not the timestamp of a UI acknowledgement.
+ */
+last_message_at: string | null, last_turn: WorkTurn | null, waiting: WorkWaiting, queue: WorkQueue, 
+/**
+ * ACP v1 does not provide an authoritative inventory of background work.
+ */
+background: BackgroundWork, 
+/**
+ * Omitted without transcript access, including the plan's contents.
+ */
+content?: WorkContent, };
+
+export type WorkTurn = { turn_id: string, outcome: TurnOutcome, ended_at: string, };
+
+export type WorkWaiting = { permissions: number, questions: number, 
+/**
+ * Open requests whose accepted answer is still awaiting reconciliation.
+ */
+answered: number, };
+
+export type WorkQueue = { held: boolean, operator: number, delegation: number, 
+/**
+ * All queued external prompts in the authorized session; external clients
+ * see only their own prompts.
+ */
+external: number, external_scope: ExternalQueueScope, };
+
+export type ExternalQueueScope = "session" | "client";
+
+export type BackgroundWork = "not_reported";
+
+export type WorkContent = { last_message: WorkMessage | null, 
+/**
+ * A reported plan is advisory, never evidence that a process is running.
+ */
+plan: WorkPlan | null, 
+/**
+ * Earlier events were outside the bounded observation window.
+ */
+history_truncated: boolean, };
+
+export type WorkMessage = { turn_id: string | null, text: string, updated_at: string, truncated: boolean, };
+
+export type WorkPlan = { turn_id: string | null, entries: Array<PlanEntry>, updated_at: string, truncated: boolean, };
+
+export type WorkChildList = { children: Array<WorkChildSummary>, next_cursor: string | null, };
+
+export type WorkChildSummary = { work: SessionWork | null, child_id: string, lifecycle: string, activity: string | null, queued: number, close_requested: boolean, };
+
 export type SessionSummary = SessionItem & {
 /**
  * An open question: the agent waits on it, in a turn or outside one,
  * whether or not an answer is queued (a question outside a turn sets
  * no `blocked` activity).
  */
-question_waits: boolean, operator_attention: number, review?: ReviewResult, unseen?: UnseenActivity, parent_handled_questions: number, family?: FamilySummary, configuration_error?: string, };
+question_waits: boolean, operator_attention: number, review?: ReviewResult, unseen?: UnseenActivity, parent_handled_questions: number, family?: FamilySummary, configuration_error?: string, work?: SessionWork, };
 
 export type SummaryPage = { sessions: Array<SessionSummary>, 
 /**

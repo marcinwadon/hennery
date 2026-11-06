@@ -13,6 +13,7 @@ state stays outside Git; public issues are separate approved projections.
    — product, topology, protocol principles, sessions, auth, hats, module
    boundaries, testing. Authoritative where subsystem specs disagree.
 2. Subsystem specs:
+   - [Shared session work observations](specs/2026-11-06-session-work.md) — common UI/MCP facts, bounded response and plan observations, waiting/queue counts and explicit missing background telemetry; presentation status rules remain separate.
    - [Session usage and cache retention](specs/2026-11-02-session-usage.md) —
      durable runtime observations, partial family accounting, responsive Usage
      presentation and requested per-session Claude retention.

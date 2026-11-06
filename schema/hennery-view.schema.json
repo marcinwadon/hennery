@@ -1,5 +1,14 @@
 {
   "$defs": {
+    "BackgroundWork": {
+      "oneOf": [
+        {
+          "const": "not_reported",
+          "description": "Missing telemetry is not an empty task list and cannot establish quiet.",
+          "type": "string"
+        }
+      ]
+    },
     "ChildCounts": {
       "properties": {
         "active": {
@@ -50,6 +59,13 @@
         "provenance"
       ],
       "type": "object"
+    },
+    "ExternalQueueScope": {
+      "enum": [
+        "session",
+        "client"
+      ],
+      "type": "string"
     },
     "FamilyChild": {
       "properties": {
@@ -1333,6 +1349,16 @@
             }
           ],
           "description": "Latest unseen agent activity, independent of operator attention."
+        },
+        "work": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionWork"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1346,6 +1372,96 @@
         "created_at",
         "last_event_at",
         "question_waits"
+      ],
+      "type": "object"
+    },
+    "SessionWork": {
+      "properties": {
+        "activity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "background": {
+          "$ref": "#/$defs/BackgroundWork",
+          "description": "ACP v1 does not provide an authoritative inventory of background work."
+        },
+        "close_requested": {
+          "type": "boolean"
+        },
+        "configuration_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkContent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Omitted without transcript access, including the plan's contents."
+        },
+        "current_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_activity_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_message_at": {
+          "description": "Latest assistant text update, not the timestamp of a UI acknowledgement.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkTurn"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lifecycle": {
+          "type": "string"
+        },
+        "presumed_parked": {
+          "type": "boolean"
+        },
+        "queue": {
+          "$ref": "#/$defs/WorkQueue"
+        },
+        "revision": {
+          "description": "Greatest applied event included in this read. Reading never acknowledges it.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "waiting": {
+          "$ref": "#/$defs/WorkWaiting"
+        }
+      },
+      "required": [
+        "revision",
+        "lifecycle",
+        "presumed_parked",
+        "close_requested",
+        "waiting",
+        "queue",
+        "background"
       ],
       "type": "object"
     },
@@ -1816,6 +1932,232 @@
       },
       "required": [
         "count"
+      ],
+      "type": "object"
+    },
+    "WorkChildList": {
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/$defs/WorkChildSummary"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "children"
+      ],
+      "type": "object"
+    },
+    "WorkChildSummary": {
+      "properties": {
+        "activity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "child_id": {
+          "type": "string"
+        },
+        "close_requested": {
+          "type": "boolean"
+        },
+        "lifecycle": {
+          "type": "string"
+        },
+        "queued": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "work": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionWork"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "child_id",
+        "lifecycle",
+        "queued",
+        "close_requested"
+      ],
+      "type": "object"
+    },
+    "WorkContent": {
+      "properties": {
+        "history_truncated": {
+          "description": "Earlier events were outside the bounded observation window.",
+          "type": "boolean"
+        },
+        "last_message": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plan": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkPlan"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A reported plan is advisory, never evidence that a process is running."
+        }
+      },
+      "required": [
+        "history_truncated"
+      ],
+      "type": "object"
+    },
+    "WorkMessage": {
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "updated_at",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "WorkPlan": {
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/PlanEntry"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "entries",
+        "updated_at",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "WorkQueue": {
+      "properties": {
+        "delegation": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "external": {
+          "description": "All queued external prompts in the authorized session; external clients\nsee only their own prompts.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "external_scope": {
+          "$ref": "#/$defs/ExternalQueueScope"
+        },
+        "held": {
+          "type": "boolean"
+        },
+        "operator": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "held",
+        "operator",
+        "delegation",
+        "external",
+        "external_scope"
+      ],
+      "type": "object"
+    },
+    "WorkTurn": {
+      "properties": {
+        "ended_at": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/TurnOutcome"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id",
+        "outcome",
+        "ended_at"
+      ],
+      "type": "object"
+    },
+    "WorkWaiting": {
+      "properties": {
+        "answered": {
+          "description": "Open requests whose accepted answer is still awaiting reconciliation.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "permissions": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "questions": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "permissions",
+        "questions",
+        "answered"
       ],
       "type": "object"
     }

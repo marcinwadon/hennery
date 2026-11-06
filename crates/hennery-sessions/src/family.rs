@@ -150,6 +150,7 @@ fn summary_in(conn: &Connection, owner: &str, s: SessionItem) -> Result<SessionS
     let review = crate::review::unread(conn, owner, &s.session_id)?;
     let unseen = crate::unseen::unseen(conn, owner, &s.session_id)?;
     Ok(SessionSummary {
+        work: crate::work::snapshot_in(conn, owner, &s.session_id, false, None)?,
         configuration_error: conn.query_row(
             "SELECT configuration_error FROM sessions WHERE owner_id = ?1 AND id=?2",
             params![owner, s.session_id],

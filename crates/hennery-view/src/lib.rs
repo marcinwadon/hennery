@@ -17,6 +17,7 @@ pub mod fold;
 pub mod item;
 pub mod question;
 pub mod tool;
+pub mod work;
 
 pub use fold::{Answerable, Fold, Items, fold, group_key, question_id};
 pub use item::*;

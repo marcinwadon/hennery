@@ -478,6 +478,7 @@ END;",
     include_str!("external_control.sql"),
     include_str!("external_tools.sql"),
     include_str!("external_scope.sql"),
+    include_str!("work.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -5725,7 +5726,11 @@ mod tests {
         let db = dir.path().join("migration.db");
         let mut conn = hennery_kernel::db::open(&db).unwrap();
         let owner = hennery_kernel::db::kernel_owner(&mut conn).unwrap();
-        hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
+        let before_scope = MIGRATIONS
+            .iter()
+            .position(|sql| *sql == include_str!("external_scope.sql"))
+            .unwrap();
+        hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..before_scope]).unwrap();
         let hat: String = conn
             .query_row("SELECT id FROM hats WHERE owner_id=?1 LIMIT 1", [&owner], |r| r.get(0))
             .unwrap();
@@ -5809,7 +5814,11 @@ mod tests {
         let db = dir.path().join("frozen-upgrade.db");
         let mut conn = hennery_kernel::db::open(&db).unwrap();
         let owner = hennery_kernel::db::kernel_owner(&mut conn).unwrap();
-        hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..MIGRATIONS.len() - 1]).unwrap();
+        let before_scope = MIGRATIONS
+            .iter()
+            .position(|sql| *sql == include_str!("external_scope.sql"))
+            .unwrap();
+        hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..before_scope]).unwrap();
         let hat: String = conn
             .query_row("SELECT id FROM hats WHERE owner_id=?1 LIMIT 1", [&owner], |r| r.get(0))
             .unwrap();
