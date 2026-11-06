@@ -637,8 +637,13 @@ running adapter (parked, closed or failed), with a warning, and writes a `hat_re
 
 ### 5.3 Where hats are enforced (kernel side)
 
-- Project recents are stored per (host, hat) and returned only for the hat the
-  browsing path resolves to.
+- Project recents are stored per (host, hat). `GET /api/hosts/{id}/projects`
+  returns those of the hat the optional canonical `path` resolves to; without
+  a path, optional `hat` selects an existing hat of the owner (empty: 400;
+  unknown or another owner's: 404). Without either selector, the host's default
+  hat applies. A path takes precedence over a nonempty `hat`. The UI supplies
+  its sidebar hat before choosing a path; this never changes path rules or the
+  hat used to start a session.
 - Push notifications follow the session's hat policy (§6).
 - The gateway's `MountPolicy` joins mounts with the principal's hat (gateway
   spec §3.1).

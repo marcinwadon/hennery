@@ -578,13 +578,14 @@ pub struct RecentProject {
     pub last_used_at: String,
 }
 
-/// `GET /api/hosts/{id}/projects?path=` (ACP core §7, §9): the recent
+/// `GET /api/hosts/{id}/projects?path=&hat=` (ACP core §7, §9): the recent
 /// projects of one hat, and the git repositories under the host's
 /// workspace roots.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct HostProjects {
     /// The hat `recents` belong to: the one `path` resolves to on the host,
-    /// or the host's default hat without one (kernel spec §5.3).
+    /// otherwise the explicit browse `hat`, or the host's default hat
+    /// without either selector (kernel spec §5.3).
     pub recents_hat_id: String,
     /// Newest first: only those whose path resolves to that hat now.
     pub recents: Vec<RecentProject>,

@@ -361,7 +361,7 @@ describe('project picker', () => {
     await fill('~/notes')
     await waitFor(() => expect(server.sent.map((s) => s.path)).toContain('/api/hosts/h1/projects?path=%2Fsrv%2Fnotes'))
     await userEvent.clear(await projectField())
-    await waitFor(() => expect(screen.getByText(/Recent projects of the hat/)).toHaveTextContent('of the hat Home'), {
+    await waitFor(() => expect(screen.getByText(/Recent projects of the hat/)).toHaveTextContent('of the hat Work'), {
       timeout: 3000,
     })
     expect(server.sent.map((s) => s.path)).toContain('/api/hosts/h1/projects?path=%2Fsrv%2Fnotes')
@@ -649,6 +649,40 @@ describe('changing the host', () => {
 })
 
 describe('in the app', () => {
+  it.each([true, false])('loads initial project recents after remount with a different host default, scoped=%s', async scoped => {
+    if (scoped) localStorage.setItem('hennery.hat', 'hat-a')
+    const homeProjects = { ...PROJECTS, recents_hat_id: 'hat-b', recents: [{ path: '/srv/home/notes', last_used_at: '2026-10-01T10:00:00Z' }] }
+    for (let round = 0; round < 2; round++) {
+      history.replaceState(null, '', '/new')
+      const server = stubServer({
+        ...base(),
+        'GET /api/capabilities': json(200, { mode: 'full', features: [] }),
+        'GET /api/hosts': json(200, [host('h1', 'laptop', { default_hat_id: 'hat-b' })]),
+        'GET /api/hosts/h1/projects': json(200, homeProjects),
+        'GET /api/hosts/h1/projects?hat=hat-a': json(200, PROJECTS),
+        'GET /api/hosts/h1/projects?path=%2Fsrv%2Fhome%2Fnotes': json(200, homeProjects),
+        'POST /api/hats/resolve': json(200, { canonical: '/srv/home/notes', hat_id: 'hat-b', exists: true, is_dir: true }),
+      })
+      const fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input), 'http://fixture').pathname
+        if (path === '/api/view/sessions') return Promise.resolve(json(200, { sessions: [], waiting: 0, epoch: 'e', revision: 1 }))
+        if (path === '/api/stream/sessions') return Promise.resolve(liveStream().response)
+        return server.fetch(input, init)
+      }
+      const view = render(<App fetchImpl={fetch} />)
+      await waitFor(() => expect(screen.getByText(/Recent projects of the hat/)).toHaveTextContent(scoped ? 'Work' : 'Home'))
+      const expected = `/api/hosts/h1/projects${scoped ? '?hat=hat-a' : ''}`
+      expect(server.sent.filter(call => call.path.startsWith('/api/hosts/h1/projects')).map(call => call.path)).toEqual([expected])
+      if (scoped) {
+        await userEvent.type(await projectField(), '/srv/home/notes')
+        await waitFor(() => expect(screen.getByText(/Recent projects of the hat/)).toHaveTextContent('Home'))
+        await userEvent.clear(await projectField())
+        await waitFor(() => expect(screen.getByText(/Recent projects of the hat/)).toHaveTextContent('Work'))
+      }
+      view.unmount()
+    }
+  })
+
   function summary(id: string, hat_id: string): SessionSummary {
     return {
       session_id: id,

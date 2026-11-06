@@ -1131,14 +1131,15 @@ export type RecentProject = { path: string,
 last_used_at: string, };
 
 /**
- * `GET /api/hosts/{id}/projects?path=` (ACP core §7, §9): the recent
+ * `GET /api/hosts/{id}/projects?path=&hat=` (ACP core §7, §9): the recent
  * projects of one hat, and the git repositories under the host's
  * workspace roots.
  */
 export type HostProjects = {
 /**
  * The hat `recents` belong to: the one `path` resolves to on the host,
- * or the host's default hat without one (kernel spec §5.3).
+ * otherwise the explicit browse `hat`, or the host's default hat
+ * without either selector (kernel spec §5.3).
  */
 recents_hat_id: string,
 /**

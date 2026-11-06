@@ -29,6 +29,7 @@ import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'rea
 import { ApiFailure, messageOf } from '../api/errors'
 import { useClient } from '../app-client'
 import ProjectPicker, { type ProjectPickerHandle } from '../components/ProjectPicker'
+import { useSessionScope } from '../components/SessionScope'
 import type {
   HatItem,
   HatResolution,
@@ -67,6 +68,7 @@ type Resolved =
 
 export default function NewSession() {
   const client = useClient()
+  const browseHat = useSessionScope()?.hat ?? ''
   const { search } = useLocation()
   // Read once: the form owns its fields after that.
   const [draft] = useState(() => { const saved = readLauncherDraft(), requested = readNewSessionPrefill(search); return requested.host && (requested.host !== saved?.host || requested.cwd !== saved?.cwd) ? null : saved })
@@ -214,14 +216,16 @@ export default function NewSession() {
   }, [client, hostId, hosts])
 
   // The host's projects: the recents of the hat the chosen path resolves to
-  // (the host's default hat until one is resolved), and its repositories.
+  // (the browse hat, or host default for All hats, until one is resolved),
+  // and its repositories.
   useEffect(() => {
     if (!hostId) return
     let live = true
     setProjectsError(null)
     const path = `/api/hosts/${encodeURIComponent(hostId)}/projects`
+    const selector = recentsFor !== null ? `?path=${encodeURIComponent(recentsFor)}` : browseHat ? `?hat=${encodeURIComponent(browseHat)}` : ''
     client
-      .request<HostProjects>('GET', recentsFor === null ? path : `${path}?path=${encodeURIComponent(recentsFor)}`)
+      .request<HostProjects>('GET', path + selector)
       .then(
         (got) => live && setProjects(got),
         (err) => live && setProjectsError(messageOf(err)),
@@ -229,7 +233,7 @@ export default function NewSession() {
     return () => {
       live = false
     }
-  }, [client, hostId, recentsFor])
+  }, [client, hostId, recentsFor, browseHat])
 
   // The hat the path resolves to, once the path has rested a moment. An
   // answer for a path or host no longer chosen is dropped.
@@ -258,9 +262,10 @@ export default function NewSession() {
 
   // Recents for the resolved hat, when the list holds another hat's.
   useEffect(() => {
-    if (resolved.state !== 'ok' || !projects) return
+    if (cwd.trim() === '') { setRecentsFor(null); return }
+    if (resolved.state !== 'ok' || resolved.hostId !== hostId || resolved.path !== cwd || !projects) return
     if (resolved.resolution.hat_id !== projects.recents_hat_id) setRecentsFor(resolved.resolution.canonical)
-  }, [resolved, projects])
+  }, [resolved, projects, cwd, hostId])
 
   const entries = useMemo(() => (projects ? projectEntries(projects) : []), [projects])
   const host = hosts?.find((h) => h.host_id === hostId)

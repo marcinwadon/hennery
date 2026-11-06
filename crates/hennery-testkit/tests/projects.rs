@@ -867,6 +867,65 @@ async fn recents_are_those_of_the_hat_the_path_resolves_to() {
     assert_eq!(paths, ["/p/home-project", "/p/work/client"]);
 }
 
+#[tokio::test]
+async fn project_recents_use_browse_hat_until_a_path_selects_another_hat() {
+    use hennery_kernel::hats::{HatChange, NewRule};
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::with_projects(&collector).await;
+    let hosts = &collector.state.hosts;
+    let HatChange::Done(work) = hosts.create_hat("Work", None, 0).unwrap() else {
+        panic!("a hat");
+    };
+    let home = default_hat(&collector);
+    hosts
+        .replace_path_rules(
+            HOST,
+            &[NewRule {
+                prefix: "/p/work".into(),
+                hat_id: work.id.clone(),
+                verified: true,
+            }],
+        )
+        .unwrap();
+    hosts.remember(HOST, &home, "/p/home", 1).unwrap();
+    hosts.remember(HOST, &work.id, "/p/work/app", 2).unwrap();
+    let (_, body) = listed_projects(&collector, &mut host, &[]).await;
+    assert_eq!(recent_paths(&body), ["/p/home"]);
+    let (status, body) = get(&collector, &format!("/api/hosts/{HOST}/projects?hat={}", work.id)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["recents_hat_id"], json!(work.id));
+    assert_eq!(recent_paths(&body), ["/p/work/app"]);
+    let (status, body) = get(
+        &collector,
+        &format!("/api/hosts/{HOST}/projects?hat={}&path=/p/home", work.id),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["recents_hat_id"], json!(home));
+    assert_eq!(recent_paths(&body), ["/p/home"]);
+    let (_, body) = get(&collector, &format!("/api/hosts/{HOST}/projects")).await;
+    assert_eq!(recent_paths(&body), ["/p/home"]);
+}
+
+#[tokio::test]
+async fn project_recents_refuse_empty_unknown_and_other_owner_hats() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::with_projects(&collector).await;
+    listed_projects(&collector, &mut host, &[]).await;
+    let conn = rusqlite::Connection::open(collector._dir.path().join("hennery.db")).unwrap();
+    conn.execute(
+        "INSERT INTO owners(id, created_at) VALUES ('other-owner', ?1)",
+        [i64::MAX],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO hats(id, owner_id, name, colour, created_at) VALUES ('other-hat', 'other-owner', 'Other', '#000000', 0)", []).unwrap();
+    for (hat, expected) in [("", 400), ("missing", 404), ("other-hat", 404)] {
+        let (status, body) = get(&collector, &format!("/api/hosts/{HOST}/projects?hat={hat}")).await;
+        assert_eq!(status, expected, "hat={hat}: {body}");
+        assert!(body.get("recents").is_none(), "{body}");
+    }
+}
+
 /// Plan 6c's A3 iii (plan 5c): a recent is remembered under the hat its
 /// session was given at its start, as stored, not under what its cwd
 /// resolves to when the start is confirmed: a rule saved in between
