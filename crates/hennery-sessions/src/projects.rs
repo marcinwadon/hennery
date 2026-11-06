@@ -195,11 +195,12 @@ fn host_refused(code: &str) -> Response {
 #[derive(Deserialize)]
 struct ProjectsQuery {
     path: Option<String>,
+    hat: Option<String>,
 }
 
-/// `GET /api/hosts/{id}/projects?path=`: the recents of the hat `path`
-/// resolves to (the host's default hat without one), read afresh (kernel
-/// spec §5.3; the review's A7), and the repositories under the host's
+/// `GET /api/hosts/{id}/projects?path=&hat=`: the recents of the hat `path`
+/// resolves to, then the explicit browse hat, then the host default, read
+/// afresh (kernel spec §5.3; the review's A7), and the repositories under the host's
 /// workspace roots (ACP core §7), from the cache or a `list_projects`.
 async fn projects(
     State(state): State<AppState>,
@@ -208,12 +209,12 @@ async fn projects(
 ) -> Response {
     // Checked before anything else, whatever the host's state (Task 6's
     // review, A2). Canonical, as hat rules are: lexically, before hats 5b.
-    let path = match query {
-        Ok(Query(ProjectsQuery { path: None })) => None,
-        Ok(Query(ProjectsQuery { path: Some(path) }))
+    let (path, hat) = match query {
+        Ok(Query(ProjectsQuery { path: None, hat })) => (None, hat),
+        Ok(Query(ProjectsQuery { path: Some(path), hat }))
             if is_askable(&path) && hennery_kernel::hats::is_canonical(&path) =>
         {
-            Some(path)
+            (Some(path), hat)
         }
         _ => {
             return error(
@@ -223,17 +224,25 @@ async fn projects(
             );
         }
     };
+    if let Err(refused) = crate::api::refuse_empty_hat(hat.as_deref()) {
+        return refused.into_response();
+    }
     let conn_id = match reachable(&state, &host_id) {
         Ok(conn_id) => conn_id,
         Err(response) => return *response,
     };
-    let hat_id = match path {
-        Some(path) => match state.hosts.resolve_hat(&host_id, &path) {
+    let hat_id = match (path, hat) {
+        (Some(path), _) => match state.hosts.resolve_hat(&host_id, &path) {
             Ok(Some(resolution)) => resolution.hat_id,
             Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
             Err(err) => return internal(err),
         },
-        None => match state.hosts.host(&host_id) {
+        (None, Some(hat)) => match state.hosts.hat(&hat) {
+            Ok(Some(_)) => hat,
+            Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such hat"),
+            Err(err) => return internal(err),
+        },
+        (None, None) => match state.hosts.host(&host_id) {
             Ok(Some(host)) => host.default_hat_id,
             Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
             Err(err) => return internal(err),

@@ -337,8 +337,10 @@ One form, one request (`POST /api/sessions`):
 - **Host:** online hosts first; offline hosts listed but disabled. Agent
   availability and auth state from the host (`auth: missing` disables the agent
   with instructions; `unknown` allows it).
-- **Project:** recents (filtered by the hat that the path resolves to on that
-  host), enumerated repositories, and a directory browser. Ranking: exact,
+- **Project:** recents (initially the sidebar's selected hat, or the host's
+  default hat for All hats; a resolved path selects its own hat). Clearing the
+  path restores the sidebar/default scope, including after reopening or reload.
+  The picker also offers enumerated repositories and a directory browser. Ranking: exact,
   prefix, substring, subsequence, stable within a rank; colliding directory
   names shown as `parent/name`. Input starting with `/` or `~` is a literal
   path.
