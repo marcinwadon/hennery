@@ -207,7 +207,7 @@
     },
     {
       "name": "session_list",
-      "description": "Page only the caller's direct children; never all owner sessions or grandchildren.",
+      "description": "Page only the caller's direct children with shared work observations, bounded last-response excerpts, waiting and queue counts, and advisory plans. Missing background telemetry does not establish completion. Follow next_cursor; no owner-wide or recursive enumeration.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "ListArgs",

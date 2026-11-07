@@ -159,6 +159,86 @@ fn pair() -> (World, SessionIdentity) {
     (w, parent)
 }
 
+#[test]
+fn direct_child_list_includes_the_shared_response_and_work_observations() {
+    let (w, parent) = pair();
+    start_child_report(&w);
+    w.store.ingest("child",3,&SessionBody::AcpUpdate {
+        indexed:hennery_proto::frames::Indexed {turn_id:Some("report".into()),..Default::default()},
+        payload:json!({"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Child response"}}}),
+    }).unwrap();
+    let page = w.store.child_work_list(&parent, 1, None, 25).unwrap();
+    assert_eq!(page.children.len(), 1);
+    assert_eq!(page.children[0].child_id, "child");
+    let work = page.children[0].work.as_ref().unwrap();
+    assert_eq!(work.current_turn_id.as_deref(), Some("report"));
+    assert_eq!(work.activity.as_deref(), Some("running"));
+    assert_eq!(work.background, hennery_view::work::BackgroundWork::NotReported);
+    assert_eq!(
+        work.content.as_ref().unwrap().last_message.as_ref().unwrap().text,
+        "Child response"
+    );
+    assert_eq!(
+        work.last_message_at,
+        w.store.session_work("child").unwrap().unwrap().last_message_at
+    );
+    let json = serde_json::to_value(page).unwrap();
+    assert_eq!(json["children"][0]["child_id"], "child");
+    assert!(json["children"][0].get("summary").is_none());
+}
+
+#[test]
+fn child_work_pages_continue_at_the_last_returned_child_when_the_byte_budget_fills() {
+    let (w, parent) = pair();
+    for n in 0..90 {
+        let id = format!("budget-{n:03}");
+        child(&w, &parent, &id, &w.hat);
+        for (seq, update) in [
+            (
+                2,
+                json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"m".repeat(1024)}}),
+            ),
+            (
+                3,
+                json!({"sessionUpdate":"plan","entries":(0..4).map(|_|json!({
+                "content":"p".repeat(128),"priority":"h".repeat(64),"status":"s".repeat(64)
+            })).collect::<Vec<_>>()}),
+            ),
+        ] {
+            w.store
+                .ingest(
+                    &id,
+                    seq,
+                    &SessionBody::AcpUpdate {
+                        indexed: Default::default(),
+                        payload: json!({"update":update}),
+                    },
+                )
+                .unwrap();
+        }
+    }
+    let mut cursor = None;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let page = w.store.child_work_list(&parent, 1, cursor.as_deref(), 100).unwrap();
+        assert!(serde_json::to_vec(&page).unwrap().len() <= 192 * 1024);
+        if pages == 0 {
+            assert!(page.next_cursor.is_some());
+        }
+        pages += 1;
+        for row in &page.children {
+            assert!(ids.insert(row.child_id.clone()));
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(ids.len(), 91);
+    assert_eq!(pages, 2);
+}
+
 fn start_child_report(w: &World) {
     assert!(
         w.store

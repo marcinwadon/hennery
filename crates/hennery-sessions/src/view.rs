@@ -109,6 +109,7 @@ pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/api/view/sessions", get(summaries))
         .route("/api/view/sessions/{id}", get(page))
+        .route("/api/view/sessions/{id}/work", get(work))
         .route("/api/view/sessions/{id}/family", get(family))
         .route("/api/view/sessions/{id}/takeover", axum::routing::post(takeover))
         .route("/api/view/sessions/{id}/read", axum::routing::post(mark_read))
@@ -134,6 +135,17 @@ pub fn epoch() -> &'static str {
 
 fn not_found() -> Response {
     error(StatusCode::NOT_FOUND, "not_found", "no such session")
+}
+
+async fn work(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if id.len() > 128 {
+        return not_found();
+    }
+    match state.store.session_work(&id) {
+        Ok(Some(work)) => Json(work).into_response(),
+        Ok(None) => not_found(),
+        Err(err) => internal(err),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1229,7 +1241,10 @@ async fn list_follow(
                 }
                 continue;
             };
-            if sent.get(&session_id) == Some(&summary) {
+            if sent
+                .get(&session_id)
+                .is_some_and(|previous| same_summary(previous, &summary))
+            {
                 continue;
             }
             messages.push(Out::new("session_upsert", serde_json::to_string(&summary)?));
@@ -1273,6 +1288,16 @@ async fn list_follow(
         scope_revision = scope;
         cursor = cursor.max(max);
     }
+}
+
+/// A snapshot's read anchor may advance without any displayed fact changing.
+/// Keep the stream's existing deduplication while still comparing every fact.
+fn same_summary(previous: &SessionSummary, current: &SessionSummary) -> bool {
+    let mut previous = previous.clone();
+    if let (Some(before), Some(after)) = (&mut previous.work, &current.work) {
+        before.revision = after.revision;
+    }
+    previous == *current
 }
 
 /// The list stream's hold (`LIST_COALESCE`): the rings meanwhile are

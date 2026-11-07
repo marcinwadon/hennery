@@ -15,6 +15,10 @@ use crate::item::{
     Body, Field, FieldKind, FieldOption, Item, Location, Marker, MarkerKind, Pairing, PairingKind, PermissionOption,
     PlanEntry, Question, Request, Text, ToolCall, ToolContent, Unrecognised,
 };
+use crate::work::{
+    BackgroundWork, ExternalQueueScope, SessionWork, WorkChildList, WorkChildSummary, WorkContent, WorkMessage,
+    WorkPlan, WorkQueue, WorkTurn, WorkWaiting,
+};
 use hennery_proto::codegen::sort_keys;
 use schemars::generate::SchemaSettings;
 use ts_rs::{Config, TS};
@@ -83,6 +87,8 @@ pub fn render_schema() -> String {
     add!(
         Item,
         ItemPage,
+        SessionWork,
+        WorkChildList,
         SessionSummary,
         SummaryPage,
         ItemRemoved,
@@ -142,6 +148,19 @@ pub fn render_ts() -> String {
         Unrecognised,
         ItemPage,
     );
+    add!(
+        SessionWork,
+        WorkTurn,
+        WorkWaiting,
+        WorkQueue,
+        ExternalQueueScope,
+        BackgroundWork,
+        WorkContent,
+        WorkMessage,
+        WorkPlan,
+        WorkChildList,
+        WorkChildSummary
+    );
     out.push_str(SESSION_SUMMARY_TS);
     add!(
         SummaryPage,
@@ -191,7 +210,7 @@ export type SessionSummary = SessionItem & {
  * whether or not an answer is queued (a question outside a turn sets
  * no `blocked` activity).
  */
-question_waits: boolean, operator_attention: number, review?: ReviewResult, unseen?: UnseenActivity, parent_handled_questions: number, family?: FamilySummary, configuration_error?: string, };
+question_waits: boolean, operator_attention: number, review?: ReviewResult, unseen?: UnseenActivity, parent_handled_questions: number, family?: FamilySummary, configuration_error?: string, work?: SessionWork, };
 ";
 
 /// `SESSION_SUMMARY_TS` names every field of the summary: one more and
@@ -199,6 +218,7 @@ question_waits: boolean, operator_attention: number, review?: ReviewResult, unse
 #[allow(dead_code)]
 fn session_summary_ts_is_whole(summary: SessionSummary) {
     let SessionSummary {
+        work: _,
         session: _,
         question_waits: _,
         operator_attention: _,

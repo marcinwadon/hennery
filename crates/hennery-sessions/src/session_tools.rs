@@ -198,7 +198,7 @@ pub async fn execute(
             &args.child_id,
             args.operation_key.as_deref(),
         )?)?),
-        ToolCall::List(args) => Ok(serde_json::to_value(state.store.child_list(
+        ToolCall::List(args) => Ok(serde_json::to_value(state.store.child_work_list(
             identity,
             revision,
             args.cursor.as_deref(),

@@ -1,3 +1,5 @@
+DROP INDEX IF EXISTS events_work_last_message;
+DROP INDEX IF EXISTS events_work_last_activity;
 DROP TRIGGER external_scope_purge;
 DROP TRIGGER external_tools_revoke;
 DROP TRIGGER external_tools_deleted;

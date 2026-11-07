@@ -46,6 +46,9 @@ pub struct ItemPage {
 /// question waits for the operator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub work: Option<crate::work::SessionWork>,
     #[serde(flatten)]
     pub session: SessionItem,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,6 +302,7 @@ mod tests {
             last_event_at: "2026-10-02T08:00:00.000Z".into(),
         };
         let summary = SessionSummary {
+            work: None,
             unseen: None,
             review: None,
             configuration_error: None,
