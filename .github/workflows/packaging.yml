@@ -104,7 +104,7 @@ jobs:
         ref: ${{ github.sha }}
         fetch-depth: 0
         persist-credentials: false
-    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086
       with:
         github_access_token: ${{ github.token }}
     - id: context
@@ -162,7 +162,7 @@ jobs:
       with:
         toolchain: 1.98.1
         targets: ${{ matrix.target }}
-    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086
       with:
         github_access_token: ${{ github.token }}
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
@@ -255,7 +255,7 @@ jobs:
         ref: ${{ github.sha }}
         fetch-depth: 0
         persist-credentials: false
-    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086
       with:
         github_access_token: ${{ github.token }}
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
@@ -323,7 +323,7 @@ jobs:
         ref: ${{ github.sha }}
         fetch-depth: 0
         persist-credentials: false
-    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086
       with:
         github_access_token: ${{ github.token }}
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
@@ -374,7 +374,7 @@ jobs:
         ref: ${{ github.sha }}
         fetch-depth: 0
         persist-credentials: false
-    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086
       with:
         github_access_token: ${{ github.token }}
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
@@ -409,7 +409,7 @@ jobs:
         ref: ${{ github.sha }}
         fetch-depth: 0
         persist-credentials: false
-    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
+    - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086
       with:
         github_access_token: ${{ github.token }}
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
