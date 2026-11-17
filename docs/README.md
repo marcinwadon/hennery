@@ -13,6 +13,7 @@ state stays outside Git; public issues are separate approved projections.
    — product, topology, protocol principles, sessions, auth, hats, module
    boundaries, testing. Authoritative where subsystem specs disagree.
 2. Subsystem specs:
+   - [Skills and hooks catalogue](specs/2026-11-17-skills-hooks-catalogue.md) — proposed: one catalogue of Agent Skills directories and command hook sets, assigned per host (a hat only pre-selects hosts), delivered as symlinks into both agents' skill directories and as per-session hooks through the adapters, with Codex trust recorded by the host; fail-closed hook delivery is the one open owner call.
    - [Shared session work observations](specs/2026-11-06-session-work.md) — common UI/MCP facts, bounded response and plan observations, waiting/queue counts and explicit missing background telemetry; presentation status rules remain separate.
    - [Session usage and cache retention](specs/2026-11-02-session-usage.md) —
      durable runtime observations, partial family accounting, responsive Usage
@@ -48,6 +49,10 @@ state stays outside Git; public issues are separate approved projections.
      and native-library qualification requirements.
    - [Spike: per-session MCP over ACP](spikes/2026-09-25-per-session-mcp.md)
      and its [harness](../spikes/2026-09-25-mcp-per-session/).
+   - [Spike: delivering hooks and skills to Claude Code and Codex](spikes/2026-11-17-hooks-delivery.md)
+     and its [harness](../spikes/2026-11-17-hooks-delivery/) — skill
+     directory locations, Codex hook trust recorded without `/hooks`, the
+     codex-acp and claude-agent-acp per-session hook channels, measured.
    - [Managed runtime acceptance (#305)](verification/2026-11-04-runtime-305.md)
      — exact-pin macOS provider/delegation/deletion acceptance, Linux process
      identity regression and Codex source audit; cross-platform status in PR #305.
