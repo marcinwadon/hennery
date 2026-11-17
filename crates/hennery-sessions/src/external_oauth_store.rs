@@ -145,6 +145,8 @@ pub(crate) struct Consent {
     pub control_sessions: bool,
     #[serde(default)]
     pub existing_sessions: bool,
+    #[serde(default)]
+    pub session_capacity: Option<u32>,
     #[serde(default = "days")]
     pub expires_in_days: u32,
 }
@@ -354,6 +356,7 @@ impl Store {
             read_transcript: c.read_transcript,
             control_sessions: c.control_sessions,
             existing_sessions: c.existing_sessions,
+            session_capacity: c.session_capacity,
             expires_in_days: c.expires_in_days,
         };
         let (grant, _unpublished_static_credential) = external_clients::issue_in(&tx, owner, &input)?;
@@ -582,6 +585,7 @@ mod tests {
                 read_transcript: false,
                 control_sessions: false,
                 existing_sessions: false,
+                session_capacity: None,
                 expires_in_days: 7,
             }
         }

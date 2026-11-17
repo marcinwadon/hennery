@@ -674,6 +674,8 @@ async fn closing_an_attached_session_waits_for_the_host_to_close_it() {
     let snapshot = events(&c, &collector, &session).await;
     let kinds: Vec<String> = without_family_invalidations(&snapshot)
         .into_iter()
+        // Project discovery is independent of the close acknowledgement.
+        .filter(|event| event.kind != "project_root")
         .map(|e| e.kind.clone())
         .collect();
     assert!(

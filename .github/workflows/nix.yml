@@ -216,6 +216,6 @@ jobs:
       env:
         R3_CARGO_HOME: ${{ runner.temp }}/r3-acceptance-cargo
       run: |
-        nix develop -c rustup toolchain install 1.88.0 --profile minimal
+        nix develop -c rustup toolchain install 1.89.0 --profile minimal
         nix develop -c node packaging/prepare-crates.mjs "$RUNNER_TEMP/crates-prepared" "$GITHUB_SHA"
         nix develop -c sh packaging/ci-crates.sh "$RUNNER_TEMP/crates-prepared"

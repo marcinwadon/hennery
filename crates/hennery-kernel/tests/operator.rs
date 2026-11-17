@@ -109,6 +109,33 @@ fn only_the_owners_password_verifies_and_every_check_is_counted() {
     assert_eq!(op.verifications(), 4);
 }
 
+#[test]
+fn a_persisted_argon2_phc_survives_a_password_library_upgrade() {
+    // Fixed Argon2 PHC test vector, independent of the current hash generator.
+    const LEGACY_PHC: &str =
+        "$argon2i$v=19$m=65536,t=1,p=1$c29tZXNhbHQAAAAAAAAAAA$+r0d29hqEB0yasKr55ZgICsQGSkl0v0kgwhd+U3wyRo";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hennery.db");
+    let op = Operator::open(&path).unwrap();
+    let token = op.issue_setup_token(NOW).unwrap().unwrap();
+    op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE password_credentials SET phc = ?1 WHERE owner_id = ?2",
+            rusqlite::params![LEGACY_PHC, op.owner_id()],
+        )
+        .unwrap();
+    drop(op);
+
+    let reopened = Operator::open(&path).unwrap();
+    assert_eq!(
+        reopened.verify_password("password").unwrap().as_deref(),
+        Some(LEGACY_PHC)
+    );
+    assert_eq!(reopened.verify_password("wrong password").unwrap(), None);
+}
+
 /// The public URL is kept as a browser serialises `Origin`, so a
 /// `public_url` typed another way still matches (review focus 3).
 #[test]

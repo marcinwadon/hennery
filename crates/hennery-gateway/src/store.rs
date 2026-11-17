@@ -1584,7 +1584,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     /// Every (table, column) `sql` reads, as SQLite's authorizer reports.
-    fn reads(conn: &Connection, sql: &str) -> BTreeSet<(String, String)> {
+    fn reads(conn: &mut Connection, sql: &str) -> BTreeSet<(String, String)> {
         let seen: Arc<Mutex<BTreeSet<(String, String)>>> = Arc::default();
         let sink = seen.clone();
         conn.authorizer(Some(move |ctx: AuthContext<'_>| {
@@ -1612,10 +1612,10 @@ mod tests {
     #[test]
     fn listing_connections_reads_no_secret() {
         let store = GatewayStore::open_in_memory().unwrap();
-        let conn = store.conn();
+        let mut conn = store.conn();
         let mut credentials = BTreeSet::new();
         for sql in [SELECT_CONNECTIONS, SELECT_MOUNTS] {
-            for (table, column) in reads(&conn, sql) {
+            for (table, column) in reads(&mut conn, sql) {
                 if table == "gw_credentials" {
                     credentials.insert(column);
                 }
@@ -1630,8 +1630,8 @@ mod tests {
     #[test]
     fn listing_connections_reads_no_client_secret() {
         let store = GatewayStore::open_in_memory().unwrap();
-        let conn = store.conn();
-        let clients: BTreeSet<String> = reads(&conn, SELECT_CONNECTIONS)
+        let mut conn = store.conn();
+        let clients: BTreeSet<String> = reads(&mut conn, SELECT_CONNECTIONS)
             .into_iter()
             .filter(|(table, _)| table == "gw_oauth_clients")
             .map(|(_, column)| column)

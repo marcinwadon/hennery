@@ -524,3 +524,54 @@ async fn bridge_profile(offered: &str, negotiated: &str) {
     assert!(rows[2].get("result").is_none());
     assert!(!text.contains(token));
 }
+#[tokio::test]
+async fn limit_refusals_are_tool_results_with_text_and_structured_content() {
+    let c = Collector::new().await;
+    let mut grant = c.grant(false);
+    grant["control_sessions"] = json!(true);
+    grant["session_capacity"] = json!(1);
+    let issued: Value = c
+        .operator
+        .post(format!("{}/api/external-clients", c.url))
+        .json(&grant)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(issued["client"]["session_capacity"], 1);
+    let hat = c.state.hosts.host("test-host").unwrap().unwrap().default_hat_id;
+    c.state
+        .store
+        .create_session("bound", "test-host", "fake", "/project", &hat, None)
+        .unwrap();
+    let db = rusqlite::Connection::open(c.dir.path().join("test.db")).unwrap();
+    db.execute(
+        "INSERT INTO external_client_sessions(owner_id,client_id,session_id) SELECT owner_id,id,'bound' FROM external_clients WHERE id=?1",
+        [issued["client"]["client_id"].as_str().unwrap()],
+    )
+    .unwrap();
+    let body: Value = c
+        .rpc(
+            issued["token"].as_str().unwrap(),
+            "tools/call",
+            json!({"name":"session_create","arguments":{"request_key":"k","host_id":"test-host","cwd":"/project","agent":"fake"}}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["result"]["isError"], true);
+    assert!(body.get("error").is_none());
+    // Conforms to every tool's declared outputSchema: one `data` property.
+    assert_eq!(body["result"]["structuredContent"]["data"]["code"], "session_limit");
+    assert_eq!(body["result"]["structuredContent"]["data"]["live"], 1);
+    assert_eq!(body["result"]["structuredContent"].as_object().unwrap().len(), 1);
+    assert!(
+        body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("session_limit: 1 of 1 live sessions")
+    );
+}

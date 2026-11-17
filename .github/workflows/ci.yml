@@ -48,6 +48,8 @@ jobs:
         nix develop .#release -c shellcheck packaging/ci-*.sh packaging/image-build.sh packaging/image-ci.sh packaging/test-image-registry.sh packaging/smoke-image.sh packaging/audit-adapters.sh
     - name: Git path classification regressions
       run: nix develop .#release -c python3 -m unittest discover -s packaging -p test_ci_paths.py
+    - name: Nix source inputs cover Rust includes and fixtures
+      run: nix build .#checks.x86_64-linux.source-inputs --no-link
     - name: Private intake workflow regressions
       run: nix develop .#release -c node --test .agents/skills/hennery-work/scripts/intake.test.mjs
     - name: Execute the exact README bootstrap against signed offline releases

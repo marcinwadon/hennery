@@ -154,7 +154,7 @@ fn code_old() -> Vec<(&'static str, Value)> {
 /// Every row of `table`, in order, each as its columns by name.
 fn named_rows(conn: &rusqlite::Connection, table: &str) -> Vec<std::collections::BTreeMap<String, Value>> {
     let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
-    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+    let names: Vec<String> = stmt.column_names().map(str::to_string).collect();
     stmt.query_map([], |r| {
         names
             .iter()

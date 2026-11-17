@@ -122,6 +122,8 @@ explicit consent choices requiring metadata access. Both default off, including
 after migrating old grants. Requesting a scope never grants it automatically.
 Control includes choosing a model and permission mode when creating a session;
 consent states this explicitly. Applied agent permissions follow that mode.
+Consent with session control also sets the client's live-session capacity
+(default 32).
 Changing a grant requires fresh consent; a token refresh cannot expand it.
 
 Each consent creates an expiring, separately revocable external grant. The
@@ -354,7 +356,18 @@ later establish completion. Reusing the key cannot launch a second copy.
 Workers run at most four commands concurrently. Each client can retain 4096
 operation receipts, with at most 32 pending operations and 1 MiB queued payload;
 new admission fails at a bound rather than silently expiring deduplication.
-Clients may have at most 32 live created sessions. Busy external prompts use a
+Each client has a live-session capacity chosen by the operator at consent
+(`session_capacity`, default 32, range 1–1024). Live means created by this
+client and not closed, deleted, failed or already asked to close; parked
+sessions count. Changing it requires fresh consent (revoke and reconnect).
+Independently, a client may be admitted for at most 16 `session_create` or
+`session_clone` operations in any rolling 60 s window; this fuse is fixed in
+code and cannot be raised by configuration. Refusals are tool results:
+`session_limit` (`structuredContent.data.live`, `.limit`) and
+`session_rate_limit` (`.limit`, `.window_secs`, `.used`, `.retry_after`),
+wrapped in `data` like every tool result, with the same numbers in the text. `hennery_capabilities.limits` reports both, the pending-operation
+cap (32), the receipt cap (4096) and the page size (50).
+Busy external prompts use a
 durable FIFO per session and yield to the existing session dispatch queue.
 Authority is checked again at dispatch and auto-resume. Grant revocation cancels
 queued payloads; it does not claim to recall an already-handed agent action.

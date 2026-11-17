@@ -479,6 +479,7 @@ END;",
     include_str!("external_tools.sql"),
     include_str!("external_scope.sql"),
     include_str!("work.sql"),
+    include_str!("external_capacity.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records

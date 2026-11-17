@@ -122,6 +122,7 @@ impl Harness {
                 existing_sessions: existing,
                 read_transcript: transcript,
                 control_sessions: control,
+                session_capacity: None,
                 expires_in_days: 1,
             })
             .unwrap()
@@ -153,6 +154,21 @@ impl Harness {
     }
     async fn rpc(&self, tool: &str, args: Value) -> Value {
         self.rpc_as(&self.token, tool, args).await
+    }
+    async fn tools_as(&self, token: &str) -> Vec<Value> {
+        let body: Value = self
+            .http
+            .post(format!("{}/mcp/external/hennery", self.url))
+            .bearer_auth(token)
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["result"]["tools"].as_array().unwrap().clone()
     }
     fn create_args(&self, key: &str) -> Value {
         json!({"request_key":key,"host_id":"host","cwd":self.root,"agent":"fake"})
@@ -1241,6 +1257,7 @@ async fn one_mcp_connection_controls_two_hats_on_two_real_hosts() {
             read_transcript: true,
             control_sessions: true,
             existing_sessions: false,
+            session_capacity: None,
             expires_in_days: 1,
         })
         .unwrap()
@@ -1337,4 +1354,43 @@ async fn one_mcp_connection_controls_two_hats_on_two_real_hosts() {
     h.state.shutdown.cancel();
     second_host.await.unwrap().unwrap();
     h.finish().await;
+}
+#[tokio::test]
+async fn capabilities_report_limits_and_tool_descriptions_mention_them() {
+    let h = Harness::new(FakeScript::default()).await;
+    let (_, token) = h
+        .state
+        .store
+        .issue_external_client(&NewClient {
+            scope: None,
+            label: "capped".into(),
+            hat_id: h.state.hosts.host("host").unwrap().unwrap().default_hat_id,
+            roots: vec![RootGrant {
+                host_id: "host".into(),
+                root: h.root.clone(),
+            }],
+            read_metadata: true,
+            existing_sessions: false,
+            read_transcript: false,
+            control_sessions: true,
+            session_capacity: Some(7),
+            expires_in_days: 1,
+        })
+        .unwrap();
+    let caps = h.rpc_as(&token, "hennery_capabilities", json!({})).await;
+    assert_eq!(
+        caps["limits"],
+        json!({"session_capacity":7,"create_rate":{"limit":16,"window_secs":60},"pending_operations":32,"operation_receipts":4096,"max_page":50})
+    );
+    assert_eq!(caps["max_page"], 50);
+    let tools = h.tools_as(&token).await;
+    for name in ["session_create", "session_clone"] {
+        let d = tools.iter().find(|t| t["name"] == name).unwrap()["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            d.contains("live session capacity") && d.contains("hennery_capabilities.limits"),
+            "{name}: {d}"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 //! Extract only the standard usage and the verified bundled adapters' quota contract.
 use crate::{adapter::AgentCommand, profile::Profile};
-use agent_client_protocol::schema::v1::PromptResponse;
+use agent_client_protocol::v1::schema::PromptResponse;
 use hennery_proto::usage::{CacheRetention, ModelUsage, TokenUsage, TurnUsage};
 use serde_json::Value;
 

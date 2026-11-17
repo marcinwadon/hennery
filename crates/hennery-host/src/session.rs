@@ -11,15 +11,16 @@ use crate::adapter::{Adapter, ExitInfo, KILL_GRACE, scrub};
 pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::profile::{Profile, Secrets};
 use crate::uplink::Uplink;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
+use agent_client_protocol::v1::schema::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
     ElicitationCapabilities, ElicitationFormCapabilities, InitializeRequest, LoadSessionRequest, NewSessionRequest,
     PromptRequest, PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
-use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, Responder, UntypedMessage};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, ByteStreams, Client, ErrorCode, UntypedMessage};
 use hennery_proto::delegation_host::{ConfigCompleteness, ConfigEvidence, PromptFence};
 use hennery_proto::frames::{
     ConfigValue, ElicitationAction, HostFrame, Indexed, McpServer, ParkReason, PendingExtract, PendingKind,
@@ -827,8 +828,8 @@ impl StartError {
     /// has no record of a loaded session, or its CLI is not logged in.
     fn acp(err: agent_client_protocol::Error, loading: bool) -> Self {
         let code = match err.code {
-            ErrorCode::ResourceNotFound if loading => "agent_has_no_record",
-            ErrorCode::AuthRequired => "agent_not_logged_in",
+            ErrorCode::RESOURCE_NOT_FOUND if loading => "agent_has_no_record",
+            ErrorCode::AUTH_REQUIRED => "agent_not_logged_in",
             _ => "start_failed",
         };
         Self {
@@ -1237,7 +1238,7 @@ impl Actor {
         let hooks = self.options.test_hooks.clone();
         let _acp = AcpTask(tokio::spawn(async move {
             let result = Client
-                .builder()
+                .v1()
                 .name("hennery-host")
                 // Raw handler: payloads are forwarded verbatim, including
                 // update kinds this build does not know (ACP core §2.4).
@@ -1521,7 +1522,7 @@ impl Actor {
                         };
                         if let Some(context) = plugin_context {
                             match context.reference_text() {
-                                Ok(text) => blocks.insert(0, ContentBlock::Text(agent_client_protocol::schema::v1::TextContent::new(text))),
+                                Ok(text) => blocks.insert(0, ContentBlock::Text(agent_client_protocol::v1::schema::TextContent::new(text))),
                                 Err(message) => {
                                     self.reject(request_id, "invalid_context", message.into());
                                     continue;
@@ -2596,7 +2597,7 @@ pub(crate) async fn probe_catalog(
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
         let _acp = AcpTask(tokio::spawn(async move {
             let _ = Client
-                .builder()
+                .v1()
                 .name("hennery-catalog-probe")
                 .on_receive_notification(
                     async move |msg: UntypedMessage, _cx| {
@@ -2646,7 +2647,7 @@ pub(crate) async fn probe_catalog(
 /// the session's MCP servers as ACP entries, and the profile's `_meta`.
 /// Never `Debug`: the entries hold the session's secrets.
 struct SessionMcp {
-    servers: Vec<agent_client_protocol::schema::v1::McpServer>,
+    servers: Vec<agent_client_protocol::v1::schema::McpServer>,
     meta: Option<serde_json::Map<String, Value>>,
 }
 

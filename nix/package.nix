@@ -17,34 +17,12 @@ let
     root = ../.;
     fileset = lib.fileset.unions [
       (craneLib.fileset.commonCargoSources ../.)
-      # Crane's common set omits SQL read by Rust's include_str!.
-      ../crates/hennery-sessions/src/delegation_schema.sql
-      ../crates/hennery-sessions/src/delegation_delivery.sql
-      ../crates/hennery-sessions/src/delegation_attention.sql
-      ../crates/hennery-sessions/src/family.sql
-      ../crates/hennery-sessions/src/idle_hold.sql
-      ../crates/hennery-sessions/src/runtime_catalog.sql
-      ../crates/hennery-sessions/src/prompt_queue.sql
-      ../crates/hennery-sessions/src/review.sql
-      ../crates/hennery-sessions/src/review_child_backfill.sql
-      ../crates/hennery-sessions/src/external_clients.sql
-      ../crates/hennery-sessions/src/external_oauth.sql
-      ../crates/hennery-sessions/src/external_tools.sql
-      ../crates/hennery-sessions/src/external_control.sql
-      ../crates/hennery-sessions/src/external_scope.sql
-      ../crates/hennery-sessions/tests/fixtures/undo_family.sql
-      ../crates/hennery-sessions/tests/fixtures/undo_usage.sql
-      ../crates/hennery-sessions/tests/fixtures/undo_external.sql
+      # Crane omits SQL read by include_str!. Include schemas and fixtures by
+      # extension so new migrations do not require a second manual allowlist.
+      (lib.fileset.fileFilter (file: file.hasExt "sql") ../crates)
       ../crates/hennery-sessions/tests/fixtures/session_tool_contract.json
-      ../crates/hennery-memory/src/schema.sql
-      ../crates/hennery-memory/src/schema2.sql
-      ../crates/hennery-memory/src/schema3.sql
-      ../crates/hennery-memory/src/schema4.sql
-      ../crates/hennery-memory/src/schema5.sql
       ../crates/hennery-memory/src/ui-client.mjs
       ../crates/hennery-memory/tests/ui-client.test.mjs
-      ../crates/hennery-sessions/tests/fixtures/undo_delegation.sql
-      ../crates/hennery-sessions/tests/fixtures/undo_delegation_limits.sql
       ../crates/hennery-testkit/tests/fixtures/delegation-codex-acp-1.13.0.jsonl
       ../crates/hennery-testkit/tests/support/codex_mcp_probe.mjs
       ../crates/hennery-view/tests/fixtures

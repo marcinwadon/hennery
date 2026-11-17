@@ -14,7 +14,7 @@ type Selection = 'selected' | 'current' | 'future'
 interface Grant {
   client_id: string; label: string; hat_id: string | null; scope?: GrantScope; roots: { host_id: string; root: string }[]
   read_metadata: boolean; existing_sessions: boolean; expires_at: number; revoked: boolean
-  read_transcript?: boolean; control_sessions?: boolean
+  read_transcript?: boolean; control_sessions?: boolean; session_capacity?: number
 }
 function callbackHost(uri: string): string { try { return new URL(uri).host } catch { return 'Invalid callback' } }
 
@@ -34,6 +34,9 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
   const [metadata, setMetadata] = useState(false)
   const [transcript, setTranscript] = useState(false)
   const [control, setControl] = useState(false)
+  const [capacity, setCapacity] = useState('32')
+  const capacityValue = /^\d+$/.test(capacity) ? Number(capacity) : NaN
+  const capacityValid = Number.isInteger(capacityValue) && capacityValue >= 1 && capacityValue <= 1024
   const [existing, setExisting] = useState(false)
   const [days, setDays] = useState(7)
   const [error, setError] = useState('')
@@ -45,7 +48,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
     const epoch = ++generation.current
     const abort = new AbortController()
     locked.current = null
-    setBusy(false); setPending(null); setGrants([]); setAfter(null); setError(''); setHats([]); setHosts([]); setHatMode('selected'); setHostMode('selected'); setAllWorkspaces(false); setRoot(''); setExisting(false); setMetadata(false); setTranscript(false); setControl(false); setDays(7)
+    setBusy(false); setPending(null); setGrants([]); setAfter(null); setError(''); setHats([]); setHosts([]); setHatMode('selected'); setHostMode('selected'); setAllWorkspaces(false); setRoot(''); setExisting(false); setMetadata(false); setTranscript(false); setControl(false); setCapacity('32'); setDays(7)
     const operation = consent
       ? client.request<Pending>('GET', '/api/external-oauth/requests/' + encodeURIComponent(requestId), undefined, { signal: abort.signal }).then(p => {
         if (abort.signal.aborted || epoch !== generation.current) return
@@ -72,7 +75,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
         } } : {}),
         read_metadata: metadata, existing_sessions: existing && metadata, expires_in_days: days,
         ...(transcript && metadata ? { read_transcript: true } : {}),
-        ...(control && metadata ? { control_sessions: true } : {}),
+        ...(control && metadata ? { control_sessions: true, session_capacity: capacityValue } : {}),
       }, { signal: controller.signal })
       if (!controller.signal.aborted && epoch === generation.current) window.location.assign(result.redirect_uri)
     } catch (err) { if (!controller.signal.aborted && epoch === generation.current) setError(messageOf(err)) }
@@ -139,10 +142,14 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
         <label className="field"><span><input type="checkbox" checked={transcript} disabled={busy || !metadata || !pending.request.scope.split(' ').includes('hennery:sessions:transcript')} onChange={e => setTranscript(e.target.checked)} /> Read session conversations</span></label>
         <label className="field"><span><input type="checkbox" checked={control} disabled={busy || !metadata || !pending.request.scope.split(' ').includes('hennery:sessions:control')} onChange={e => setControl(e.target.checked)} /> Create, prompt and control sessions</span></label>
         {control && <p>Session control includes changing the model and permission mode, answering ordinary forms, sending images, editing queued prompts, and renaming, pinning or cloning sessions. Agent actions follow that mode; permission requests still require approval in Hennery.</p>}
+        {control && <>
+          <label className="field"><span className="field-label">Live sessions this client may hold</span><input className="text-input" type="number" min={1} max={1024} aria-label="Live sessions this client may hold" disabled={busy} value={capacity} onChange={e => setCapacity(e.target.value)} /></label>
+          <p>Parked sessions count. Closed sessions do not.</p>
+        </>}
         <label className="field"><span><input type="checkbox" checked={existing} disabled={busy || !metadata} onChange={e => setExisting(e.target.checked)} /> Also allow existing sessions within the selected scope</span></label>
         <p>By default, access is limited to sessions created by this client. Including existing sessions also allows the selected read and control actions on those sessions.</p>
         <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => void decide(false)}>Deny</button>
-        <button type="submit" className="btn btn-primary" disabled={busy || (hatMode === 'selected' && !hats.length) || (hostMode === 'selected' && !hosts.length) || (hostMode !== 'future' && !allWorkspaces && !root.startsWith('/'))}>Allow selected access</button>
+        <button type="submit" className="btn btn-primary" disabled={busy || (hatMode === 'selected' && !hats.length) || (hostMode === 'selected' && !hosts.length) || (hostMode !== 'future' && !allWorkspaces && !root.startsWith('/')) || (control && !capacityValid)}>Allow selected access</button>
       </form>
     </>}
     {!consent && <ul aria-label="Client grants">{grants.map(g => <li key={g.client_id}>
@@ -151,7 +158,7 @@ export default function ExternalMcp({ consent = false }: { consent?: boolean }) 
       {g.scope?.all_hosts && <p>All workspaces on all current and future hosts.</p>}
       {g.roots.map(r => <p key={r.host_id + r.root}><bdi>{r.host_id}: {r.root}</bdi></p>)}
       <p>{g.existing_sessions ? 'Existing sessions included' : 'Created by this client only'}; {g.read_metadata ? 'metadata enabled' : 'discovery only'}.</p>
-      <p>{g.read_transcript ? 'Conversation access enabled' : 'No conversation access'}; {g.control_sessions ? 'session control enabled' : 'no session control'}.</p>
+      <p>{g.read_transcript ? 'Conversation access enabled' : 'No conversation access'}; {g.control_sessions ? `session control enabled, up to ${g.session_capacity ?? 32} live sessions` : 'no session control'}.</p>
       <p>Expires: {new Date(g.expires_at * 1000).toLocaleString()}</p>
       {g.revoked ? <p>Revoked</p> : <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => void revoke(g.client_id)}>Revoke access to {g.label}</button>}
     </li>)}</ul>}

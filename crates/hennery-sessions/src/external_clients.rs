@@ -29,6 +29,11 @@ pub struct GrantScope {
     #[serde(default)]
     pub all_hosts: bool,
 }
+/// Live sessions a client may hold when consent does not say otherwise.
+pub const DEFAULT_SESSION_CAPACITY: u32 = 32;
+/// Sanity ceiling for a consented capacity; the creation rate fuse is the
+/// safety control, not this bound.
+pub const MAX_SESSION_CAPACITY: u32 = 1024;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewClient {
@@ -47,6 +52,9 @@ pub struct NewClient {
     pub control_sessions: bool,
     #[serde(default)]
     pub existing_sessions: bool,
+    /// Live sessions this client may hold; `None` means `DEFAULT_SESSION_CAPACITY`.
+    #[serde(default)]
+    pub session_capacity: Option<u32>,
     /// Credentials are finite-lived. Renewal/rotation is a later explicit action.
     pub expires_in_days: u32,
 }
@@ -61,6 +69,7 @@ pub struct ClientRecord {
     pub read_transcript: bool,
     pub control_sessions: bool,
     pub existing_sessions: bool,
+    pub session_capacity: u32,
     pub revision: i64,
     pub expires_at: i64,
     pub revoked: bool,
@@ -118,7 +127,7 @@ pub fn valid_token(token: &str) -> bool {
 pub(crate) fn record(conn: &rusqlite::Connection, owner: &str, id: &str) -> Result<Option<ClientRecord>> {
     let row = conn
         .query_row(
-            "SELECT id,label,hat_id,read_metadata,existing_sessions,revision,expires_at,revoked_at IS NOT NULL,read_transcript,control_sessions,all_hats,all_hosts
+            "SELECT id,label,hat_id,read_metadata,existing_sessions,revision,expires_at,revoked_at IS NOT NULL,read_transcript,control_sessions,all_hats,all_hosts,session_capacity
         FROM external_clients WHERE owner_id = ?1 AND id = ?2",
             params![owner, id],
             |r| {
@@ -132,6 +141,7 @@ pub(crate) fn record(conn: &rusqlite::Connection, owner: &str, id: &str) -> Resu
                     read_transcript: r.get(8)?,
                     control_sessions: r.get(9)?,
                     existing_sessions: r.get(4)?,
+                    session_capacity: r.get(12)?,
                     revision: r.get(5)?,
                     expires_at: r.get(6)?,
                     revoked: r.get(7)?,
@@ -401,6 +411,12 @@ pub(crate) fn issue_in(
         "invalid_grant"
     );
     ensure!((1..=90).contains(&input.expires_in_days), "invalid_grant");
+    ensure!(
+        input
+            .session_capacity
+            .is_none_or(|c| (1..=MAX_SESSION_CAPACITY).contains(&c)),
+        "invalid_grant"
+    );
     ensure!(!input.existing_sessions || input.read_metadata, "invalid_grant");
     ensure!(
         !(input.read_transcript || input.control_sessions) || input.read_metadata,
@@ -468,8 +484,8 @@ pub(crate) fn issue_in(
     let id = uuid::Uuid::now_v7().to_string();
     let token = format!("{TOKEN_PREFIX}{}", hex::encode(random_bytes::<32>()));
     let expires = unix_now() + i64::from(input.expires_in_days) * 86400;
-    tx.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at,read_transcript,control_sessions,all_hats,all_hosts)
-          VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10,?11,?12)",params![owner,id,input.label.trim(),input.scope.is_none().then_some(&input.hat_id),sha256_hex(token.as_bytes()),input.read_metadata,input.existing_sessions,expires,input.read_transcript,input.control_sessions,scope.all_hats,scope.all_hosts])?;
+    tx.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at,read_transcript,control_sessions,all_hats,all_hosts,session_capacity)
+          VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9,?10,?11,?12,?13)",params![owner,id,input.label.trim(),input.scope.is_none().then_some(&input.hat_id),sha256_hex(token.as_bytes()),input.read_metadata,input.existing_sessions,expires,input.read_transcript,input.control_sessions,scope.all_hats,scope.all_hosts,input.session_capacity.unwrap_or(DEFAULT_SESSION_CAPACITY)])?;
     for hat in &scope.hat_ids {
         tx.execute(
             "INSERT OR IGNORE INTO external_client_hats(owner_id,client_id,hat_id) VALUES(?1,?2,?3)",
@@ -533,6 +549,7 @@ mod tests {
                 read_transcript: false,
                 control_sessions: false,
                 existing_sessions: existing,
+                session_capacity: None,
                 expires_in_days: 1,
             }
         }
@@ -1169,5 +1186,85 @@ mod tests {
         assert_eq!(grants.len(), 2);
         assert_eq!(w.store.external_clients_after(&grants[0].client_id).unwrap().len(), 1);
         assert!(w.store.external_clients_after(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn capacity_defaults_to_32_and_is_bounded() {
+        let w = World::new();
+        let (c, _) = w.store.issue_external_client(&w.grant(true)).unwrap();
+        assert_eq!(c.session_capacity, 32);
+        let (c, _) = w
+            .store
+            .issue_external_client(&NewClient {
+                session_capacity: Some(100),
+                control_sessions: true,
+                ..w.grant(true)
+            })
+            .unwrap();
+        assert_eq!(c.session_capacity, 100);
+        assert_eq!(
+            w.store
+                .external_clients_after("")
+                .unwrap()
+                .iter()
+                .find(|r| r.client_id == c.client_id)
+                .unwrap()
+                .session_capacity,
+            100
+        );
+        for bad in [0, 1025] {
+            let err = w
+                .store
+                .issue_external_client(&NewClient {
+                    session_capacity: Some(bad),
+                    ..w.grant(true)
+                })
+                .unwrap_err();
+            assert_eq!(err.to_string(), "invalid_grant");
+        }
+    }
+    #[test]
+    fn capacity_is_stored_without_control() {
+        let w = World::new();
+        let (c, _) = w
+            .store
+            .issue_external_client(&NewClient {
+                session_capacity: Some(5),
+                control_sessions: false,
+                ..w.grant(true)
+            })
+            .unwrap();
+        assert_eq!(c.session_capacity, 5);
+    }
+    #[test]
+    fn upgrading_a_store_without_the_capacity_column_reads_grants_back_as_32() {
+        // A grant issued before the column existed: wind the schema back one
+        // migration, drop the column, and reopen so the migration reapplies.
+        let w = World::new();
+        let (before, _) = w.store.issue_external_client(&w.grant(true)).unwrap();
+        {
+            let conn = w.store.conn();
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            conn.execute_batch(&format!(
+                "ALTER TABLE external_clients DROP COLUMN session_capacity; PRAGMA user_version = {};",
+                version - 1
+            ))
+            .unwrap();
+            assert!(record(&conn, w.store.owner_id(), &before.client_id).is_err());
+        }
+        let reopened = Store::open(&w.dir.path().join("test.db")).unwrap();
+        assert_eq!(
+            record(&reopened.conn(), reopened.owner_id(), &before.client_id)
+                .unwrap()
+                .unwrap()
+                .session_capacity,
+            32
+        );
+    }
+    #[test]
+    fn consent_body_accepts_session_capacity() {
+        let c: crate::external_oauth_store::Consent =
+            serde_json::from_value(serde_json::json!({"request_id":"r","allow":true,"session_capacity":7})).unwrap();
+        assert_eq!(c.session_capacity, Some(7));
     }
 }

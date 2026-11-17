@@ -119,8 +119,8 @@ pub fn mcp_refusal(agent: &str, profile: Profile, servers: &[McpServer], waived:
 }
 
 /// The ACP `mcpServers` entries for `servers`.
-pub fn acp_servers(servers: &[McpServer]) -> Vec<agent_client_protocol::schema::v1::McpServer> {
-    use agent_client_protocol::schema::v1::{EnvVariable, HttpHeader, McpServer as Acp, McpServerHttp, McpServerStdio};
+pub fn acp_servers(servers: &[McpServer]) -> Vec<agent_client_protocol::v1::schema::McpServer> {
+    use agent_client_protocol::v1::schema::{EnvVariable, HttpHeader, McpServer as Acp, McpServerHttp, McpServerStdio};
     servers
         .iter()
         .map(|server| match server {

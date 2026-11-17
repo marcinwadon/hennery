@@ -2,7 +2,7 @@
 //! `agent-client-protocol` crate, so the host is tested against the same
 //! wire format real adapters use.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, DeleteSessionRequest,
     DeleteSessionResponse, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, SessionCapabilities,
@@ -11,7 +11,8 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
     TextContent,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, SentRequest, Stdio, UntypedMessage};
+use agent_client_protocol::v1::{ConnectionTo, Responder, SentRequest};
+use agent_client_protocol::{Agent, Client, Stdio, UntypedMessage};
 use hennery_testkit::{CRASH_EXIT_CODE, FakeAsk, FakeScript, SCRIPT_ENV};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +94,7 @@ async fn main() -> agent_client_protocol::Result<()> {
     // `echo_servers`.
     let servers: Arc<Mutex<String>> = Arc::default();
     Agent
-        .builder()
+        .v1()
         .name("hennery-fake-acp")
         .on_receive_request(
             {
@@ -156,7 +157,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                         Some(code) => {
                             let message = if script.new_session_error_echoes {
                                 format!("scripted: {}", serde_json::to_string(&req.mcp_servers).unwrap())
-                            } else if code == i32::from(agent_client_protocol::ErrorCode::AuthRequired) {
+                            } else if code == i32::from(agent_client_protocol::ErrorCode::AUTH_REQUIRED) {
                                 agent_client_protocol::Error::auth_required().message
                             } else {
                                 "scripted".into()
@@ -695,7 +696,7 @@ fn answer_load(
     responder: Responder<LoadSessionResponse>,
 ) -> agent_client_protocol::Result<()> {
     match script.load_error {
-        Some(code) if code == i32::from(agent_client_protocol::ErrorCode::AuthRequired) => {
+        Some(code) if code == i32::from(agent_client_protocol::ErrorCode::AUTH_REQUIRED) => {
             responder.respond_with_error(agent_client_protocol::Error::auth_required())
         }
         Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),

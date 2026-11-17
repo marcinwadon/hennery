@@ -161,7 +161,7 @@ fn invoke(state: &AppState, identity: &ExternalIdentity, call: Call) -> anyhow::
         "hennery_capabilities" => {
             let _: std::collections::BTreeMap<String, Value> = arguments(call.arguments.clone())?;
             anyhow::ensure!(call.arguments == json!({}), "invalid_arguments");
-            json!({"client_id":identity.client.client_id,"hat_id":identity.client.hat_id,"scope":identity.client.scope,"hats":state.store.external_hats(identity)?,"revision":identity.client.revision,"expires_at":identity.client.expires_at,"existing_sessions":identity.client.existing_sessions,"read_metadata":identity.client.read_metadata,"read_transcript":identity.client.read_transcript,"execution":identity.client.control_sessions,"max_page":50,"permissions":"operator_ui","source_policy":"server_resolved_per_hat_actual_acp"})
+            json!({"client_id":identity.client.client_id,"hat_id":identity.client.hat_id,"scope":identity.client.scope,"hats":state.store.external_hats(identity)?,"revision":identity.client.revision,"expires_at":identity.client.expires_at,"existing_sessions":identity.client.existing_sessions,"read_metadata":identity.client.read_metadata,"read_transcript":identity.client.read_transcript,"execution":identity.client.control_sessions,"max_page":50,"limits":{"session_capacity":identity.client.session_capacity,"create_rate":{"limit":crate::external_control_store::CREATE_RATE_LIMIT,"window_secs":crate::external_control_store::CREATE_RATE_WINDOW_SECS},"pending_operations":crate::external_control_store::PENDING_OPERATION_LIMIT,"operation_receipts":crate::external_control_store::OPERATION_RECEIPT_LIMIT,"max_page":50},"permissions":"operator_ui","source_policy":"server_resolved_per_hat_actual_acp"})
         }
         "host_list" => {
             anyhow::ensure!(call.arguments == json!({}), "invalid_arguments");
@@ -350,6 +350,12 @@ async fn endpoint(
                 ),
                 Err(e) if e.to_string() == "unknown_tool" => rpc(id, -32602, "unknown_tool"),
                 Err(e) => {
+                    if let Some(refusal) = e.downcast_ref::<crate::external_control_store::LimitRefusal>() {
+                        return result(
+                            id,
+                            json!({"content":[{"type":"text","text":refusal.text}],"structuredContent":{"data":refusal.data},"isError":true}),
+                        );
+                    }
                     let code = match e.to_string().as_str() {
                         "invalid_arguments" => "invalid_arguments",
                         "not_found" => "not_found",
@@ -358,6 +364,7 @@ async fn endpoint(
                         "request_key_conflict" => "request_key_conflict",
                         "operation_limit" => "operation_limit",
                         "session_limit" => "session_limit",
+                        "session_rate_limit" => "session_rate_limit",
                         "configuration_unavailable" => "configuration_unavailable",
                         "chunk_conflict" => "chunk_conflict",
                         "invalid_offset" => "invalid_offset",

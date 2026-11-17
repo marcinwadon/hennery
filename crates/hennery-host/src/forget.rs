@@ -11,8 +11,9 @@
 use crate::adapter::{Adapter, AgentCommand};
 use crate::walk;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{DeleteSessionRequest, InitializeRequest, SessionId};
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder, UntypedMessage};
+use agent_client_protocol::v1::schema::{DeleteSessionRequest, InitializeRequest, SessionId};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, ByteStreams, Client, UntypedMessage};
 use hennery_proto::frames::{ForgetKind, ForgetOutcome, ForgetReason, ForgetRemaining, ForgetWhat, HostFrame};
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -235,7 +236,7 @@ pub(crate) async fn run_adapter(
     let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
     let id = forget.agent_session_id.clone();
     let talk = Client
-        .builder()
+        .v1()
         .name("hennery-host")
         .on_receive_notification(
             async move |_msg: UntypedMessage, _cx| Ok(()),

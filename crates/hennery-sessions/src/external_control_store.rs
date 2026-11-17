@@ -12,6 +12,91 @@ use hennery_kernel::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
+/// A refusal at one of the per-client admission limits. `Display` is the
+/// bare code so string-matched error plumbing keeps working; the MCP
+/// endpoint reads `text` and `data` for the client.
+#[derive(Debug)]
+pub struct LimitRefusal {
+    pub code: &'static str,
+    pub text: String,
+    pub data: Value,
+}
+impl std::fmt::Display for LimitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code)
+    }
+}
+impl std::error::Error for LimitRefusal {}
+
+/// Sessions this client created that still hold capacity: not closed,
+/// deleted or failed, and not already asked to close.
+pub(crate) fn live_sessions_in(conn: &Connection, owner: &str, client_id: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM external_client_sessions x JOIN sessions s ON s.owner_id=x.owner_id AND s.id=x.session_id
+         WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','deleted','failed') AND s.close_requested = 0",
+        params![owner, client_id],
+        |r| r.get(0),
+    )?)
+}
+pub(crate) fn capacity_refusal(live: i64, limit: u32) -> LimitRefusal {
+    LimitRefusal {
+        code: "session_limit",
+        text: format!(
+            "session_limit: {live} of {limit} live sessions in use; close sessions created by this client to free capacity"
+        ),
+        data: json!({"code":"session_limit","live":live,"limit":limit}),
+    }
+}
+/// Creation rate fuse: admissions of `session_create`/`session_clone` per
+/// client in a rolling window. Fixed in code on purpose; a runaway client
+/// must stop no matter how high the operator set its capacity.
+pub const CREATE_RATE_LIMIT: i64 = 16;
+pub const CREATE_RATE_WINDOW_SECS: i64 = 60;
+/// Operations a client may have queued, running or uncertain at once.
+pub const PENDING_OPERATION_LIMIT: i64 = 32;
+/// Receipts the per-client ledger retains over the grant's lifetime.
+pub const OPERATION_RECEIPT_LIMIT: i64 = 4096;
+
+/// (creations admitted inside the window, oldest such admission time).
+pub(crate) fn creations_in_window_in(
+    conn: &Connection,
+    owner: &str,
+    client_id: &str,
+    now: i64,
+) -> Result<(i64, Option<i64>)> {
+    Ok(conn.query_row(
+        "SELECT count(*), MIN(created_at) FROM external_operations
+         WHERE owner_id = ?1 AND client_id = ?2 AND tool IN ('session_create','session_clone') AND created_at > ?3",
+        params![owner, client_id, now - CREATE_RATE_WINDOW_SECS],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+pub(crate) fn rate_refusal(used: i64, retry_after: i64) -> LimitRefusal {
+    LimitRefusal {
+        code: "session_rate_limit",
+        text: format!(
+            "session_rate_limit: {used} sessions created in the last {CREATE_RATE_WINDOW_SECS} s; retry after {retry_after} s"
+        ),
+        data: json!({"code":"session_rate_limit","limit":CREATE_RATE_LIMIT,"window_secs":CREATE_RATE_WINDOW_SECS,"used":used,"retry_after":retry_after}),
+    }
+}
+fn ensure_create_rate_in(conn: &Connection, owner: &str, client_id: &str) -> Result<()> {
+    let now = unix_now();
+    let (used, oldest) = creations_in_window_in(conn, owner, client_id, now)?;
+    if used >= CREATE_RATE_LIMIT {
+        let retry_after = (oldest.unwrap_or(now) + CREATE_RATE_WINDOW_SECS - now).max(1);
+        return Err(rate_refusal(used, retry_after).into());
+    }
+    Ok(())
+}
+fn ensure_capacity_in(conn: &Connection, owner: &str, client: &ClientRecord) -> Result<()> {
+    let live = live_sessions_in(conn, owner, &client.client_id)?;
+    if live >= i64::from(client.session_capacity) {
+        return Err(capacity_refusal(live, client.session_capacity).into());
+    }
+    Ok(())
+}
+
 fn contains(root: &str, path: &str) -> bool {
     path == root
         || root == "/" && path.starts_with('/')
@@ -220,8 +305,7 @@ impl Store {
                 self.external_target_hat_in(conn, command)?.as_deref() == Some(hat),
                 "not_found"
             );
-            let live:i64=conn.query_row("SELECT count(*) FROM external_client_sessions x JOIN sessions s ON s.owner_id=x.owner_id AND s.id=x.session_id WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','deleted','failed')",params![self.owner_id(),client.client_id],|r|r.get(0))?;
-            ensure!(live < 32, "session_limit");
+            ensure_capacity_in(conn, self.owner_id(), &client)?;
             placement(conn, self.owner_id(), &client, host, cwd, hat)
         } else {
             if matches!(command.tool.as_str(), "session_create" | "session_clone") {
@@ -279,6 +363,12 @@ impl Store {
             ensure!(stored == digest, "request_key_conflict");
             return self.external_receipt_in(&tx, identity, &id);
         }
+        // Capacity is the actionable refusal (close sessions), so it is
+        // checked before anything that could fail for other reasons.
+        if matches!(tool, "session_create" | "session_clone") {
+            ensure_capacity_in(&tx, self.owner_id(), client)?;
+            ensure_create_rate_in(&tx, self.owner_id(), &client.client_id)?;
+        }
         let source = if tool == "session_clone" {
             Some(
                 args["source_session_id"]
@@ -314,8 +404,6 @@ impl Store {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid_arguments"))?;
             target_hat = Some(resolved_hat(&tx, self.owner_id(), client, host, cwd)?);
-            let live:i64=tx.query_row("SELECT count(*) FROM external_client_sessions x JOIN sessions s ON s.owner_id=x.owner_id AND s.id=x.session_id WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','deleted','failed')",params![self.owner_id(),client.client_id],|r|r.get(0))?;
-            ensure!(live < 32, "session_limit");
             uuid::Uuid::now_v7().to_string()
         } else {
             let id = args["session_id"]
@@ -326,7 +414,9 @@ impl Store {
         };
         let (pending,bytes,total):(i64,i64,i64)=tx.query_row("SELECT COALESCE(SUM(state IN ('queued','running','uncertain')),0),COALESCE(SUM(length(CAST(args AS BLOB))),0),count(*) FROM external_operations WHERE owner_id = ?1 AND client_id=?2",params![self.owner_id(),client.client_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
         ensure!(
-            pending < 32 && bytes + raw.len() as i64 <= 1024 * 1024 && total < 4096,
+            pending < PENDING_OPERATION_LIMIT
+                && bytes + raw.len() as i64 <= 1024 * 1024
+                && total < OPERATION_RECEIPT_LIMIT,
             "operation_limit"
         );
         let id = uuid::Uuid::now_v7().to_string();

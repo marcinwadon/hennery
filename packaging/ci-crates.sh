@@ -4,8 +4,8 @@ candidate=$1
 R3_EXTENDED=${R3_EXTENDED:-false}
 export R3_EXTENDED
 if [ "$R3_EXTENDED" = true ]; then
-    R3_MSRV_CARGO=$(rustup which --toolchain 1.88.0 cargo)
-    R3_MSRV_RUSTC=$(rustup which --toolchain 1.88.0 rustc)
+    R3_MSRV_CARGO=$(rustup which --toolchain 1.89.0 cargo)
+    R3_MSRV_RUSTC=$(rustup which --toolchain 1.89.0 rustc)
 else
     R3_MSRV_CARGO=
     R3_MSRV_RUSTC=

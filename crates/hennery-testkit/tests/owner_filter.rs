@@ -525,7 +525,7 @@ fn audit_connection(db: &Path) -> rusqlite::Connection {
     conn
 }
 
-fn touched(conn: &rusqlite::Connection, sql: &str) -> Touched {
+fn touched(conn: &mut rusqlite::Connection, sql: &str) -> Touched {
     let log: Arc<Mutex<Touched>> = Arc::default();
     let sink = log.clone();
     conn.authorizer(Some(move |ctx: AuthContext<'_>| {
@@ -553,7 +553,7 @@ fn touched(conn: &rusqlite::Connection, sql: &str) -> Touched {
     .unwrap();
     let prepared = conn
         .prepare(sql)
-        .map(|stmt| stmt.column_names().into_iter().map(String::from).collect());
+        .map(|stmt| stmt.column_names().map(String::from).collect());
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>).unwrap();
     let returned = prepared.unwrap_or_else(|err| panic!("{err}: {sql}"));
     let mut touched = Arc::try_unwrap(log).unwrap().into_inner().unwrap();
@@ -798,7 +798,7 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
 /// there; `owner_id` later in an ordering expression than its first
 /// keyword (`ORDER BY 1 AND owner_id`), since the ordering list ends at
 /// `AND`, `OR` and the like. The second-owner tests are the other half.
-fn problems(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
+fn problems(conn: &mut rusqlite::Connection, sql: &str) -> Vec<String> {
     let t = touched(conn, sql);
     let mut out = Vec::new();
     let tables: BTreeSet<&String> = t
@@ -856,7 +856,7 @@ fn every_query_of_the_stores_filters_by_the_owner() {
     Hosts::open(&db).unwrap();
     Store::open(&db).unwrap();
     GatewayStore::open(&db).unwrap();
-    let conn = audit_connection(&db);
+    let mut conn = audit_connection(&db);
     let mut found = Vec::new();
     for (path, source, at_least) in SOURCES {
         let sql = statements(source);
@@ -864,7 +864,7 @@ fn every_query_of_the_stores_filters_by_the_owner() {
             found.push(format!("{path}: {} statements, not {at_least}", sql.len()));
         }
         for statement in sql {
-            for problem in problems(&conn, &statement) {
+            for problem in problems(&mut conn, &statement) {
                 found.push(format!("{path}: {problem}:\n    {statement}"));
             }
         }
@@ -938,7 +938,7 @@ fn the_audit_catches_a_query_without_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hennery.db");
     Store::open(&db).unwrap();
-    let conn = audit_connection(&db);
+    let mut conn = audit_connection(&db);
     for bad in [
         "SELECT phc FROM password_credentials LIMIT 1",
         "SELECT count(*) FROM auth_sessions",
@@ -1036,7 +1036,7 @@ fn the_audit_catches_a_query_without_the_owner() {
         "REPLACE INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)",
         "INSERT OR REPLACE INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)",
     ] {
-        assert!(!problems(&conn, bad).is_empty(), "passed: {bad}");
+        assert!(!problems(&mut conn, bad).is_empty(), "passed: {bad}");
     }
     for good in [
         "SELECT phc FROM password_credentials WHERE owner_id = ?1",
@@ -1063,7 +1063,7 @@ fn the_audit_catches_a_query_without_the_owner() {
         "INSERT OR REPLACE INTO session_catalog(session_id, config_options, updated_at, owner_id)
          VALUES (?1, ?2, ?3, ?4)",
     ] {
-        assert_eq!(problems(&conn, good), Vec::<String>::new(), "{good}");
+        assert_eq!(problems(&mut conn, good), Vec::<String>::new(), "{good}");
     }
     // ED4: a statement is found whatever the case of its verb, `REPLACE`
     // among them; a literal that is only the word is not one (`"update"`,
