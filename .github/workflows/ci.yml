@@ -68,7 +68,7 @@ jobs:
         git -C "$audit_db" rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
     - name: Fresh web advisories when the lock changes
       if: steps.paths.outputs.audit_web == 'true'
-      run: nix develop .#web -c pnpm --dir web audit
+      run: nix develop .#release -c python3 packaging/audit_web.py
 
   rust:
     runs-on: ubuntu-24.04

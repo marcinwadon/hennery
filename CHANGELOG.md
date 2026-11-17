@@ -2,8 +2,26 @@
 
 ## Unreleased
 
+## 0.6.0
+
 - Send selected queued messages as steering input to running Claude Code and
   Codex sessions. Keep messages available when delivery cannot be confirmed.
+- Share session activity, recent responses, pending inputs, queues and plans
+  across UI and MCP reads without acknowledging results or changing execution.
+- Configure external MCP clients' live session capacity and creation limits,
+  with actionable errors and retry-safe request keys.
+- Apply hat defaults when external clients create sessions and use the selected
+  hat's recent projects in New session.
+- Update managed Claude ACP to 0.107.3 with Agent SDK 0.3.326, Codex ACP to 2.7.0
+  with CLI 0.169.0, and Node to 24.22.3.
+- Refresh Rust, frontend and CI dependencies, remediate security advisories,
+  and retain exact ACP dependency licence sources in release packages.
+- Preserve raw audit findings while temporarily accepting the unpatched,
+  development-tool-only picomatch ReDoS through 2026-12-01. Production paths
+  and other advisories still block qualification.
+- Back up collector data before upgrading; session-store migrations require
+  a compatible backup for downgrade. Update collector and agent hosts together
+  to use steering.
 
 ## 0.5.3
 

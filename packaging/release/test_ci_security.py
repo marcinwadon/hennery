@@ -81,7 +81,7 @@ class CiSecurity(unittest.TestCase):
         self.assertNotIn('--no-fetch', commands)
         self.assertNotIn('--stale', commands)
         self.assertNotIn('--ignore', commands)
-        self.assertIn('pnpm --dir web audit', commands)
+        self.assertIn('python3 packaging/audit_web.py', commands)
         self.assertNotIn('--offline', commands)
         self.assertNotIn('continue-on-error', str(data))
         for job in jobs.values():

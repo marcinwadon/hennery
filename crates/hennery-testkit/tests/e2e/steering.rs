@@ -1,5 +1,39 @@
 use super::*;
 
+fn recorded_requests(bytes: &[u8]) -> Vec<Value> {
+    // The child can be between writes, including inside a UTF-8 code point.
+    // Only its terminating newline commits a JSONL record for observation.
+    bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| line.ends_with(b"\n"))
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn steering_log_waits_for_the_writers_newline() {
+    assert!(recorded_requests(b"{").is_empty());
+    let first = json!({"method":"session/new"});
+    let next = json!({"method":"_session/steering","text":"żółw 🐢"});
+    let mut bytes = serde_json::to_vec(&first).unwrap();
+    bytes.push(b'\n');
+    let mut append = serde_json::to_vec(&next).unwrap();
+    append.push(b'\n');
+    for length in 0..append.len() {
+        let mut snapshot = bytes.clone();
+        snapshot.extend_from_slice(&append[..length]);
+        assert_eq!(recorded_requests(&snapshot), vec![first.clone()]);
+    }
+    bytes.extend_from_slice(&append);
+    assert_eq!(recorded_requests(&bytes), vec![first, next]);
+}
+
+#[test]
+#[should_panic]
+fn steering_log_still_rejects_a_malformed_complete_record() {
+    recorded_requests(b"{}\n{broken}\n");
+}
+
 #[tokio::test]
 async fn queued_steering_injects_once_and_late_ack_survives_disconnect() {
     exercise_steering(Scenario::Late).await;
@@ -86,13 +120,7 @@ async fn exercise_steering(scenario: Scenario) {
     let pending = open_question(&c, &collector, &session).await;
     let base = collector.url(&format!("/api/sessions/{session}"));
     let queue = || collector.state.store.operator_prompt_queue(&session).unwrap();
-    let log = || {
-        std::fs::read_to_string(&log)
-            .unwrap()
-            .lines()
-            .map(|s| serde_json::from_str::<Value>(s).unwrap())
-            .collect::<Vec<_>>()
-    };
+    let log = || recorded_requests(&std::fs::read(&log).unwrap());
     let (_, first) = post_json(&c, format!("{base}/prompt"), json!({"content":text("first")})).await;
     let selected =
         json!([{"type":"text","text":"selected"},{"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}]);
