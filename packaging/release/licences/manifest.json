@@ -6,6 +6,13 @@
       "source": "https://raw.githubusercontent.com/agentclientprotocol/rust-sdk/2a78849d3eb3dcb140dade3b8fc938cf1e2b9ce5/LICENSE"
     }
   ],
+  "cargo:agent-client-protocol-derive@5.2.0": [
+    {
+      "file": "6ed4f049cce59e05197d585bdf8a39980b45d546d6ea718ee344555f3a867c3a.txt",
+      "sha256": "6ed4f049cce59e05197d585bdf8a39980b45d546d6ea718ee344555f3a867c3a",
+      "source": "https://raw.githubusercontent.com/agentclientprotocol/rust-sdk/91d368ad8b6761f314da9095c4a030d365c079a9/LICENSE"
+    }
+  ],
   "cargo:agent-client-protocol-schema@1.12.0": [
     {
       "file": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221.txt",
@@ -20,6 +27,13 @@
       "source": "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/97fcb0f5b88567dd91d585ea6885761365a6aa7b/LICENSE"
     }
   ],
+  "cargo:agent-client-protocol-schema@1.17.0": [
+    {
+      "file": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221.txt",
+      "sha256": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221",
+      "source": "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/0849001ca66fb975fc01111ddab9093bc8304e98/LICENSE"
+    }
+  ],
   "cargo:agent-client-protocol-schema@1.9.1": [
     {
       "file": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221.txt",
@@ -32,6 +46,13 @@
       "file": "6ed4f049cce59e05197d585bdf8a39980b45d546d6ea718ee344555f3a867c3a.txt",
       "sha256": "6ed4f049cce59e05197d585bdf8a39980b45d546d6ea718ee344555f3a867c3a",
       "source": "https://raw.githubusercontent.com/agentclientprotocol/rust-sdk/2a78849d3eb3dcb140dade3b8fc938cf1e2b9ce5/LICENSE"
+    }
+  ],
+  "cargo:agent-client-protocol@5.2.0": [
+    {
+      "file": "6ed4f049cce59e05197d585bdf8a39980b45d546d6ea718ee344555f3a867c3a.txt",
+      "sha256": "6ed4f049cce59e05197d585bdf8a39980b45d546d6ea718ee344555f3a867c3a",
+      "source": "https://raw.githubusercontent.com/agentclientprotocol/rust-sdk/91d368ad8b6761f314da9095c4a030d365c079a9/LICENSE"
     }
   ],
   "cargo:asn1-rs-impl@0.2.0": [
