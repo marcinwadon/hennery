@@ -208,7 +208,12 @@ async fn pinned_codex_delete_removes_rollouts_and_private_database_rows() -> any
         "state rows remain"
     );
     let history = rusqlite::Connection::open_with_flags(history_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    for table in ["thread_items", "thread_turns", "thread_realtime_items"] {
+    for table in [
+        "thread_items",
+        "thread_turns",
+        "thread_realtime_items",
+        "thread_history_projection_state",
+    ] {
         ensure!(
             history.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE thread_id=?1"),

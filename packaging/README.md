@@ -114,7 +114,7 @@ live, with logged-in agents, and the operator's to run before it merges:
   from hennery and check that nothing of the thread is left: its rollout
   files in `sessions/` and `archived_sessions/`, its rows in
   `thread_history_1.sqlite` (`thread_items`, `thread_turns`,
-  `thread_realtime_items`), its rows in the state DB (`state_5.sqlite`),
+  `thread_realtime_items`, `thread_history_projection_state`), its rows in the state DB (`state_5.sqlite`),
   and its entries in `session_index.jsonl`. hennery itself only checks the
   rollout files: the rest is `thread/delete`'s contract. If the bundled
   Codex version changed, read `thread/delete`'s call shape from its source
