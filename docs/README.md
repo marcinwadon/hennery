@@ -13,6 +13,11 @@ state stays outside Git; public issues are separate approved projections.
    — product, topology, protocol principles, sessions, auth, hats, module
    boundaries, testing. Authoritative where subsystem specs disagree.
 2. Subsystem specs:
+   - [External OMP adapter proposal](superpowers/specs/2026-10-23-omp-design.md)
+     and [implementation plan](superpowers/plans/2026-10-23-omp-adapter.md) —
+     external runtime, exact transcript bindings and retry-safe removal;
+     proposed only, with upstream ownership-contract qualification required
+     before enablement.
    - [Skills and hooks catalogue](specs/2026-11-17-skills-hooks-catalogue.md) — proposed: one catalogue of Agent Skills directories and command hook sets, assigned per host (a hat only pre-selects hosts), delivered as symlinks into both agents' skill directories and as per-session hooks through the adapters, with Codex trust recorded by the host; fail-closed hook delivery is the one open owner call.
    - [Shared session work observations](specs/2026-11-06-session-work.md) — common UI/MCP facts, bounded response and plan observations, waiting/queue counts and explicit missing background telemetry; presentation status rules remain separate.
    - [Session usage and cache retention](specs/2026-11-02-session-usage.md) —
