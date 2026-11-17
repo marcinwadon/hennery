@@ -1238,19 +1238,16 @@ mod tests {
     }
     #[test]
     fn upgrading_a_store_without_the_capacity_column_reads_grants_back_as_32() {
-        // A grant issued before the column existed: wind the schema back one
-        // migration, drop the column, and reopen so the migration reapplies.
+        // Apply the exact migration to a legacy-shaped table. Rewinding the
+        // schema version would replay unrelated migrations added after this one.
         let w = World::new();
         let (before, _) = w.store.issue_external_client(&w.grant(true)).unwrap();
         {
             let conn = w.store.conn();
-            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-            conn.execute_batch(&format!(
-                "ALTER TABLE external_clients DROP COLUMN session_capacity; PRAGMA user_version = {};",
-                version - 1
-            ))
-            .unwrap();
+            conn.execute_batch("ALTER TABLE external_clients DROP COLUMN session_capacity;")
+                .unwrap();
             assert!(record(&conn, w.store.owner_id(), &before.client_id).is_err());
+            conn.execute_batch(include_str!("external_capacity.sql")).unwrap();
         }
         let reopened = Store::open(&w.dir.path().join("test.db")).unwrap();
         assert_eq!(
