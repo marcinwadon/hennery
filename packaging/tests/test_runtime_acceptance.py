@@ -1,5 +1,6 @@
 """Check the acceptance driver without downloading agents or using credentials."""
 import importlib.util
+import hashlib
 import json
 import os
 import signal
@@ -7,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('runtime_acceptance',
@@ -16,6 +18,66 @@ spec.loader.exec_module(driver)
 
 
 class RuntimeAcceptance(unittest.TestCase):
+    def test_full_run_scopes_parent_and_child_controls_for_all_sixteen_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in driver.INPUTS:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({'node': {'version': '24.22.3'}}))
+            auth = root / 'fixture-auth.json'
+            auth.write_text('{"fixture":"offline-credentials"}')
+            output = root / 'evidence'
+            args = SimpleNamespace(allow_real_agents=True, platform='darwin-arm64',
+                                   claude_auth=auth, codex_auth=auth, output=output)
+            source = 'a' * 40
+            inputs = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in driver.INPUTS}
+            dispatched = []
+
+            def git_or_version(argv, **kwargs):
+                if argv[:2] == ['git', 'status']:
+                    return b''
+                if argv[:2] == ['git', 'rev-parse']:
+                    return source + '\n'
+                self.assertEqual(argv, ['/fake/node', '--version'])
+                return 'v24.22.3\n'
+
+            def fake_execute(argv, env, log, timeout, secrets=()):
+                if '--no-run' in argv:
+                    text = '\n'.join(json.dumps({'reason': 'compiler-artifact',
+                        'target': {'name': name}, 'executable': '/fake/' + name})
+                        for name in ('delegation_live', 'forget_codex'))
+                elif '--example' in argv:
+                    text = json.dumps({'node': '/fake/node', 'set': '/fake/runtime', 'record': {
+                        'manifest_hash': inputs['crates/hennery-host/manifest.json'], 'platform': args.platform}})
+                elif argv[0] == '/fake/node':
+                    (output / 'mcp').mkdir()
+                    (output / 'mcp/runtime-matrix.json').write_text(json.dumps({'results': [{}] * 8}))
+                    text = ''
+                else:
+                    self.assertIn(argv[0], ['/fake/delegation_live', '/fake/forget_codex'])
+                    parent, child = env['HENNERY_D4_PARENT'], env.get('HENNERY_D4_CHILD')
+                    dispatched.append((argv[1], parent, child))
+                    if parent == 'claude':
+                        self.assertFalse('HENNERY_D4_CODEX_PARENT_EFFORT' in env,
+                                         'Claude case received Codex-only effort override')
+                    else:
+                        self.assertEqual(env['HENNERY_D4_CODEX_PARENT_EFFORT'], 'medium')
+                    text = 'test result: ok. 1 passed;'
+                return {'exit': 0, 'seconds': 0}, text
+
+            poisoned = {'PATH': '/usr/bin:/bin', 'CI': '', 'GITHUB_ACTIONS': '', 'HENNERY_D4_CODEX_PARENT_EFFORT': 'high',
+                        'HENNERY_D4_CHILD': 'inherited-child'}
+            with patch.dict(os.environ, poisoned, clear=True), patch.object(driver, 'ROOT', root), \
+                    patch.object(driver, 'host_platform', return_value=args.platform), \
+                    patch.object(driver.subprocess, 'check_output', side_effect=git_or_version), \
+                    patch.object(driver, 'execute', side_effect=fake_execute), patch('builtins.print'):
+                self.assertEqual(driver.run(args), 0)
+            self.assertEqual(dispatched, driver.cases())
+            report = json.loads((output / 'report.json').read_text())
+            self.assertEqual(report['outcome'], 'success')
+            self.assertEqual(len(report['results']), 19)
+
     def test_external_reports_require_all_platforms_cases_and_exact_source_inputs(self):
         rows = [{'case': name, 'exit': 0} for name in ('build', 'install', 'mcp-source-policy')]
         rows += [{'case': '-'.join(part for part in row if part), 'exit': 0} for row in driver.cases()]

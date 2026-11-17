@@ -218,8 +218,9 @@ def run(args):
         for test, parent, child in cases():
             label = '-'.join(part for part in (test, parent, child) if part)
             case_env = dict(env, HENNERY_D4_PARENT=parent, HENNERY_PIN_CODEX=str(codex),
-                            HENNERY_D4_CODEX_PARENT_EFFORT='medium',
                             HENNERY_D4_CAPTURE=str(args.output / (label + '.capture.json')))
+            if parent == 'codex':
+                case_env['HENNERY_D4_CODEX_PARENT_EFFORT'] = 'medium'
             if child:
                 case_env['HENNERY_D4_CHILD'] = child
             binary = binaries['forget_codex' if test.startswith('pinned_codex_delete_') else 'delegation_live']
