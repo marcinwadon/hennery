@@ -38,6 +38,11 @@ scratch runtime, verifies the manifest/platform and Node version, and runs:
 - sixteen opt-in invocations, including all four delegation pairs with their
   existing lifecycle assertions, provider/usage/tool tests and real Codex deletion.
 
+The synthetic-provider MCP fixture explicitly selects Manual (`default`)
+permission mode and verifies it after every session create/load. Tool approvals
+still use `allow_once`; Auto mode's separate permission evaluator is outside
+this routing fixture. All eight source-isolation and collision checks remain.
+
 No test limits or assertions are relaxed. Tests execute directly from Cargo's
 reported binary paths, without rebuilding for each row. A successful invocation
 must report one actual passing test; a renamed or missing test cannot pass with

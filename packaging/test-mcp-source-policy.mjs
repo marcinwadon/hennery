@@ -106,7 +106,11 @@ const native = { mcpServers: {
 } }
 writeFileSync(join(home, '.claude.json'), JSON.stringify(native))
 writeFileSync(join(config, '.claude.json'), JSON.stringify(native))
-writeFileSync(join(config, 'settings.json'), JSON.stringify({ enableAllProjectMcpServers: true }))
+// Auto mode needs a real permission evaluator; this synthetic provider tests
+// MCP routing. Use Manual and retain the client's allow_once approval path.
+writeFileSync(join(config, 'settings.json'), JSON.stringify({
+  enableAllProjectMcpServers: true, permissions: { defaultMode: 'default' },
+}))
 writeFileSync(join(project, '.mcp.json'), JSON.stringify({ mcpServers: {
   'hennery-probe': { type: 'http', url: base + '/mcp/project-collision',
     headers: { 'X-Native-Only': 'project-secret' } },
@@ -183,6 +187,8 @@ try {
       ? { extraArgs: { 'strict-mcp-config': '' } } : { strictMcpConfig: false } } }
     const response = await request(method, { cwd: project, mcpServers: managed ? servers : [], _meta: meta,
       ...(method === 'session/load' ? { sessionId } : {}) })
+    assert.equal(response.modes?.currentModeId, 'default',
+      'MCP source-policy fixture requires Manual (default) permission mode')
     if (method === 'session/new') sessionId = response.sessionId
     const answer = await request('session/prompt', { sessionId,
       prompt: [{ type: 'text', text: `Use every MCP marker tool with nonce ${currentNonce}.` }] })
@@ -202,7 +208,7 @@ try {
     assert.equal(answer.stopReason, 'end_turn')
     await request('session/close', { sessionId })
     await stopChild()
-    results.push({ method, mode, managed, nonce: currentNonce, calls })
+    results.push({ method, mode, managed, permissionMode: response.modes.currentModeId, nonce: currentNonce, calls })
     console.log(JSON.stringify({ case: results.length, method, mode, managed, toolCalls: used.length }))
   }
   writeFileSync(join(output, 'runtime-matrix.json'), JSON.stringify({ results, apiCalls, stderr }, null, 2))
