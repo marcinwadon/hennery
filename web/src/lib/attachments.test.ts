@@ -35,13 +35,13 @@ function held(sizes: number[]): Attachment[] {
 beforeEach(() => forgetAllAttachments())
 
 describe('admit: image limits', () => {
-  it('limit type: takes png, jpeg, gif and webp, and refuses an svg or a pdf', () => {
+  it('takes native images and generic SVG/PDF files', () => {
     const files = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml', 'application/pdf'].map((t, i) =>
       sized(`f${i}`, 10, t),
     )
     const { accepted, refused } = admit([], files, 1)
-    expect(accepted.map((a) => a.file.type)).toEqual(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
-    expect(refused).toEqual(['f4 is not a PNG, JPEG, GIF or WebP image.', 'f5 is not a PNG, JPEG, GIF or WebP image.'])
+    expect(accepted.map((a) => a.file.type)).toEqual(files.map(f => f.type))
+    expect(refused).toEqual([])
   })
 
   it('limit size: takes an image of exactly 5 MiB, refuses one byte more', () => {
@@ -54,7 +54,7 @@ describe('admit: image limits', () => {
     const { accepted, refused } = admit(held(Array(19).fill(10)), [sized('20th.png', 10), sized('21st.png', 10)], 20)
     expect(MAX_IMAGES).toBe(20)
     expect(accepted.map((a) => a.file.name)).toEqual(['20th.png'])
-    expect(refused).toEqual(['21st.png: a prompt takes at most 20 images.'])
+    expect(refused).toEqual(['21st.png: a prompt takes at most 20 attachments.'])
   })
 
   it('limit total: takes images up to exactly 16 MiB in all, refuses one byte more', () => {
@@ -64,7 +64,7 @@ describe('admit: image limits', () => {
     expect(exact.accepted.map((a) => a.file.name)).toEqual(['last.png'])
     const over = admit(three, [sized('over.png', MiB + 1)], 4)
     expect(over.accepted).toEqual([])
-    expect(over.refused).toEqual(['over.png: a prompt takes at most 16 MiB of images in all.'])
+    expect(over.refused).toEqual(['over.png: a prompt takes at most 16 MiB of attachments in all.'])
   })
 
   it('limit number: takes image #999999, refuses a seventh digit, saying why', () => {
@@ -74,7 +74,7 @@ describe('admit: image limits', () => {
   })
 
   it('numbers what it takes from the next number, skipping the refused', () => {
-    const { accepted } = admit([], [sized('a', 1), sized('b', 1, 'text/plain'), sized('c', 1)], 7)
+    const { accepted } = admit([], [sized('a', 1), sized('../b', 1, 'text/plain'), sized('c', 1)], 7)
     expect(accepted.map((a) => [a.file.name, a.n])).toEqual([
       ['a', 7],
       ['c', 8],
@@ -172,4 +172,17 @@ describe('held images per session', () => {
     hold('a', { attachments: [], nextN: 4 })
     expect(heldFor('a').nextN).toBe(4)
   })
+})
+
+it('keeps generic file markers, original filename and binary bytes distinct from native images', async () => {
+  const file = new File(['name,value\na,42\n'], 'data.csv', { type: 'text/csv' })
+  const held = [{ n: 1, file }]
+  expect(marker(1, file)).toBe('[File #1]')
+  expect(live('[File #1]', held)).toEqual(held)
+  expect(live('[Image #1]', held)).toEqual([])
+  expect(await promptBlocks('Analyze [File #1]', held)).toEqual([
+    { type: 'text', text: 'Analyze ' },
+    { type: 'file', name: 'data.csv', mimeType: 'text/csv', data: btoa('name,value\na,42\n') },
+  ])
+  expect(await promptBlocks('[Image #1]', held)).toEqual([{ type: 'text', text: '[Image #1]' }])
 })

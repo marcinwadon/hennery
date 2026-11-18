@@ -20,10 +20,12 @@ import Thinking from './items/Thinking'
 import ToolCall from './items/ToolCall'
 import Unrecognised from './items/Unrecognised'
 import UserTurn from './items/UserTurn'
+import { ArtifactCard } from './SessionFiles'
 import type { ItemEnv } from './items/types'
 
 export function ItemView({ item, env }: { item: Item; env: ItemEnv }) {
   switch (item.kind) {
+    case 'artifact': return <ArtifactCard artifact={item.artifact} />
     case 'plugin_context':
       return <PluginContext item={item} />
     case 'user_turn':

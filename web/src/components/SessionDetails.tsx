@@ -13,10 +13,11 @@ import type { McpSourceState } from '../generated/protocol'
 import StepList from './StepList'
 import { WaitingBadge } from './SessionScope'
 
-const TABS = ['Family', 'Plan', 'Usage', 'Details'] as const
+const TABS = ['Family', 'Plan', 'Usage', 'Files', 'Details'] as const
 export type SessionDetailsTab = typeof TABS[number]
 
 interface Props {
+  files?: ReactNode
   usage?: ReactNode
   usageFocus?: number
   open: boolean
@@ -70,7 +71,7 @@ export default function SessionDetails(props: Props) {
     </div>}
     {TABS.map(name => <div key={name} role={sheet ? 'tabpanel' : 'region'} tabIndex={sheet ? 0 : undefined} id={`${prefix}-${name}-panel`} aria-label={sheet ? undefined : name} aria-labelledby={sheet ? `${prefix}-${name}` : undefined} hidden={sheet && tab !== name}>
       {!sheet && <h3 className="session-section-title">{name}</h3>}
-      {name === 'Family' ? props.children : !open || (sheet && tab !== name) ? null : name === 'Plan' ? props.plan?.entries.length ? <StepList entries={props.plan.entries} truncated={props.plan.truncated} open /> : <p className="item-note">No plan has been shared.</p> : name === 'Usage' ? props.usage ?? <p className="item-note">No usage has been reported.</p> : <Details {...props} />}
+      {name === 'Family' ? props.children : !open || (sheet && tab !== name) ? null : name === 'Files' ? props.files : name === 'Plan' ? props.plan?.entries.length ? <StepList entries={props.plan.entries} truncated={props.plan.truncated} open /> : <p className="item-note">No plan has been shared.</p> : name === 'Usage' ? props.usage ?? <p className="item-note">No usage has been reported.</p> : <Details {...props} />}
     </div>)}
   </>
   return <div ref={wrapper} className={'session-details-wrap' + (sheet ? ' is-sheet' : '')} hidden={!open}>

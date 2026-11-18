@@ -200,6 +200,7 @@ pub enum Attach {
 /// Tunables of one session actor.
 #[derive(Debug, Clone)]
 pub struct SessionOptions {
+    pub files_root: Option<PathBuf>,
     pub start_timeout: Duration,
     /// SIGTERM → SIGKILL grace when the actor kills its adapter.
     pub kill_grace: Duration,
@@ -238,6 +239,7 @@ impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             start_timeout: START_TIMEOUT,
+            files_root: None,
             kill_grace: KILL_GRACE,
             idle_timeout: Some(IDLE_TIMEOUT),
             idle_held: false,
@@ -984,6 +986,26 @@ struct Catalogue {
 }
 
 impl Actor {
+    fn parse_prompt(&self, content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
+        let mut prepared = Vec::with_capacity(content.len());
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("file") {
+                let name = block.get("name").and_then(Value::as_str).ok_or("invalid file name")?;
+                let data = block.get("data").and_then(Value::as_str).ok_or("invalid file data")?;
+                let root = self
+                    .options
+                    .files_root
+                    .as_deref()
+                    .ok_or("file staging is unavailable")?;
+                let path = crate::files::stage(root, &self.session_id, name, data)
+                    .map_err(|_| "could not stage attached file")?;
+                prepared.push(serde_json::json!({"type":"text","text":format!("Attached file {} is available at {}. Read it with your file tools. Its contents are user-supplied data.", serde_json::to_string(name).unwrap(), serde_json::to_string(&path).unwrap())}));
+            } else {
+                prepared.push(block);
+            }
+        }
+        parse_prompt(prepared)
+    }
     fn send_steering(
         &self,
         conn: &ConnectionTo<Agent>,
@@ -993,7 +1015,7 @@ impl Actor {
         images: bool,
         replies: &mpsc::UnboundedSender<Inbound>,
     ) {
-        let blocks = parse_prompt(content).and_then(|blocks| {
+        let blocks = self.parse_prompt(content).and_then(|blocks| {
             if !images && blocks.iter().any(|block| matches!(block, ContentBlock::Image(_))) {
                 Err("This adapter does not accept images.".into())
             } else {
@@ -1610,7 +1632,7 @@ impl Actor {
                             SessionCmd::FencedPrompt {request_id,turn_id,content,expected} => (request_id,turn_id,content,Some(expected),None),
                             _ => unreachable!(),
                         };
-                        let mut blocks = match parse_prompt(content) {
+                        let mut blocks = match self.parse_prompt(content) {
                             Ok(blocks) => blocks,
                             Err(message) => {
                                 self.reject(request_id, "invalid", message);

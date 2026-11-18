@@ -29,6 +29,10 @@ What works:
   for organising sessions and choosing their MCP servers.
 - **MCP servers.** Connect a server with a static token or OAuth through the
   gateway, or configure local stdio servers for a host and hat, on the **MCP** screen.
+- **Session files.** Attach documents, CSVs, archives and other files to a prompt.
+  Agents can publish downloadable artifacts with immutable versions; the session's
+  **Files** panel keeps their history and offers Markdown/text previews. Published
+  copies remain available when the agent host is offline. See [Session files](docs/session-files.md).
 - **Parent/child sessions.** Let a session delegate work to children, receive
   their reports and answer their questions, with operator oversight.
 - **Phone answers.** Enable Web Push in **Settings** to open a waiting question

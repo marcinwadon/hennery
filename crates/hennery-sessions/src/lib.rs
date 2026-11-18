@@ -26,6 +26,7 @@ pub mod external_oauth;
 mod external_oauth_store;
 mod external_tools;
 pub mod family;
+pub mod files;
 pub mod forget;
 pub mod hats;
 pub mod hosts;
@@ -187,6 +188,7 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
 /// Serve `router(state)` on every listener until `state.shutdown` is
 /// cancelled (kernel spec §7).
 pub async fn serve_on(listeners: Vec<tokio::net::TcpListener>, state: AppState) -> std::io::Result<()> {
+    files::start_cleanup(&state);
     external_control::after_startup(&state);
     offline::after_startup(&state);
     sweep::after_startup(&state);
@@ -220,6 +222,7 @@ pub fn router(state: AppState) -> Router {
         .merge(session_defaults_api::router(state.clone()))
         .merge(idle_parking::router(state.clone()))
         .merge(projects::router(state.clone()))
+        .merge(files::router(state.clone()))
         .merge(push::router(state.clone()))
         .merge(view::router(state.clone()))
         .merge(plugin_api::router(state.clone()))

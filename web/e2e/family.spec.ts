@@ -49,6 +49,7 @@ async function fixture(context: BrowserContext, statusOnly = false) {
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
   await context.route('**/api/**', async route => {
     const url = new URL(route.request().url()), path = url.pathname
+    if (/^\/api\/sessions\/[^/]+\/files$/.test(path) && route.request().method() === 'GET') return json(route, { artifacts: [], next_cursor: null, attachments: [], attachments_truncated: false })
     if (path === '/api/capabilities') return json(route, { mode: 'full', features: [] })
     if (path === '/api/hosts') return json(route, [{ host_id: 'host1', name: 'worker host', connected: true, capabilities: [] }])
     if (path === '/api/hats') return json(route, [])

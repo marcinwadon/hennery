@@ -1,5 +1,52 @@
 {
   "$defs": {
+    "ArtifactRevision": {
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "session_id",
+        "revision",
+        "title",
+        "name",
+        "mime_type",
+        "sha256",
+        "size",
+        "created_at"
+      ],
+      "type": "object"
+    },
     "BackgroundWork": {
       "oneOf": [
         {
@@ -466,6 +513,22 @@
     "Item": {
       "description": "One display item of a session. Its `id` is stable for the session's\nlife; `version` is the `event_id` of the last event that changed it, so\na client keeps the item with the higher version.",
       "oneOf": [
+        {
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/ArtifactRevision"
+            },
+            "kind": {
+              "const": "artifact",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "artifact"
+          ],
+          "type": "object"
+        },
         {
           "properties": {
             "kind": {
@@ -1586,6 +1649,36 @@
           "required": [
             "type",
             "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mimeType": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "mimeType",
+            "sha256",
+            "size"
           ],
           "type": "object"
         },

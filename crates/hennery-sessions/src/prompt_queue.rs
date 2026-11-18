@@ -67,6 +67,7 @@ impl Store {
         &self,
         blocks: &[StoredBlock],
         images: bool,
+        files: bool,
     ) -> Result<Option<Vec<serde_json::Value>>> {
         let mut sent = Vec::with_capacity(blocks.len());
         for block in blocks {
@@ -82,6 +83,22 @@ impl Store {
                         return Ok(None);
                     };
                     sent.push(serde_json::json!({"type":"image","mimeType":mime_type,"data":STANDARD.encode(bytes)}));
+                }
+                StoredBlock::File {
+                    name,
+                    mime_type,
+                    sha256,
+                    ..
+                } => {
+                    let Some(bytes) = self
+                        .attachments
+                        .as_deref()
+                        .filter(|_| files)
+                        .and_then(|dir| crate::attachments::read(dir, sha256).ok().flatten())
+                    else {
+                        return Ok(None);
+                    };
+                    sent.push(serde_json::json!({"type":"file","name":name,"mimeType":mime_type,"data":STANDARD.encode(bytes)}));
                 }
                 StoredBlock::PluginContext { .. } => anyhow::bail!("invalid queued content"),
             }
@@ -232,7 +249,11 @@ impl Store {
         let (old, image_bytes) = old.context("queue_item_unavailable")?;
         let blocks: Vec<StoredBlock> = serde_json::from_str(&old)?;
         let mut content = vec![StoredBlock::Text { text: text.into() }];
-        content.extend(blocks.into_iter().filter(|b| matches!(b, StoredBlock::Image { .. })));
+        content.extend(
+            blocks
+                .into_iter()
+                .filter(|b| matches!(b, StoredBlock::Image { .. } | StoredBlock::File { .. })),
+        );
         ensure!(!text.trim().is_empty() || content.len() > 1, "empty_prompt");
         let payload = serde_json::to_string(&content)?;
         bounds(&tx, self.owner_id(), session, id, payload.len() as i64 + image_bytes)?;
@@ -413,7 +434,12 @@ impl Store {
             };
         }
         let stored: Vec<StoredBlock> = serde_json::from_str(&payload)?;
-        let Some(sent) = self.queued_content(&stored, hub.has_capability(&host, Capability::Images))? else {
+        let Some(sent) = self.queued_content(
+            &stored,
+            hub.has_capability(&host, Capability::Images),
+            hub.has_capability(&host, Capability::Files),
+        )?
+        else {
             self.fail_operator_item_in(&tx, &id, "image_unavailable")?;
             tx.commit()?;
             return Ok(false);

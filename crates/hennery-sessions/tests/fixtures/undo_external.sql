@@ -1,3 +1,8 @@
+-- Rewind session files (v46) before rebuilding a historical fixture.
+DROP TRIGGER artifact_session_deleted;
+DROP TABLE artifact_revisions;
+DROP TABLE session_artifacts;
+DROP TABLE file_cache_cleanup;
 -- Rewind steering (v45) before rebuilding a historical fixture.
 DROP TRIGGER steering_detached;
 DROP TRIGGER steering_endpoint_end;

@@ -138,11 +138,18 @@ pub fn weight(item: &Item) -> usize {
         + item.ts.len()
         + opt(&item.turn_id)
         + match &item.body {
+            Body::Artifact { artifact } => artifact.title.len() + artifact.name.len() + 512,
             Body::UserTurn { content, .. } => content
                 .iter()
                 .map(|block| match block {
                     StoredBlock::Text { text } => text.len() + 16,
                     StoredBlock::Image { mime_type, sha256, .. } => mime_type.len() + sha256.len() + 24,
+                    StoredBlock::File {
+                        name,
+                        mime_type,
+                        sha256,
+                        ..
+                    } => name.len() + mime_type.len() + sha256.len() + 32,
                     StoredBlock::PluginContext { startup } => serde_json::to_vec(startup).map_or(8192, |b| b.len()),
                 })
                 .sum(),
@@ -276,6 +283,15 @@ impl Fold {
             return self.user_turn(event);
         }
         match kind {
+            "artifact_published" => {
+                match serde_json::from_value(event.body.clone()) {
+                    Ok(artifact) => {
+                        self.create_ordinal(event, Body::Artifact { artifact });
+                    }
+                    Err(_) => self.unrecognised(event, "artifact_published"),
+                }
+                return;
+            }
             "pending_opened" => return self.question_opened(event, answerable),
             "answer_submitted" | "answer_result" | "answer_cancelled" | "pending_resolved" | "pending_cancelled" => {
                 return self.question_changed(event, answerable);

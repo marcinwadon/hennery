@@ -37,6 +37,7 @@ pub fn router(app: AppState, gateway: GatewayState) -> Router {
 pub fn router_with_limits(app: AppState, gateway: GatewayState, limits: Limits) -> Router {
     Router::new()
         .route("/mcp/builtin/hennery", any(endpoint))
+        .route("/mcp/builtin/files", any(endpoint))
         .with_state(BuiltinState {
             app,
             gateway,
@@ -76,6 +77,7 @@ async fn endpoint(
     body: Body,
 ) -> Response {
     let mut body = RequestBody::new(body, &headers);
+    let files = uri.path() == "/mcp/builtin/files";
     let mut permit = None;
     let origin = state.app.operator.public_url();
     let mut token_watch = None;
@@ -94,16 +96,23 @@ async fn endpoint(
             let cancelled = watch.token();
             let admitted = state.gateway.runtime.store.authenticate_session(token).ok().flatten();
             if let Some(identity) = admitted {
-                grant_watch = state.gateway.runtime.store.watch_delegation(&identity).ok().flatten();
-                if let Some(grant) = &grant_watch {
-                    let grant_cancelled = grant.token();
+                if files {
                     tokio::select! { biased;
                         () = cancelled.cancelled() => no_scope(),
-                        () = grant_cancelled.cancelled() => no_scope(),
-                        response = handle(&state, identity, method, &headers, &mut body, &mut permit) => response,
+                        response = handle(&state, identity, method, &headers, &mut body, &mut permit, true) => response,
                     }
                 } else {
-                    no_scope()
+                    grant_watch = state.gateway.runtime.store.watch_delegation(&identity).ok().flatten();
+                    if let Some(grant) = &grant_watch {
+                        let grant_cancelled = grant.token();
+                        tokio::select! { biased;
+                            () = cancelled.cancelled() => no_scope(),
+                            () = grant_cancelled.cancelled() => no_scope(),
+                            response = handle(&state, identity, method, &headers, &mut body, &mut permit, false) => response,
+                        }
+                    } else {
+                        no_scope()
+                    }
                 }
             } else {
                 no_scope()
@@ -245,16 +254,25 @@ async fn handle(
     headers: &HeaderMap,
     body: &mut RequestBody,
     permit: &mut Option<hennery_kernel::egress::Permit>,
+    files: bool,
 ) -> Response {
-    let Some(revision) = identity.delivered_delegation_revision() else {
+    let Some(revision) = (if files {
+        Some(0)
+    } else {
+        identity.delivered_delegation_revision()
+    }) else {
         return no_scope();
     };
-    let context = state
-        .app
-        .store
-        .session_tool_context(&identity, revision, false)
-        .ok()
-        .flatten();
+    let context = if files {
+        state.app.store.file_tool_context(&identity, false).ok().flatten()
+    } else {
+        state
+            .app
+            .store
+            .session_tool_context(&identity, revision, false)
+            .ok()
+            .flatten()
+    };
     let Some(context) = context else { return no_scope() };
     let delivery = state.app.store.mcp_delivery(context.session_id()).ok().flatten();
     if !delivery.is_some_and(|d| {
@@ -359,7 +377,13 @@ async fn handle(
             json!({"protocolVersion":version, "capabilities":{"tools":{}}, "serverInfo":{"name":"hennery","version":env!("CARGO_PKG_VERSION")}})
         }
         "ping" if no_params => json!({}),
-        "tools/list" if no_params => crate::tool_args::discovery(),
+        "tools/list" if no_params => {
+            if files {
+                crate::files::tools()
+            } else {
+                crate::tool_args::discovery()
+            }
+        }
         "tools/call" => {
             let params = message.params.unwrap_or(Value::Null);
             if !params.is_object() {
@@ -372,13 +396,23 @@ async fn handle(
                 return rpc_error(id, -32602, StatusCode::BAD_REQUEST);
             }
             let active = state.app.hub.is_ready(context.host_id())
-                && state
-                    .app
-                    .store
-                    .session_tool_context(&identity, revision, true)
-                    .ok()
-                    .flatten()
-                    .is_some();
+                && (if files {
+                    state
+                        .app
+                        .store
+                        .file_tool_context(&identity, true)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                } else {
+                    state
+                        .app
+                        .store
+                        .session_tool_context(&identity, revision, true)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                });
             let (structured, failed) = if !active {
                 (
                     json!({"code":"session_starting","message":"the session is starting"}),
@@ -387,19 +421,27 @@ async fn handle(
             } else {
                 match tokio::time::timeout(
                     state.limits.answer_timeout.min(std::time::Duration::from_secs(30)),
-                    crate::session_tools::execute(
-                        &state.app,
-                        &identity,
-                        revision,
-                        &call.name,
-                        Value::Object(call.arguments),
-                    ),
+                    async {
+                        if files {
+                            crate::files::execute(&state.app, &identity, &call.name, Value::Object(call.arguments))
+                                .await
+                        } else {
+                            crate::session_tools::execute(
+                                &state.app,
+                                &identity,
+                                revision,
+                                &call.name,
+                                Value::Object(call.arguments),
+                            )
+                            .await
+                        }
+                    },
                 )
                 .await
                 {
                     Ok(Ok(value)) => (value, false),
                     Ok(Err(error)) => (
-                        json!({"code":crate::session_tools::error_code(&error),"message":crate::session_tools::error_message(&error)}),
+                        json!({"code":crate::session_tools::error_code(&error),"message":if files {crate::files::error_message(&error).to_owned()} else {crate::session_tools::error_message(&error)}}),
                         true,
                     ),
 

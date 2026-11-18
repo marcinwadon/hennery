@@ -27,6 +27,7 @@ for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 844 }
     await context.route('**/api/**', async route => {
       const path = new URL(route.request().url()).pathname
       const json = (value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
+      if (/^\/api\/sessions\/[^/]+\/files$/.test(path) && route.request().method() === 'GET') return json({ artifacts: [], next_cursor: null, attachments: [], attachments_truncated: false })
       if (path === '/api/capabilities') return json({ mode: 'full', features: [] })
       if (path === '/api/hats') return json([{ id: 'hat1', name: 'Synthetic project', colour: '#8a3cbd' }])
       if (path === '/api/hosts') return json([{ host_id: 'host1', name: 'Synthetic host', connected: true, capabilities: ['images'] }])
@@ -117,7 +118,7 @@ for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 844 }
       // Twenty images occupy one bounded strip rather than twenty wrapped chips.
       const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
       await composer.getByTestId('image-input').setInputFiles(Array.from({ length: 20 }, (_, i) => ({ name: `image-${i}.png`, mimeType: 'image/png', buffer: png })))
-      const images = composer.getByRole('list', { name: 'Images', exact: true })
+      const images = composer.getByRole('list', { name: 'Attachments', exact: true })
       await expect(images.getByRole('listitem')).toHaveCount(20)
       if (viewport.width < 1024) {
         const remove = (await images.getByRole('button', { name: 'Remove image #1', exact: true }).boundingBox())!

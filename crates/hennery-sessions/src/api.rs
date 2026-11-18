@@ -1142,7 +1142,24 @@ pub(crate) async fn prompt_authorized(
             return request_failed(RequestError::NotConnected);
         }
         // Never an image to a host that did not announce it (ACP core §3.3).
-        let images_supported = state.hub.has_capability(&session.host_id, Capability::Images);
+        let files_supported = state.hub.has_capability(&session.host_id, Capability::Files);
+        if !files_supported
+            && checked
+                .stored
+                .iter()
+                .any(|b| matches!(b, hennery_proto::rest::StoredBlock::File { .. }))
+        {
+            return error(
+                StatusCode::CONFLICT,
+                "files_unsupported",
+                "file attachments require an updated host",
+            );
+        }
+        let images_supported = !checked
+            .stored
+            .iter()
+            .any(|b| matches!(b, hennery_proto::rest::StoredBlock::Image { .. }))
+            || state.hub.has_capability(&session.host_id, Capability::Images);
         if !images_supported {
             return error(
                 StatusCode::CONFLICT,
@@ -1413,7 +1430,17 @@ async fn attachment(State(state): State<AppState>, Path(sha256): Path<String>) -
             HeaderValue::from_static("same-origin"),
         ),
     ];
-    (headers, found.bytes).into_response()
+    let mut response = (headers, found.bytes).into_response();
+    // Generic bytes must never become an active same-origin document.
+    if !content::IMAGE_TYPES.contains(&found.mime.as_str()) {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+    }
+    response
 }
 
 /// The owner's attachment store, for Settings (ACP core §15, plan 6a).

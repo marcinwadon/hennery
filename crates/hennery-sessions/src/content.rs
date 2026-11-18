@@ -123,9 +123,52 @@ pub fn check(content: Vec<Value>) -> Result<Checked, Refusal> {
                 sent.push(json!({ "type": "image", "mimeType": image.mime, "data": data }));
                 images.push(image);
             }
+            Some("file") => {
+                if images.len() == MAX_IMAGES {
+                    return Err(Refusal::TooLarge("a prompt takes at most 20 attachments".into()));
+                }
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| hennery_proto::files::valid_name(n))
+                    .ok_or_else(|| Refusal::Invalid("a file needs a plain filename of at most 255 bytes".into()))?
+                    .to_owned();
+                let mime = block
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .filter(|m| hennery_proto::files::valid_mime(m))
+                    .ok_or_else(|| Refusal::Invalid("invalid file MIME type".into()))?
+                    .to_owned();
+                let data = block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Refusal::Invalid("a file needs base64 data".into()))?;
+                if data.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+                    return Err(too_large_image(n));
+                }
+                let bytes = STANDARD
+                    .decode(data)
+                    .map_err(|_| Refusal::Invalid("invalid base64 file data".into()))?;
+                if bytes.len() > MAX_IMAGE_BYTES {
+                    return Err(too_large_image(n));
+                }
+                if total + bytes.len() > MAX_IMAGES_TOTAL {
+                    return Err(too_large_total());
+                }
+                total += bytes.len();
+                let sha256 = hex::encode(Sha256::digest(&bytes));
+                stored.push(StoredBlock::File {
+                    name: name.clone(),
+                    mime_type: mime.clone(),
+                    sha256: sha256.clone(),
+                    size: bytes.len() as u64,
+                });
+                sent.push(json!({"type":"file","name":name,"mimeType":mime,"data":data}));
+                images.push(Image { sha256, mime, bytes });
+            }
             Some(other) => {
                 return Err(Refusal::Invalid(format!(
-                    "block {n}: {} blocks are not accepted; a prompt is text and images",
+                    "block {n}: {} blocks are not accepted; a prompt is text, images and files",
                     shown(other)
                 )));
             }

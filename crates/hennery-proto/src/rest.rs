@@ -107,6 +107,14 @@ pub enum StoredBlock {
     Text {
         text: String,
     },
+    File {
+        name: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        sha256: String,
+        #[ts(type = "number")]
+        size: u64,
+    },
     Image {
         #[serde(rename = "mimeType")]
         mime_type: String,

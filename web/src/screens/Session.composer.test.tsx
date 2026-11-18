@@ -76,7 +76,7 @@ describe('SessionView: the composer', () => {
     })
     render(view('s1'), { wrapper: s.wrapper })
     await screen.findByText('build-box', {}, WAIT)
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Attach images' })).toBeNull(), WAIT)
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^Attach (?:images|files)$/ })).toBeNull(), WAIT)
     expect(s.of('/api/hosts')).toHaveLength(1)
   })
 
@@ -84,7 +84,7 @@ describe('SessionView: the composer', () => {
     const s = sessionServer({ hosts: () => json([{ host_id: 'h1', name: 'build-box' }]) })
     render(view('s1'), { wrapper: s.wrapper })
     await screen.findByText('build-box', {}, WAIT)
-    expect(screen.getByRole('button', { name: 'Attach images' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeInTheDocument()
   })
 
   it('offers Send beside Cancel while the session runs a turn', async () => {
@@ -113,7 +113,7 @@ describe('SessionView: the composer', () => {
     r.rerender(view('s2'))
     await screen.findByText('s2-m')
     expect(textarea().value).toBe('')
-    expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+    expect(screen.queryByRole('list', { name: 'Attachments' })).toBeNull()
     type('second ')
     paste(png('two.png', 'TWO'))
     await waitFor(() => expect(textarea().value).toBe('second [Image #1] '))
@@ -136,7 +136,7 @@ describe('SessionView: the composer', () => {
     r.rerender(view('s1'))
     await screen.findByText('s1-m')
     expect(textarea().value).toBe('first [Image #1] ')
-    expect(within(screen.getByRole('list', { name: 'Images' })).getByAltText('Image #1')).toBeInTheDocument()
+    expect(within(screen.getByRole('list', { name: 'Attachments' })).getByAltText('Image #1')).toBeInTheDocument()
     expect(s.posted('/prompt')).toHaveLength(1)
   })
 
@@ -185,7 +185,7 @@ describe('SessionView: a send in flight when the composer is mounted again', () 
     // Work added meanwhile is refused, as in the composer that sent.
     paste(png('late.png'))
     expect(screen.getByRole('alert').textContent).toBe(STILL_SENDING)
-    expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+    expect(screen.queryByRole('list', { name: 'Attachments' })).toBeNull()
 
     await answer.answer(json({ turn_id: 'new' }, 202))
     await waitFor(() => expect(textarea().value).toBe(''), WAIT)
@@ -276,7 +276,7 @@ describe('SessionView: Send again', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Send again' }, WAIT))
     await waitFor(() => expect(textarea().value).toBe('look at [Image #1] and fix it'), WAIT)
     expect(screen.getByText(/The turn that was not delivered, back in the draft/)).toBeInTheDocument()
-    expect(within(screen.getByRole('list', { name: 'Images' })).getByAltText('Image #1')).toBeInTheDocument()
+    expect(within(screen.getByRole('list', { name: 'Attachments' })).getByAltText('Image #1')).toBeInTheDocument()
     expect(s.of('/api/view/sessions/s1/turns/t9')).toHaveLength(1)
     expect(s.of('/api/attachments/ab%2Fc')).toHaveLength(1)
     expect(s.posted('/prompt')).toEqual([])
@@ -354,7 +354,7 @@ describe('SessionView: Send again', () => {
     const again = await screen.findByRole('button', { name: 'Send again' }, WAIT)
     type('mine')
     fireEvent.click(again)
-    await screen.findByText(/a prompt takes at most 20 images/, {}, WAIT)
+    await screen.findByText(/a prompt takes at most 20 attachments/, {}, WAIT)
     expect(textarea().value).toBe('mine')
     expect(heldFor('s1').attachments).toHaveLength(19)
   })
@@ -399,7 +399,7 @@ describe('SessionView: Send again', () => {
     fireEvent.click(again)
     await screen.findByText(/The turn could not be put back: An image of this prompt could not be read \(404\)/, {}, WAIT)
     expect(textarea().value).toBe('mine')
-    expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+    expect(screen.queryByRole('list', { name: 'Attachments' })).toBeNull()
     expect(s.posted('/prompt')).toEqual([])
   })
 
@@ -438,7 +438,7 @@ describe('SessionView: Send again', () => {
     r.rerender(view('s1'))
     await screen.findByRole('button', { name: 'Send again' }, WAIT)
     expect(textarea().value).toBe('')
-    expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+    expect(screen.queryByRole('list', { name: 'Attachments' })).toBeNull()
   })
 })
 

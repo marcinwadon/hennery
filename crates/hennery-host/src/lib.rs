@@ -6,6 +6,7 @@ pub mod agent_home;
 pub mod connection;
 pub mod delegation;
 pub mod enrollment;
+pub mod files;
 pub mod forget;
 pub mod forget_codex;
 pub mod git;

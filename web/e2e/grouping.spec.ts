@@ -23,6 +23,7 @@ for (const width of [1280, 1024, 390]) for (const theme of ['light', 'dark'] as 
   await context.route('**/api/**', route => {
     const path = new URL(route.request().url()).pathname
     const json = (value: unknown) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) })
+    if (/^\/api\/sessions\/[^/]+\/files$/.test(path) && route.request().method() === 'GET') return json({ artifacts: [], next_cursor: null, attachments: [], attachments_truncated: false })
     if (path === '/api/capabilities') return json({ mode: 'full', features: [] })
     if (path === '/api/hosts') return json(['one', 'two', 'three', 'four'].map(host_id => ({ host_id, name: `dev-${host_id}`, connected: true, capabilities: [] })))
     if (path === '/api/hats') return json([{ id: 'personal', name: 'Personal', colour: '#8050d0', created_at: ts, purging: false, default_for_new_hosts: false }])

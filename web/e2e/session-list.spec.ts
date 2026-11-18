@@ -20,6 +20,7 @@ for (const width of [1280, 390]) for (const count of [1, 100]) test(`${count} ch
     const url = new URL(route.request().url()), path = url.pathname
     const json = (value: unknown) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(value) })
     if (/^\/api\/sessions\/[^/]+\/queue$/.test(path)) return json([])
+    if (/^\/api\/sessions\/[^/]+\/files$/.test(path) && route.request().method() === 'GET') return json({ artifacts: [], next_cursor: null, attachments: [], attachments_truncated: false })
     if (path === '/api/capabilities') return json({ mode: 'full', features: [] })
     if (path === '/api/hosts') return json([{ host_id: 'host', name: hostname, connected: true, capabilities: [] }])
     if (path === '/api/hats') return json([{ id: 'hat', name: 'Personal', colour: '#8050d0', created_at: ts, purging: false, default_for_new_hosts: false }])

@@ -7222,3 +7222,78 @@ async fn worker_notice_dropped_model_requires_operator_after_one_probe() {
     assert_eq!(drain_count_catalogs(&state, &mut rx, removed).await, 0);
     assert_eq!(w.store.find_session("parent").unwrap().unwrap().lifecycle, "parked");
 }
+
+#[test]
+fn file_tools_have_session_identity_without_a_delegation_grant() {
+    let w = World::new();
+    w.gateway.set_session_tools(&w.hat, false).unwrap();
+    let hosts = Hosts::open(&w.db).unwrap();
+    hosts
+        .record_hello(
+            "host",
+            "test",
+            &Capabilities(vec![Capability::McpServers, Capability::Files]),
+            unix_now(),
+        )
+        .unwrap();
+    let given = w
+        .store
+        .create_session_with_mcp(
+            "file-session",
+            "host",
+            "claude",
+            "/project",
+            &w.hat,
+            None,
+            McpContext {
+                source_policy: false,
+                native_sources: false,
+                capable: true,
+                isolation: McpIsolation::ClaudeStrict,
+                rules_name_other_hats: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let token = given
+        .servers
+        .iter()
+        .find_map(|server| match server {
+            McpServer::Http { name, headers, .. } if name == "hennery_files" => {
+                Some(headers[0].value.strip_prefix("Bearer ").unwrap())
+            }
+            _ => None,
+        })
+        .expect("file MCP delivered independently");
+    assert!(
+        !given
+            .servers
+            .iter()
+            .any(|s| matches!(s,McpServer::Http{name,..} if name=="hennery"))
+    );
+    let identity = w.gateway.authenticate_session(token).unwrap().unwrap();
+    assert!(identity.delivered_delegation_revision().is_none());
+    w.active("file-session");
+    assert!(w.store.file_tool_context(&identity, true).unwrap().is_some());
+    assert!(w.store.session_tool_context(&identity, 0, true).unwrap().is_none());
+    let mut forged = identity.clone();
+    forged.owner_id = "another-owner".into();
+    assert!(w.store.file_tool_context(&forged, true).unwrap().is_none());
+    w.start("file-other", &w.hat, McpIsolation::ClaudeStrict);
+    w.active("file-other");
+    let q = hennery_proto::files::PublishArtifact {
+        path: "report.md".into(),
+        request_key: "cross-session".into(),
+        title: None,
+        mime_type: None,
+        artifact_id: None,
+        expected_revision: None,
+    };
+    assert!(
+        w.store
+            .publish_artifact("file-other", "host", &w.hat, &q, "report.md", b"no", Some(&identity))
+            .is_err()
+    );
+    w.store.revoke_host_tokens("host").unwrap();
+    assert!(w.store.file_tool_context(&identity, true).unwrap().is_none());
+}

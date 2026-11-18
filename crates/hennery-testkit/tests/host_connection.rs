@@ -831,6 +831,7 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
             Capability::CacheRetention,
             Capability::IdleTimeout,
             Capability::Images,
+            Capability::Files,
             Capability::Projects,
             Capability::ResolvePath,
             Capability::ForgetSession,

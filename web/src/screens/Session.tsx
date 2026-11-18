@@ -57,6 +57,7 @@ import SessionFooter from '../components/SessionFooter'
 import SessionHeader, { type HeaderInfo } from '../components/SessionHeader'
 import UnseenObserver from '../components/UnseenObserver'
 import FamilyPanel from '../components/FamilyPanel'
+import SessionFiles, { ArtifactVersions } from '../components/SessionFiles'
 import SessionDetails, { type SessionDetailsTab } from '../components/SessionDetails'
 import { useSessionScope } from '../components/SessionScope'
 import { useRegisterAction, useRegisterContext } from '../app-actions'
@@ -374,6 +375,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
     saveTheme(themeOf(actualHat.colour))
     return () => { if (scope?.hats) saveTheme(themeOf(scope.hats.find(h => h.id === scope.hat)?.colour)) }
   }, [actualHat?.id, actualHat?.colour, scope?.hats, scope?.hat])
+  const artifactVersions = useMemo(() => { const versions = new Map<string, number>(); for (const item of s.items) if (item.kind === 'artifact') versions.set(item.artifact.artifact_id, Math.max(versions.get(item.artifact.artifact_id) ?? 0, item.artifact.revision)); return versions }, [s.items])
   const plan = useMemo(() => latestPlan(s.items), [s.items])
   const startNotice = useStartNotice(id)
   const answers = useAnswering(id, info, s.items, s.loading, s.loads, connectedOf(hostItems, info?.host_id), s.mergeQuestion, s.pinned)
@@ -513,6 +515,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
 
   return (
     <QuestionPresentationContext.Provider value={presentation}>
+    <ArtifactVersions.Provider value={artifactVersions}>
     <div className={'session hn-accent-scope' + (narrow && selectedQuestion ? ' has-question-actions' : '')} style={accent} ref={questionRegion}>
       <SessionHeader
         renaming={renaming}
@@ -608,7 +611,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
       />
       {info?.lifecycle !== 'parked' && sessionFooter}
       </div>
-      <SessionDetails usageFocus={usageFocus} usage={<>
+      <SessionDetails files={<SessionFiles key={id} sessionId={id} active={detailsOpen} />} usageFocus={usageFocus} usage={<>
         {compactError && <p className="error" role="alert">{compactError}</p>}
         <UsagePanel state={usage} away={hostAway || !!info?.presumed_parked || connectedOf(hostItems, info?.host_id) === false}
           compact={commands(s.catalog).some(c => c.name === 'compact')} compacting={compactBusy}
@@ -618,6 +621,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
       </SessionDetails>
       </div>
     </div>
+    </ArtifactVersions.Provider>
     </QuestionPresentationContext.Provider>
   )
 }

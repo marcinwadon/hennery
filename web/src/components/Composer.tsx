@@ -102,6 +102,8 @@ export interface ComposerProps {
 }
 
 /** The composer of one session, remounted whenever the session changes. */
+function isImageFile(file: File) { return ['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type) }
+
 export function Composer(props: ComposerProps) {
   return <SessionComposer key={props.sessionId} {...props} />
 }
@@ -183,6 +185,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
 
   const inFlight = session?.activity === 'running' || session?.activity === 'blocked'
   const hostImages = capabilities === null || capabilities.includes('images')
+  const hostFiles = capabilities === null || capabilities.includes('files')
   // A session still starting refuses a resume too: it runs soon on its own.
   const canResume = session?.lifecycle !== 'starting'
   // Nothing to send: Send and "Resume and send" both wait for words.
@@ -191,9 +194,9 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
 
   // The draft as last rendered, for the handle and for a refill that
   // answers later.
-  const latest = useRef({ text, atts, hostImages })
+  const latest = useRef({ text, atts, hostImages, hostFiles })
   useLayoutEffect(() => {
-    latest.current = { text, atts, hostImages }
+    latest.current = { text, atts, hostImages, hostFiles }
   })
   // Aborted when the composer goes: a refill answering later lands nowhere.
   const alive = useRef<AbortController | null>(null)
@@ -235,9 +238,9 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
       setDraftError(STILL_SENDING)
       return
     }
-    const { text: current, atts: held, hostImages: images } = latest.current
-    const files = parts.flatMap((p) => (p.type === 'image' ? [p.file] : []))
-    if (files.length > 0 && !images) {
+    const { text: current, atts: held, hostImages: images, hostFiles: generic } = latest.current
+    const files = parts.flatMap((p) => (p.type !== 'text' ? [p.file] : []))
+    if (parts.some(p => p.type === 'image') && !images || parts.some(p => p.type === 'file') && !generic) {
       setNotice({ text: 'This turn holds images, and this host takes no images.' })
       return
     }
@@ -253,8 +256,8 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
     const numbers = new Map(accepted.map((a) => [a.file, a.n]))
     let added = ''
     for (const part of parts) {
-      const n = part.type === 'image' ? numbers.get(part.file) : undefined
-      const piece = part.type === 'text' ? part.text : n === undefined ? '' : marker(n)
+      const n = part.type !== 'text' ? numbers.get(part.file) : undefined
+      const piece = part.type === 'text' ? part.text : n === undefined ? '' : marker(n, part.file)
       if (added !== '' && !/\s$/.test(added) && !/^\s/.test(piece)) added += ' '
       added += piece
     }
@@ -302,8 +305,8 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
       setDraftError(STILL_SENDING)
       return
     }
-    if (!hostImages) {
-      setDraftError('This host takes no images.')
+    if (files.some(f => isImageFile(f) ? !hostImages : !hostFiles)) {
+      setDraftError('This host does not support these attachments. Update it before sending files.')
       return
     }
     const { accepted, refused } = admit(atts, files, nextN.current)
@@ -313,7 +316,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
     const ta = taRef.current
     const start = ta ? ta.selectionStart : text.length
     const end = ta ? ta.selectionEnd : text.length
-    const placed = splice(text, start, end, accepted.map((a) => marker(a.n)).join(' ') + ' ')
+    const placed = splice(text, start, end, accepted.map((a) => marker(a.n, a.file)).join(' ') + ' ')
     cursor.current = placed.cursor
     edit(placed.text)
     keep([...atts, ...accepted])
@@ -443,7 +446,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
   function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
     const files: File[] = []
     for (const item of Array.from(e.clipboardData.items)) {
-      if (item.kind === 'file' && item.type.startsWith('image/')) {
+      if (item.kind === 'file') {
         const file = item.getAsFile()
         if (file) files.push(file)
       }
@@ -530,12 +533,12 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
             onPaste={onPaste}
           />
           <div className="composer-actions">
-            {hostImages && (
+            {(hostImages || hostFiles) && (
               <>
                 <input
                   ref={fileRef}
                   type="file"
-                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  accept={hostFiles ? undefined : 'image/png,image/jpeg,image/gif,image/webp'}
                   multiple
                   hidden
                   aria-hidden="true"
@@ -546,7 +549,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
                     e.target.value = ''
                   }}
                 />
-                <button className="attach-btn" type="button" aria-label="Attach images" onClick={() => fileRef.current?.click()}>
+                <button className="attach-btn" type="button" aria-label={hostFiles ? 'Attach files' : 'Attach images'} onClick={() => fileRef.current?.click()}>
                   <Icon.Paperclip size={18} />
                 </button>
               </>
@@ -572,16 +575,16 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
           </div>
         </div>
         {atts.length > 0 && (
-          <ul className="att-strip" aria-label="Images">
+          <ul className="att-strip" aria-label="Attachments">
             {atts.map((a) => (
               <li
                 className="att-chip"
                 key={a.n}
-                title={liveNs.has(a.n) ? undefined : `${marker(a.n)} is no longer in the text: it will not be sent.`}
+                title={liveNs.has(a.n) ? undefined : `${marker(a.n, a.file)} is no longer in the text: it will not be sent.`}
               >
-                <Thumb file={a.file} n={a.n} />
+                {isImageFile(a.file) ? <Thumb file={a.file} n={a.n} /> : <span className="att-filename"><bdi>{a.file.name}</bdi></span>}
                 <span className="att-n">#{a.n}</span>
-                <button className="att-x" type="button" aria-label={`Remove image #${a.n}`} onClick={() => removeAttachment(a.n)}>
+                <button className="att-x" type="button" aria-label={`Remove ${isImageFile(a.file) ? 'image' : 'file'} #${a.n}`} onClick={() => removeAttachment(a.n)}>
                   <Icon.X size={12} />
                 </button>
               </li>

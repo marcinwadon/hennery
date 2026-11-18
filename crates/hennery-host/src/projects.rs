@@ -428,6 +428,39 @@ impl Default for Probes {
 }
 
 impl Probes {
+    pub fn forget_files(&self, uplink: &Uplink, request_id: String, root: PathBuf, session: String) {
+        let Ok(permit) = self.browses.clone().try_acquire_owned() else {
+            uplink.reply(busy(request_id));
+            return;
+        };
+        let uplink = uplink.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            uplink.reply(match crate::files::forget(&root, &session) {
+                Ok(()) => HostFrame::FilesForgotten { request_id },
+                Err(_) => HostFrame::Error {
+                    request_id,
+                    code: "file_cleanup_failed".into(),
+                    message: "The host input cache could not be removed.".into(),
+                },
+            });
+        });
+    }
+    pub fn file(&self, uplink: &Uplink, request_id: String, cwd: String, path: String) {
+        use base64::Engine;
+        let Ok(permit) = self.browses.clone().try_acquire_owned() else {
+            uplink.reply(busy(request_id));
+            return;
+        };
+        let uplink = uplink.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            uplink.reply(match crate::files::read(&cwd, &path) {
+                Ok((name, bytes)) => HostFrame::File { request_id, name, data: base64::engine::general_purpose::STANDARD.encode(bytes) },
+                Err(_) => HostFrame::Error { request_id, code: "file_unavailable".into(), message: "Read a regular file below the session working directory, up to 16 MiB; symlinks are not followed.".into() },
+            });
+        });
+    }
     pub fn with_capacity(limits: Limits, lists: usize, browses: usize) -> Self {
         Self {
             catalog: crate::delegation::CatalogProbes::default(),

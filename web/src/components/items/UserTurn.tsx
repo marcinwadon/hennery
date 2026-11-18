@@ -50,6 +50,8 @@ export default function UserTurn({ item, env }: { item: ItemOf<'user_turn'>; env
             <p key={i} className="user-text">
               {block.text}
             </p>
+          ) : block.type === 'file' ? (
+            <a key={i} className="file-download" href={attachmentHref(block.sha256) ?? undefined} download={block.name}><bdi>{block.name}</bdi> · Download</a>
           ) : block.type === 'image' && SHOWN_IMAGE_TYPES.has(block.mimeType) ? (
             <Attachment key={i} mimeType={block.mimeType} sha256={block.sha256} />
           ) : (

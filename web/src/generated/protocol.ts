@@ -281,7 +281,7 @@ export type SessionConfig = { cache_retention?: CacheRetention, model?: string |
  * collector never sends a frame that needs a capability to a host that
  * lacks it.
  */
-export type Capability = "plugin_context" | "projects" | "images" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering";
+export type Capability = "plugin_context" | "projects" | "images" | "files" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering";
 
 /**
  * `hello.capabilities`. Deserialized leniently: a capability this build
@@ -644,7 +644,7 @@ parent?: string | null, entries: Array<DirEntry>,
 /**
  * Not every subdirectory is listed.
  */
-truncated: boolean, };
+truncated: boolean, } | { "type": "file", request_id: string, name: string, data: string, } | { "type": "files_forgotten", request_id: string, };
 
 /**
  * Collector -> host.
@@ -727,7 +727,7 @@ isolation_waived?: boolean, } | { "type": "steer", request_id: string, session_i
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "set_idle_hold", session_id: string, held: boolean, } | { "type": "set_idle_timeout", seconds: number | null, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, } | { "type": "forget_hat", hat_id: string, } | { "type": "forget_session", request_id: string, agent: string, agent_session_id: string, agent_home: AgentHome,
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "set_idle_hold", session_id: string, held: boolean, } | { "type": "set_idle_timeout", seconds: number | null, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, } | { "type": "read_file", request_id: string, cwd: string, path: string, } | { "type": "forget_files", request_id: string, session_id: string, } | { "type": "forget_hat", hat_id: string, } | { "type": "forget_session", request_id: string, agent: string, agent_session_id: string, agent_home: AgentHome,
 /**
  * Plan 9d-ii, B5 as ruled (the hybrid): the record's last
  * `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` answers were all
@@ -781,7 +781,7 @@ export type EditQueuedPrompt = { text: string, };
  * was sent; an image as the attachment it was stored as, never its bytes.
  * `GET /api/attachments/{sha256}` serves the image.
  */
-export type StoredBlock = { "type": "plugin_context", startup: StartupRecord, } | { "type": "text", text: string, } | { "type": "image", mimeType: string,
+export type StoredBlock = { "type": "plugin_context", startup: StartupRecord, } | { "type": "text", text: string, } | { "type": "file", name: string, mimeType: string, sha256: string, size: number, } | { "type": "image", mimeType: string,
 /**
  * The SHA-256 of the image's bytes, 64 lowercase hex digits.
  */
@@ -804,6 +804,14 @@ count: number,
  * Their size in bytes, decoded.
  */
 bytes: number, };
+
+export type ArtifactRevision = { artifact_id: string, session_id: string, revision: number, title: string, name: string, mime_type: string, sha256: string, size: number, created_at: string, };
+
+export type ArtifactPage = { artifacts: Array<ArtifactRevision>, next_cursor: string | null, };
+
+export type ArtifactListArgs = { cursor: string | null, };
+
+export type PublishArtifact = { path: string, request_key: string, title: string | null, mime_type: string | null, artifact_id: string | null, expected_revision: number | null, };
 
 /**
  * One stored timeline event, as served by REST and SSE.

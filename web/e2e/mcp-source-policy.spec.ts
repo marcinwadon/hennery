@@ -111,7 +111,7 @@ for (const width of [1280, 390]) test(`MCP source setting and confirmed attach s
     const detail = await (await page.request.get(`/api/sessions/${id}`)).json()
     expect(detail.mcp_source_policy.applied).toEqual(detail.mcp_source_policy.requested)
     expect(detail.mcp_delivery.mode).toBe('managed_plus_native')
-    expect(detail.mcp_delivery.servers).toBe(0)
+    expect(detail.mcp_delivery.servers).toBe(1)
 
     // Same host, another hat, different source permission while the first runs.
     await page.goto('/hats')

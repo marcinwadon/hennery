@@ -18,7 +18,7 @@ const enc = encodeURIComponent
 
 /** One ACP content block of a prompt, in order: a run of text, or an image
  *  as base64 (ACP core §7). */
-export type PromptBlock = { type: 'text'; text: string } | { type: 'image'; mimeType: string; data: string }
+export type PromptBlock = { type: 'text'; text: string } | { type: 'image'; mimeType: string; data: string } | { type: 'file'; name: string; mimeType: string; data: string }
 
 /** `POST /api/sessions/{id}/prompt` → 202 `{turn_id}`. */
 export function prompt(client: Client, id: string, content: PromptBlock[], requestKey?: string): Promise<PromptResponse | QueuedPromptResponse> {

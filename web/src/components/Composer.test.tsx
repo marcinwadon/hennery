@@ -622,7 +622,7 @@ describe('Composer: images', () => {
   it('says which image was refused, and why', () => {
     mount()
     paste(new File(['<svg/>'], 'v.svg', { type: 'image/svg+xml' }))
-    expect(screen.getByRole('alert')).toHaveTextContent('v.svg is not a PNG, JPEG, GIF or WebP image.')
+    expect(screen.getByRole('alert')).toHaveTextContent('This host does not support these attachments. Update it before sending files.')
     expect(textarea().value).toBe('')
   })
 
@@ -636,7 +636,7 @@ describe('Composer: images', () => {
 
   it('shows images while the host’s capabilities are not known yet', () => {
     mount(accepted, { capabilities: null })
-    expect(screen.getByRole('button', { name: 'Attach images' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeInTheDocument()
   })
 
   it('sends only the images whose marker is still in the text', async () => {

@@ -130,6 +130,7 @@ impl HostConfig {
     /// Options for every session actor this host spawns.
     pub fn session_options(&self) -> SessionOptions {
         SessionOptions {
+            files_root: Some(self.data_dir.join("session-files")),
             idle_timeout: (!self.idle_timeout.is_zero()).then_some(self.idle_timeout),
             git: self.git.clone(),
             project_roots: Some(self.project_roots.clone()),
@@ -400,6 +401,7 @@ async fn handshake(
                 Capability::CacheRetention,
                 Capability::IdleTimeout,
                 Capability::Images,
+                Capability::Files,
                 Capability::Projects,
                 Capability::ResolvePath,
                 Capability::ForgetSession,
@@ -1126,6 +1128,18 @@ fn handle(
         }
         CollectorFrame::BrowseDirectory { request_id, path } => {
             probes.browse(uplink, request_id, path, cfg.workspace_roots.clone(), cfg.home.clone())
+        }
+        CollectorFrame::ReadFile { request_id, cwd, path } => probes.file(uplink, request_id, cwd, path),
+        CollectorFrame::ForgetFiles { request_id, session_id } => {
+            if live_session(sessions, &session_id).is_some() {
+                uplink.reply(HostFrame::Error {
+                    request_id,
+                    code: "busy".into(),
+                    message: "The session is still attached; retry cleanup after it closes.".into(),
+                });
+            } else {
+                probes.forget_files(uplink, request_id, cfg.data_dir.join("session-files"), session_id);
+            }
         }
         CollectorFrame::ResolvePath { request_id, path } => probes.resolve(uplink, request_id, path, cfg.home.clone()),
         // A purged hat (plan 9c decision 12): nothing of it is kept here

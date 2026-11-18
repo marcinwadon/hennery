@@ -6,6 +6,7 @@
 
 pub mod delegation_host;
 pub mod delegation_status;
+pub mod files;
 pub mod form_schema;
 pub mod frames;
 pub mod mcp_source;

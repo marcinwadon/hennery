@@ -216,6 +216,13 @@ pub async fn execute(
 }
 pub fn error_code(error: &anyhow::Error) -> &'static str {
     const CODES: &[&str] = &[
+        "files_unsupported",
+        "file_unavailable",
+        "file_too_large",
+        "artifact_revision_conflict",
+        "request_conflict",
+        "session_changed",
+        "host_offline",
         crate::mcp_source::UNSUPPORTED,
         "not_found",
         "operation_conflict",

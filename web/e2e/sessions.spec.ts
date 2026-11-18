@@ -651,6 +651,7 @@ test.describe('redesigned session', () => {
       await context.route('**/api/**', async route => {
         const path = new URL(route.request().url()).pathname
         const json = (value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
+        if (/^\/api\/sessions\/[^/]+\/files$/.test(path) && route.request().method() === 'GET') return json({ artifacts: [], next_cursor: null, attachments: [], attachments_truncated: false })
         if (path === '/api/capabilities') return json({ mode: 'full', features: [] })
         if (path === '/api/hats') return json([{ id: 'hat1', name: 'Synthetic project', colour: '#8a3cbd' }])
         if (path === '/api/hosts') return json([{ host_id: 'host1', name: 'Test workstation', connected: true, capabilities: ['images', 'park', 'idle_hold'] }])

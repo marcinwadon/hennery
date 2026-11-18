@@ -121,6 +121,85 @@
       ],
       "type": "object"
     },
+    "ArtifactListArgs": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ArtifactPage": {
+      "properties": {
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRevision"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "artifacts"
+      ],
+      "type": "object"
+    },
+    "ArtifactRevision": {
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "session_id",
+        "revision",
+        "title",
+        "name",
+        "mime_type",
+        "sha256",
+        "size",
+        "created_at"
+      ],
+      "type": "object"
+    },
     "AttachedSession": {
       "description": "A session that a host still has an adapter for, reported in `hello`.",
       "properties": {
@@ -335,6 +414,11 @@
         {
           "const": "images",
           "description": "Image content blocks in prompts.",
+          "type": "string"
+        },
+        {
+          "const": "files",
+          "description": "Generic prompt files and bounded session artifact reads.",
           "type": "string"
         },
         {
@@ -1386,6 +1470,52 @@
             "type",
             "request_id",
             "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read a regular file below this session's canonical working directory.\nThe collector has already authorized the session; the host applies the\ndescriptor-relative filesystem fence. Never sent without `files`.",
+          "properties": {
+            "cwd": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "read_file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "cwd",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Remove only the host-managed input cache of a deleted collector session.",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "forget_files",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id"
           ],
           "type": "object"
         },
@@ -2681,6 +2811,46 @@
             "path",
             "entries",
             "truncated"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "name",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "files_forgotten",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id"
           ],
           "type": "object"
         }
@@ -5097,6 +5267,48 @@
       ],
       "type": "object"
     },
+    "PublishArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_revision": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "request_key": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "request_key"
+      ],
+      "type": "object"
+    },
     "PurgePreview": {
       "description": "`GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):\nwhat a purge of the hat would delete, read only. Tombstones are not\ncounted.",
       "properties": {
@@ -7092,6 +7304,36 @@
           "required": [
             "type",
             "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mimeType": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "file",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "mimeType",
+            "sha256",
+            "size"
           ],
           "type": "object"
         },

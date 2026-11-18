@@ -74,6 +74,36 @@ impl Store {
         if !granted_in(tx, self.owner_id(), identity, revision)? {
             return Ok(None);
         }
+        self.authenticated_session_context_in(tx, identity, revision, mutation)
+    }
+    pub fn file_tool_context(&self, identity: &SessionIdentity, mutation: bool) -> Result<Option<SessionToolContext>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        self.file_tool_context_in(&tx, identity, mutation)
+    }
+    pub fn file_tool_context_in(
+        &self,
+        tx: &Transaction<'_>,
+        identity: &SessionIdentity,
+        mutation: bool,
+    ) -> Result<Option<SessionToolContext>> {
+        if identity.owner_id != self.owner_id() {
+            return Ok(None);
+        }
+        if !hennery_gateway::identity::resolve_in(tx, self.owner_id(), identity.generation())?
+            .is_some_and(|current| current.principal == identity.principal)
+        {
+            return Ok(None);
+        }
+        self.authenticated_session_context_in(tx, identity, 0, mutation)
+    }
+    fn authenticated_session_context_in(
+        &self,
+        tx: &Transaction<'_>,
+        identity: &SessionIdentity,
+        revision: i64,
+        mutation: bool,
+    ) -> Result<Option<SessionToolContext>> {
         let PrincipalKind::Session { session_id, host_id } = &identity.principal.kind;
         let row: Option<CallerRow> = tx.query_row(
             "SELECT s.cwd, s.agent, h.capabilities, h.mcp_isolation, s.mcp_delivery_mode

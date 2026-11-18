@@ -3078,7 +3078,11 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         &store,
         "s1",
         "t1",
-        vec![json!({"type": "text", "text": "see"}), image(&a)],
+        vec![
+            json!({"type": "text", "text": "see"}),
+            image(&a),
+            json!({"type":"file","name":"input.png","mimeType":"application/octet-stream","data":base64::engine::general_purpose::STANDARD.encode(&a)}),
+        ],
     );
     store.ingest("s1", 5, &turn_started("t1")).unwrap();
     store.ingest("s1", 6, &permission("p1")).unwrap();
@@ -3178,6 +3182,19 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
              0,1,id,id FROM sessions WHERE id IN ('s1','s2');",
     )
     .unwrap();
+    for (session, bytes) in [("s1", &a), ("s2", &kept)] {
+        let request = hennery_proto::files::PublishArtifact {
+            path: "report.png".into(),
+            request_key: "publication".into(),
+            title: None,
+            mime_type: None,
+            artifact_id: None,
+            expected_revision: None,
+        };
+        store
+            .publish_artifact(session, "h1", "hat-1", &request, "report.png", bytes, None)
+            .unwrap();
+    }
     store.close_now("s1").unwrap();
     let s1_uploads = ids("SELECT id FROM external_uploads WHERE session_id=?1", "s1");
     let s2_uploads = ids("SELECT id FROM external_uploads WHERE session_id=?1", "s2");
@@ -3190,6 +3207,9 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         "events",
         "pending",
         "session_catalog",
+        "session_artifacts",
+        "artifact_revisions",
+        "file_cache_cleanup",
         "prompt_receipts",
         "runtime_catalog",
         "session_families",
@@ -3214,7 +3234,9 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     // `host_forgets` is written by the delete itself (plan 9d decision 2):
     // empty before it.
     assert!(
-        before.iter().all(|(t, n)| *n > 0 || t == "host_forgets"),
+        before
+            .iter()
+            .all(|(t, n)| *n > 0 || t == "host_forgets" || t == "file_cache_cleanup"),
         "nothing to delete somewhere: {before:?}"
     );
     let s2_before = {
@@ -3239,6 +3261,8 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     for (table, n) in &after {
         let left = match table.as_str() {
             "sessions" | "events" => 1,
+            // The host-managed input copy is retried until its host confirms removal.
+            "file_cache_cleanup" => 1,
             // s2 still uses the agent session s1 had (`a0`): nothing is
             // left to remove on the host for it (plan 9d B8).
             "host_forgets" => 0,

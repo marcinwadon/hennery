@@ -32,6 +32,9 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Body {
+    Artifact {
+        artifact: hennery_proto::files::ArtifactRevision,
+    },
     PluginContext {
         startup: hennery_proto::plugin::StartupRecord,
     },

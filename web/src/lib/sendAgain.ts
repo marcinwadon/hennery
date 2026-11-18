@@ -11,11 +11,11 @@ import { ALLOWED_IMAGE_TYPES } from './image'
 
 /** A block of the turn as the composer takes it back: a run of text, or an
  *  image as a file. */
-export type DraftPart = { type: 'text'; text: string } | { type: 'image'; file: File }
+export type DraftPart = { type: 'text'; text: string } | { type: 'image' | 'file'; file: File }
 
 /** `GET /api/attachments/{sha256}` as a file of type `mimeType`. */
-async function attachment(client: Client, sha256: string, mimeType: string, n: number, signal: AbortSignal): Promise<File> {
-  const response = await client.open(`/api/attachments/${encodeURIComponent(sha256)}`, { Accept: 'image/*' }, signal)
+async function attachment(client: Client, sha256: string, mimeType: string, n: number, signal: AbortSignal, name?: string): Promise<File> {
+  const response = await client.open(`/api/attachments/${encodeURIComponent(sha256)}`, { Accept: '*/*' }, signal)
   if (!response.ok) {
     void response.body?.cancel().catch(() => {})
     throw new ApiFailure(response.status, {
@@ -24,7 +24,7 @@ async function attachment(client: Client, sha256: string, mimeType: string, n: n
     })
   }
   const bytes = await response.arrayBuffer()
-  return new File([bytes], `image-${n}`, { type: mimeType })
+  return new File([bytes], name ?? `image-${n}`, { type: mimeType })
 }
 
 /** The undelivered turn `turnId` of session `sessionId`, rebuilt as draft
@@ -38,7 +38,7 @@ export async function undeliveredDraft(
 ): Promise<DraftPart[]> {
   const turn = await undeliveredTurn(client, sessionId, turnId, signal)
   for (const block of turn.content) {
-    if (block.type === 'text') continue
+    if (block.type === 'text' || block.type === 'file') continue
     if (block.type === 'image' && ALLOWED_IMAGE_TYPES.has(block.mimeType)) continue
     throw new Error('This prompt holds content that cannot be sent again.')
   }
@@ -46,8 +46,8 @@ export async function undeliveredDraft(
   let n = 0
   for (const block of turn.content) {
     if (block.type === 'text') parts.push({ type: 'text', text: block.text })
-    else if (block.type === 'image') {
-      parts.push({ type: 'image', file: await attachment(client, block.sha256, block.mimeType, ++n, signal) })
+    else if (block.type === 'image' || block.type === 'file') {
+      parts.push({ type: block.type, file: await attachment(client, block.sha256, block.mimeType, ++n, signal, block.type === 'file' ? block.name : undefined) })
     }
   }
   return parts

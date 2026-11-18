@@ -648,3 +648,140 @@ async fn usage(c: &reqwest::Client, collector: &Collector) -> AttachmentUsage {
         .await
         .unwrap()
 }
+
+/// Generic uploads share image admission/storage, while old hosts refuse them.
+#[tokio::test]
+async fn generic_files_cross_the_prompt_wire_and_remain_downloadable() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, Capabilities(vec![Capability::Files])).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = prompt_url(&collector, &session);
+    let content =
+        vec![json!({"type":"file","name":"data.csv","mimeType":"text/csv","data":STANDARD.encode(b"a,b\n1,2\n")})];
+    let expected = content.clone();
+    let call = tokio::spawn(async move { post(&c, url, &json!({"content":content})).await });
+    assert_eq!(accept_prompt(&mut host, &session).await, expected);
+    assert_eq!(call.await.unwrap().0, 202);
+    let c = client(&collector);
+    let response = c
+        .get(collector.url(&format!("/api/attachments/{}", sha(b"a,b\n1,2\n"))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-disposition"], "attachment");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"a,b\n1,2\n");
+    collector.state.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn generic_files_are_visibly_refused_by_an_older_host() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, Capabilities(vec![Capability::Images])).await;
+    let session = started_session(&collector, &mut host).await;
+    let result = post(
+        &client(&collector),
+        prompt_url(&collector, &session),
+        &json!({"content":[{"type":"file","name":"data.csv","mimeType":"text/csv","data":"eA=="}]}),
+    )
+    .await;
+    assert_eq!(result.0, 409);
+    assert_eq!(result.1["code"], "files_unsupported");
+    host.nothing_more().await;
+    collector.state.shutdown.cancel();
+}
+
+#[tokio::test]
+async fn published_artifact_revisions_download_after_host_disconnect_and_retries_do_not_read_again() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, Capabilities(vec![Capability::Files])).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let mut previous = Value::Null;
+    for (key, text) in [("first", "# First"), ("second", "# Second")] {
+        let mut q = json!({"path":"report.md","request_key":key});
+        if key == "second" {
+            q["artifact_id"] = previous["artifact_id"].clone();
+            q["expected_revision"] = json!(1)
+        }
+        let request = q.clone();
+        let url = collector.url(&format!("/api/sessions/{session}/files"));
+        let cc = c.clone();
+        let call = tokio::spawn(async move { post(&cc, url, &request).await });
+        let CollectorFrame::ReadFile { request_id, cwd, path } = host.next().await else {
+            panic!("expected read file")
+        };
+        assert_eq!(cwd, "/tmp");
+        assert_eq!(path, "report.md");
+        host.send(&HostFrame::File {
+            request_id,
+            name: "report.md".into(),
+            data: STANDARD.encode(text),
+        })
+        .await;
+        let (status, result) = call.await.unwrap();
+        assert_eq!(status, 200, "{result}");
+        let replay = post(&c, collector.url(&format!("/api/sessions/{session}/files")), &q).await;
+        assert_eq!(replay, (200, result.clone()));
+        host.nothing_more().await;
+        previous = result;
+    }
+    let artifact = previous["artifact_id"].as_str().unwrap();
+    let path = |revision| collector.url(&format!("/api/sessions/{session}/artifacts/{artifact}/{revision}"));
+    host.ws.close(None).await.unwrap();
+    for (revision, text) in [(1, "# First"), (2, "# Second")] {
+        let response = c.get(path(revision)).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            response.headers()["content-disposition"]
+                .to_str()
+                .unwrap()
+                .contains("filename*=UTF-8''")
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.text().await.unwrap(), text);
+    }
+    assert_eq!(reqwest::get(path(1)).await.unwrap().status(), 401);
+    assert_eq!(
+        c.get(collector.url(&format!("/api/sessions/unknown/artifacts/{artifact}/1")))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let files: Value = c
+        .get(collector.url(&format!("/api/sessions/{session}/files")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(files["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(files["artifacts"][0]["revision"], 2);
+    let history: Value = c
+        .get(collector.url(&format!("/api/sessions/{session}/artifacts/{artifact}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(history["revisions"].as_array().unwrap().len(), 2);
+    collector
+        .state
+        .store
+        .delete_session(
+            &session,
+            Some(&hennery_sessions::store::Unattached {
+                lifecycle: "active".into(),
+                presumed_parked: false,
+            }),
+        )
+        .unwrap();
+    assert_eq!(c.get(path(1)).send().await.unwrap().status(), 404);
+    collector.state.shutdown.cancel();
+}

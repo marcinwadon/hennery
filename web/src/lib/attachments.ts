@@ -16,8 +16,8 @@ export interface Attachment {
   file: File
 }
 
-export function marker(n: number): string {
-  return `[Image #${n}]`
+export function marker(n: number, file?: File): string {
+  return `[${file && !ALLOWED_IMAGE_TYPES.has(file.type) ? 'File' : 'Image'} #${n}]`
 }
 
 /** The greatest N a marker may name. A marker of more digits is plain
@@ -27,7 +27,7 @@ export const MAX_MARKER = 999_999
 
 /** What `marker` writes: N from 1 to `MAX_MARKER`, with no leading zero.
  *  Anything else (`[Image #01]`, seven digits) is plain text. */
-const MARKER = /\[Image #([1-9]\d{0,5})\]/g
+const MARKER = /\[(?:Image|File) #([1-9]\d{0,5})\]/g
 
 /** `text` with every `[Image #` made plain text, readable as it was: a
  *  word joiner (U+2060, invisible) after the bracket. For words an agent
@@ -36,7 +36,7 @@ const MARKER = /\[Image #([1-9]\d{0,5})\]/g
  *  operator took out of the text. Never for the operator's own words: a
  *  turn put back goes back byte for byte. */
 export function inertMarkers(text: string): string {
-  return text.replaceAll('[Image #', '[\u2060Image #')
+  return text.replaceAll('[Image #', '[\u2060Image #').replaceAll('[File #', '[\u2060File #')
 }
 
 /** The greatest N any marker in `text` names (0 for none): a draft restored
@@ -64,14 +64,14 @@ export function admit(held: readonly Attachment[], files: readonly File[], nextN
   let n = nextN
   for (const file of files) {
     const name = file.name || 'image'
-    if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
-      refused.push(`${name} is not a PNG, JPEG, GIF or WebP image.`)
+    if (!file.name || new TextEncoder().encode(name).length > 255 || Array.from(name).some(c => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 || c === '/' || c === '\\') || name === '.' || name === '..') {
+      refused.push(`${name}: use a plain filename of at most 255 bytes.`)
     } else if (file.size > MAX_IMAGE_BYTES) {
       refused.push(`${name} is over 5 MiB.`)
     } else if (count >= MAX_IMAGES) {
-      refused.push(`${name}: a prompt takes at most ${MAX_IMAGES} images.`)
+      refused.push(`${name}: a prompt takes at most ${MAX_IMAGES} attachments.`)
     } else if (total + file.size > MAX_TOTAL_BYTES) {
-      refused.push(`${name}: a prompt takes at most 16 MiB of images in all.`)
+      refused.push(`${name}: a prompt takes at most 16 MiB of attachments in all.`)
     } else if (n > MAX_MARKER) {
       refused.push(`${name}: this draft has no image number left; send it first.`)
     } else {
@@ -93,16 +93,17 @@ export function splice(text: string, start: number, end: number, inserted: strin
 
 /** `text` without the first `[Image #n]` marker (and one space after it). */
 export function withoutMarker(text: string, n: number): string {
-  const at = text.indexOf(marker(n))
+  const token = text.includes(marker(n)) ? marker(n) : `[File #${n}]`
+  const at = text.indexOf(token)
   if (at < 0) return text
-  let end = at + marker(n).length
+  let end = at + token.length
   if (text[end] === ' ') end++
   return text.slice(0, at) + text.slice(end)
 }
 
 /** The attachments whose marker is still in `text`. */
 export function live(text: string, held: readonly Attachment[]): Attachment[] {
-  return held.filter((a) => text.includes(marker(a.n)))
+  return held.filter((a) => text.includes(marker(a.n, a.file)))
 }
 
 /** The prompt as ordered blocks: runs of text, and each live image in place
@@ -123,13 +124,15 @@ export async function promptBlocks(text: string, held: readonly Attachment[]): P
     const attachment = byN.get(n)
     run += text.slice(from, m.index)
     from = m.index + m[0].length
-    if (!attachment || placed.has(n)) {
+    if (!attachment || m[0] !== marker(n, attachment.file) || placed.has(n)) {
       run += m[0]
       continue
     }
     placed.add(n)
     flush()
-    blocks.push({ type: 'image', mimeType: attachment.file.type, data: await fileToBase64(attachment.file) })
+    const file = attachment.file
+    const data = await fileToBase64(file)
+    blocks.push(ALLOWED_IMAGE_TYPES.has(file.type) ? { type: 'image', mimeType: file.type, data } : { type: 'file', name: file.name, mimeType: file.type || 'application/octet-stream', data })
   }
   run += text.slice(from)
   flush()

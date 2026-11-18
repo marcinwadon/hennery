@@ -24,7 +24,7 @@ use hennery_kernel::operator::Operator;
 use hennery_kernel::secret::unix_now;
 use hennery_proto::frames::{McpServer, NameValue};
 use hennery_proto::rest::McpSessionDeliveryMode;
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::sync::Arc;
 
 /// The session a start or resume is for, as its row says.
@@ -215,13 +215,25 @@ impl SessionMcp for GatewayMcp {
             });
         }
         let slugs = mounted_slugs_in(tx, owner, session.host_id, session.hat_id)?;
+        // File tools are independent of delegation. Only capable hosts receive
+        // this descriptor; their ordinary session token is the identity fence.
+        let files = self.builtin
+            && tx
+                .query_row(
+                    "SELECT capabilities FROM hosts WHERE owner_id = ?1 AND id=?2 AND revoked_at IS NULL",
+                    params![owner, session.host_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|s| serde_json::from_str::<hennery_proto::frames::Capabilities>(&s).ok())
+                .is_some_and(|caps| caps.has(hennery_proto::frames::Capability::Files));
         let builtin = if self.builtin {
             crate::identity::builtin_in(tx, owner, session.hat_id)?
         } else {
             None
         };
         let mut servers = Vec::with_capacity(slugs.len() + usize::from(builtin.is_some()));
-        if slugs.is_empty() && builtin.is_none() {
+        if slugs.is_empty() && builtin.is_none() && !files {
             // No connection to reach: no token at all.
             tokens::revoke_in(tx, owner, session.session_id, now)?;
         } else {
@@ -240,6 +252,16 @@ impl SessionMcp for GatewayMcp {
             )?;
             if let Some(builtin) = builtin {
                 servers.push(builtin.server(public.origin(), token.expose()));
+            }
+            if files {
+                servers.push(McpServer::Http {
+                    name: "hennery_files".into(),
+                    url: format!("{}/mcp/builtin/files", public.origin()),
+                    headers: vec![hennery_proto::frames::NameValue::new(
+                        "Authorization",
+                        format!("Bearer {}", token.expose()),
+                    )],
+                });
             }
             for slug in slugs {
                 let connection: String = tx.query_row(

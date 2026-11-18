@@ -481,6 +481,7 @@ END;",
     include_str!("work.sql"),
     include_str!("external_capacity.sql"),
     include_str!("steering.sql"),
+    include_str!("files.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -1033,7 +1034,7 @@ fn image_hashes<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> Vec<(usize, 
     blocks
         .into_iter()
         .enumerate()
-        .filter(|(_, block)| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter(|(_, block)| matches!(block.get("type").and_then(Value::as_str), Some("image" | "file")))
         .filter_map(|(position, block)| Some((position, block.get("sha256")?.as_str()?)))
         .collect()
 }
@@ -1075,7 +1076,8 @@ pub(crate) fn drop_unreferenced(tx: &Transaction<'_>, owner: &str, hashes: &BTre
             "DELETE FROM attachments WHERE owner_id = ?1 AND sha256 = ?2
                  AND NOT EXISTS (SELECT 1 FROM turn_attachments WHERE owner_id = ?1 AND sha256 = ?2)
                  AND NOT EXISTS (SELECT 1 FROM event_attachments WHERE owner_id = ?1 AND sha256 = ?2)
-                 AND NOT EXISTS (SELECT 1 FROM prompt_queue_attachments WHERE owner_id = ?1 AND sha256 = ?2)",
+                 AND NOT EXISTS (SELECT 1 FROM prompt_queue_attachments WHERE owner_id = ?1 AND sha256 = ?2)
+                 AND NOT EXISTS (SELECT 1 FROM artifact_revisions WHERE owner_id = ?1 AND sha256 = ?2)",
             [owner, sha256],
         )?;
         if gone == 1 {
@@ -3230,7 +3232,8 @@ impl Store {
                  AND NOT EXISTS (SELECT 1 FROM event_attachments
                      WHERE event_attachments.owner_id = ?1 AND event_attachments.sha256 = attachments.sha256)
                  AND NOT EXISTS (SELECT 1 FROM prompt_queue_attachments
-                     WHERE prompt_queue_attachments.owner_id = ?1 AND prompt_queue_attachments.sha256 = attachments.sha256)",
+                     WHERE prompt_queue_attachments.owner_id = ?1 AND prompt_queue_attachments.sha256 = attachments.sha256)
+                 AND NOT EXISTS (SELECT 1 FROM artifact_revisions r WHERE r.owner_id = ?1 AND r.sha256 = attachments.sha256)",
             [&self.owner],
         )?;
         let mut report = SweepReport {
@@ -3370,6 +3373,7 @@ impl Store {
                 _ => return Ok(Deletion::Refused(lifecycle)),
             }
         }
+        crate::files::queue_cleanup_in(&tx, &self.owner, session_id, &host_id)?;
         let hashes: BTreeSet<String> = {
             let mut stmt = tx.prepare(
                 "SELECT sha256 FROM turn_attachments
@@ -3378,7 +3382,8 @@ impl Store {
                  SELECT sha256 FROM event_attachments
                  WHERE owner_id = ?2 AND event_id IN (SELECT event_id FROM events WHERE session_id = ?1 AND owner_id = ?2)
                  UNION SELECT a.sha256 FROM prompt_queue_attachments a JOIN session_dispatch_queue q ON q.owner_id = ?2 AND q.operation_id=a.operation_id
-                 WHERE a.owner_id = ?2 AND q.target_id=?1",
+                 WHERE a.owner_id = ?2 AND q.target_id=?1
+                 UNION SELECT sha256 FROM artifact_revisions WHERE owner_id = ?2 AND session_id=?1",
             )?;
             let rows = stmt.query_map([session_id, &self.owner], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
@@ -3427,6 +3432,10 @@ impl Store {
         tx.execute(
             "DELETE FROM events WHERE session_id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
+        )?;
+        tx.execute(
+            "DELETE FROM session_artifacts WHERE owner_id = ?1 AND session_id=?2",
+            params![self.owner, session_id],
         )?;
         // The kernel's table, on this transaction (R3). The path compares
         // byte for byte (`=`, the column's BINARY collation; R4), and only a

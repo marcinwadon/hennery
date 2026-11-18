@@ -40,7 +40,12 @@ impl Store {
             .optional()?
             .context("queue_item_unavailable")?;
         let stored: Vec<StoredBlock> = serde_json::from_str(&payload)?;
-        let Some(content) = self.queued_content(&stored, hub.has_capability(&host, Capability::Images))? else {
+        let Some(content) = self.queued_content(
+            &stored,
+            hub.has_capability(&host, Capability::Images),
+            hub.has_capability(&host, Capability::Files),
+        )?
+        else {
             self.fail_operator_item_in(&tx, id, "image_unavailable")?;
             tx.commit()?;
             return Ok(());

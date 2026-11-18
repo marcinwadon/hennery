@@ -29,6 +29,8 @@ pub enum Capability {
     Projects,
     /// Image content blocks in prompts.
     Images,
+    /// Generic prompt files and bounded session artifact reads.
+    Files,
     /// Explicit park (`park_session`).
     Park,
     /// Collector-controlled suppression of automatic idle parking.
@@ -972,6 +974,14 @@ pub enum HostFrame {
         /// Not every subdirectory is listed.
         truncated: bool,
     },
+    File {
+        request_id: String,
+        name: String,
+        data: String,
+    },
+    FilesForgotten {
+        request_id: String,
+    },
 }
 
 /// A collector frame that is not a probe (`CollectorFrame::probe_capability`).
@@ -987,6 +997,8 @@ impl CollectorFrame {
     pub fn probe_capability(&self) -> Result<Option<Capability>, NotAProbe> {
         match self {
             Self::ListProjects { .. } | Self::BrowseDirectory { .. } => Ok(Some(Capability::Projects)),
+            Self::ReadFile { .. } => Ok(Some(Capability::Files)),
+            Self::ForgetFiles { .. } => Ok(Some(Capability::Files)),
             Self::ResolvePath { .. } => Ok(Some(Capability::ResolvePath)),
             Self::ProbeCatalog { .. } => Ok(Some(Capability::CatalogProbe)),
             // Not a probe of state, but carried as one (`session_forgotten`).
@@ -1041,6 +1053,8 @@ impl CollectorFrame {
             | Self::CloseSession { .. }
             | Self::ListProjects { .. }
             | Self::BrowseDirectory { .. }
+            | Self::ReadFile { .. }
+            | Self::ForgetFiles { .. }
             | Self::ForgetHat { .. }
             | Self::ForgetSession { .. } => None,
         }
@@ -1066,6 +1080,8 @@ impl HostFrame {
             Self::Catalog { request_id, .. }
             | Self::Projects { request_id, .. }
             | Self::Directory { request_id, .. }
+            | Self::File { request_id, .. }
+            | Self::FilesForgotten { request_id }
             | Self::ResolvedPath { request_id, .. }
             | Self::SessionForgotten { request_id, .. } => Some(request_id),
             Self::Authenticate { .. }
@@ -1283,6 +1299,19 @@ pub enum CollectorFrame {
     BrowseDirectory {
         request_id: String,
         path: String,
+    },
+    /// Read a regular file below this session's canonical working directory.
+    /// The collector has already authorized the session; the host applies the
+    /// descriptor-relative filesystem fence. Never sent without `files`.
+    ReadFile {
+        request_id: String,
+        cwd: String,
+        path: String,
+    },
+    /// Remove only the host-managed input cache of a deleted collector session.
+    ForgetFiles {
+        request_id: String,
+        session_id: String,
     },
     /// A hat the operator purged (kernel spec §5.5; plan 9c decisions 10
     /// and 12, A7): sent after every reconciled handshake, one per purged
