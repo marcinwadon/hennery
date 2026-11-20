@@ -2,10 +2,14 @@
 
 ## Unreleased
 
-- Add the Skills catalogue (phase 1): upload Agent Skills directories once on
-  the **Skills** screen, choose the hosts that receive each skill, and the host
-  links it into `~/.claude/skills` and `~/.codex/skills`. Behind the `skills`
-  feature flag; hook sets are not built yet.
+- Add the Skills catalogue: upload Agent Skills directories once on the
+  **Skills** screen, choose the hosts that receive each skill, and the host
+  links it into `~/.claude/skills` and `~/.codex/skills` (phase 1, behind the
+  `skills` feature flag). Add hook sets (phase 2, behind the `hook_sets` flag):
+  command hooks assigned per host on the **Hook sets** tab, injected into each
+  session at start through the adapter (Codex trust is recorded by the host)
+  and shown in session details. A start fails closed when the hooks cannot be
+  applied.
 
 ## 0.6.0
 

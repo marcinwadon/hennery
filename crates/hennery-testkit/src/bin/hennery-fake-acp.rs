@@ -13,7 +13,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::{ConnectionTo, Responder, SentRequest};
 use agent_client_protocol::{Agent, Client, Stdio, UntypedMessage};
-use hennery_testkit::{CRASH_EXIT_CODE, FakeAsk, FakeScript, SCRIPT_ENV};
+use hennery_testkit::{CRASH_EXIT_CODE, FakeAsk, FakeCodexHooks, FakeHookEntry, FakeScript, SCRIPT_ENV};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,11 @@ async fn main() -> agent_client_protocol::Result<()> {
 
     for line in &script.stderr_lines {
         eprintln!("{line}");
+    }
+    // codex-acp reads its per-process config from `CODEX_CONFIG` at start
+    // (skills spec §8): logged so a test sees what the host passed.
+    if let Ok(config) = std::env::var("CODEX_CONFIG") {
+        log_line(&script, serde_json::json!({ "env": { "CODEX_CONFIG": config } }));
     }
     if let Some(path) = &script.grandchild_pid_file {
         // Detached from our stdio so it cannot hold the ACP pipes open; it
@@ -583,6 +588,12 @@ async fn main() -> agent_client_protocol::Result<()> {
         )
         .on_receive_request(
             async move |req: UntypedMessage, responder, cx| {
+                if let Some(hooks) = &script.codex_hooks
+                    && let Some(answer) = codex_hooks(hooks, req.method(), req.params())
+                {
+                    log_session(&script, req.method(), req.params());
+                    return responder.respond(answer);
+                }
                 if req.method() != "_session/steering" || !steering {
                     return responder.respond_with_error(agent_client_protocol::Error::method_not_found());
                 }
@@ -911,16 +922,52 @@ fn write_stdout_line(line: &str) {
 /// One `session_log` line: the request as parsed, so an entry the schema
 /// could not take is missing from it, as from a real adapter's view.
 fn log_session(script: &FakeScript, method: &str, params: &impl serde::Serialize) {
+    log_line(script, serde_json::json!({ "method": method, "params": params }));
+}
+
+/// Append `line` to the script's `session_log`, if it has one.
+fn log_line(script: &FakeScript, line: serde_json::Value) {
     let Some(path) = &script.session_log else {
         return;
     };
-    let line = serde_json::json!({ "method": method, "params": params });
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .expect("open the session log");
     writeln!(log, "{line}").expect("write the session log");
+}
+
+/// codex-acp's answer to its hook extension methods, in the shapes the
+/// pinned adapter answers (skills spec §8): `None` for any other method.
+/// The listing is that of the `CODEX_CONFIG` the fake actually started with
+/// (after any `env` wrapper: the fake is the program it runs), unless the
+/// script overrides it.
+fn codex_hooks(hooks: &FakeCodexHooks, method: &str, params: &serde_json::Value) -> Option<serde_json::Value> {
+    match method {
+        "_codex/hooks/list" => {
+            let entries = hooks.override_list.clone().unwrap_or_else(|| {
+                std::env::var("CODEX_CONFIG")
+                    .map(|config| FakeHookEntry::listed_from(&config))
+                    .unwrap_or_default()
+            });
+            Some(serde_json::json!({
+                "cwd": params["cwd"],
+                "hooks": entries.iter().map(|entry| serde_json::json!({
+                    "key": entry.key,
+                    "handlerType": entry.handler_type,
+                    "command": entry.command,
+                    "matcher": entry.matcher,
+                    "timeoutSec": entry.timeout_sec,
+                    "currentHash": entry.current_hash,
+                    "source": "sessionFlags",
+                    "trustStatus": "untrusted",
+                })).collect::<Vec<_>>(),
+            }))
+        }
+        "_codex/hooks/trust" => Some(serde_json::json!({ "trusted": hooks.trusted })),
+        _ => None,
+    }
 }
 
 /// Record a switch in the script's `config_log`, if it has one.

@@ -52,6 +52,7 @@ mod prompt_queue_head_tests {
         assert!(store.operator_dispatch_id("removed-session-head").unwrap().is_none());
     }
 }
+mod hook_sets_api;
 pub mod push;
 mod redact;
 mod resolve;
@@ -223,6 +224,7 @@ pub fn router(state: AppState) -> Router {
         .merge(hats::router(state.clone()))
         .merge(session_defaults_api::router(state.clone()))
         .merge(skills_api::router(state.clone()))
+        .merge(hook_sets_api::router(state.clone()))
         .merge(idle_parking::router(state.clone()))
         .merge(projects::router(state.clone()))
         .merge(files::router(state.clone()))

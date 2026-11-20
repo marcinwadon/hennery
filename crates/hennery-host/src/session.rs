@@ -271,12 +271,18 @@ pub struct Launch {
     /// Passed in `session/new` / `session/load` (plan 8c); their secret
     /// values are redacted from what the session reports.
     pub mcp_servers: Vec<McpServer>,
+    /// The session's hook sets (skills spec §8), rendered for `profile`
+    /// before the adapter is spawned.
+    pub hooks: Option<hennery_proto::frames::HookDelivery>,
 }
 
 /// The connection task's handle on a session actor.
 #[derive(Clone)]
 pub struct SessionHandle {
     mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
+    /// The `content_hash` of each hook set the actor was launched with, in
+    /// delivery order: a live actor keeps its adapter's hooks.
+    hook_set_hashes: Vec<String>,
     attach_generation: Option<u64>,
     commands: mpsc::UnboundedSender<SessionCmd>,
     turns: Arc<Mutex<PromptTurns>>,
@@ -357,6 +363,11 @@ impl SessionHandle {
 
     pub fn attach_generation(&self) -> Option<u64> {
         self.attach_generation
+    }
+
+    /// See `hook_set_hashes`.
+    pub fn hook_set_hashes(&self) -> &[String] {
+        &self.hook_set_hashes
     }
     /// The agent's own session id, if known yet (plan 9d B7): a forget for
     /// it is refused while this actor has not ended.
@@ -460,6 +471,7 @@ pub fn spawn(
         cwd,
         profile: Profile::default(),
         mcp_servers: Vec::new(),
+        hooks: None,
     };
     self::launch(uplink, launch, options)
 }
@@ -486,6 +498,7 @@ pub fn resume(
         cwd,
         profile: Profile::default(),
         mcp_servers: Vec::new(),
+        hooks: None,
     };
     self::launch(uplink, launch, options)
 }
@@ -534,8 +547,14 @@ fn launch_inner(
         Attach::Load { agent_session_id } => Some(agent_session_id.clone()),
         Attach::New => None,
     }));
+    let hook_set_hashes = hook_set_hashes(launch.hooks.as_ref());
     let actor = Actor {
         cache_retention: (launch.profile == Profile::Claude).then_some(launch.config.cache_retention),
+        hook_sets_applied: launch
+            .hooks
+            .as_ref()
+            .map(|hooks| crate::hook_sets::applied(launch.profile, hooks))
+            .unwrap_or_default(),
         mcp_source_policy: launch.mcp_source_policy.clone(),
         catalog_identity: crate::delegation::catalog_identity(&launch.agent, launch.profile),
         workspace_roots,
@@ -564,6 +583,7 @@ fn launch_inner(
     });
     SessionHandle {
         mcp_source_policy,
+        hook_set_hashes,
         attach_generation,
         commands: tx,
         turns,
@@ -571,6 +591,13 @@ fn launch_inner(
         ending,
         agent_session_id,
     }
+}
+
+/// The `content_hash` of each set in `hooks`, in delivery order.
+pub fn hook_set_hashes(hooks: Option<&hennery_proto::frames::HookDelivery>) -> Vec<String> {
+    hooks
+        .map(|hooks| hooks.sets.iter().map(|set| set.content_hash.clone()).collect())
+        .unwrap_or_default()
 }
 
 type Reply = Pin<Box<dyn Future<Output = agent_client_protocol::Result<PromptResponse>> + Send>>;
@@ -941,6 +968,8 @@ impl Drop for AcpTask {
 
 struct Actor {
     cache_retention: Option<hennery_proto::usage::CacheRetention>,
+    /// The delivered hook sets that reach the agent (skills spec §8).
+    hook_sets_applied: Vec<hennery_proto::frames::HookSetApplied>,
     mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     catalog_identity: hennery_proto::delegation_host::CatalogIdentity,
     workspace_roots: Option<Vec<PathBuf>>,
@@ -1157,6 +1186,7 @@ impl Actor {
         let mut indexed = self.catalogue_extracts();
         indexed.steering_supported = steering_supported;
         indexed.cache_retention = self.cache_retention;
+        indexed.hook_sets_applied = self.hook_sets_applied.clone();
         indexed.mcp_source_policy = self.mcp_source_policy.clone();
         if indexed.current_config().is_some() {
             let mut identity = self.catalog_identity.clone();
@@ -1276,6 +1306,7 @@ impl Actor {
             cwd,
             profile,
             mcp_servers,
+            hooks,
             ..
         } = launch;
         if let Err(message) = crate::usage::retention(&mut agent, profile, config.cache_retention) {
@@ -1287,9 +1318,50 @@ impl Actor {
                 },
             );
         }
+        // Before anything is spawned: the agent's own `CODEX_CONFIG` (in its
+        // environment, or the argument of an `env(1)` wrapper, which wins at
+        // exec time) takes the hooks, or the start fails (skills spec §8,
+        // fail-closed).
+        let codex_source = crate::hook_sets::operator_codex_config(&agent);
+        let hooks = match hooks
+            .as_ref()
+            .map(|hooks| {
+                let existing = match &codex_source {
+                    Ok(Some(source)) => Some(crate::hook_sets::codex_config_text(&agent, *source)),
+                    _ => None,
+                };
+                let rendered = crate::hook_sets::render(profile, hooks, existing)?;
+                match &codex_source {
+                    // An `env -i` wrapper would drop the config hennery passes.
+                    Err(error) if rendered.codex_config.is_some() => Err(error.clone()),
+                    _ => Ok(rendered),
+                }
+            })
+            .transpose()
+        {
+            Ok(rendered) => rendered.unwrap_or_default(),
+            Err(error) => {
+                let code = match error {
+                    crate::hook_sets::HookSetsError::Unsupported => "hook_sets_unsupported",
+                    _ => "hook_sets_refused",
+                };
+                return self.start_failed(
+                    request_id,
+                    StartError {
+                        code,
+                        message: error.to_string(),
+                    },
+                );
+            }
+        };
+        debug_assert_eq!(hooks.applied, self.hook_sets_applied);
+        let codex_trust = hooks.codex_hooks;
+        if let Some(config) = hooks.codex_config {
+            crate::hook_sets::deliver_codex_config(&mut agent, codex_source.ok().flatten(), config);
+        }
         let mcp = SessionMcp {
             servers: crate::profile::acp_servers(&mcp_servers),
-            meta: profile.session_meta_for(self.mcp_source_policy.as_ref()),
+            meta: profile.session_meta_with_hooks(self.mcp_source_policy.as_ref(), hooks.claude_meta_hooks.as_ref()),
         };
         // For the git probe: `cwd` goes to the adapter's start.
         let probe_cwd = cwd.clone();
@@ -1417,7 +1489,7 @@ impl Actor {
         let started = tokio::select! {
             result = async {
                 let (session, catalogue, images, steering_supported) =
-                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mcp, &mut updates, &mut replay)).await {
+                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mcp, codex_trust.as_ref(), &mut updates, &mut replay)).await {
                         Ok(result) => result?,
                         Err(_) => {
                             return Err(StartError::other(format!(
@@ -2613,12 +2685,15 @@ async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<Pr
 /// Returns the config options the adapter announced (none if it announced
 /// none, or they did not parse), and whether its `initialize` offered
 /// images in prompts (plan 6a). What the adapter sends meanwhile goes into
-/// `replay`.
+/// `replay`. With `codex_trust`, the hooks the adapter was started with
+/// (its `CODEX_CONFIG` `hooks`) are checked and trusted before any session
+/// exists (skills spec §8).
 async fn negotiate(
     conn: &ConnectionTo<Agent>,
     cwd: PathBuf,
     attach: &Attach,
     mcp: &SessionMcp,
+    codex_trust: Option<&hennery_proto::hooks::HookSetConfig>,
     updates: &mut mpsc::UnboundedReceiver<Inbound>,
     replay: &mut Replay,
 ) -> Result<(SessionId, Announced, bool, bool), StartError> {
@@ -2634,6 +2709,14 @@ async fn negotiate(
         .and_then(|s| s.get("supported"))
         .and_then(Value::as_bool)
         == Some(true);
+    if let Some(sent) = codex_trust {
+        crate::hook_sets::trust_codex(conn, &cwd, sent)
+            .await
+            .map_err(|error| StartError {
+                code: "hook_sets_refused",
+                message: error.to_string(),
+            })?;
+    }
     let images = init.agent_capabilities.prompt_capabilities.image;
     let agent_session_id = match attach {
         Attach::New => {
@@ -2760,7 +2843,7 @@ pub(crate) async fn probe_catalog(
             servers: vec![],
             meta: profile.session_meta(),
         };
-        let (_, catalog, _, _) = negotiate(&conn, cwd, &Attach::New, &mcp, &mut updates, &mut replay)
+        let (_, catalog, _, _) = negotiate(&conn, cwd, &Attach::New, &mcp, None, &mut updates, &mut replay)
             .await
             .map_err(anyhow::Error::new)?;
         Ok(if catalog.authoritative {
@@ -3220,6 +3303,7 @@ mod tests {
         (
             SessionHandle {
                 mcp_source_policy: None,
+                hook_set_hashes: vec![],
                 attach_generation: Some(1),
                 commands,
                 turns: Arc::new(Mutex::new(PromptTurns::default())),
@@ -3325,6 +3409,7 @@ mod tests {
                 cwd: dir.path().canonicalize().unwrap(),
                 profile: Profile::Generic,
                 mcp_servers: vec![],
+                hooks: None,
             },
             SessionOptions::default(),
             1,

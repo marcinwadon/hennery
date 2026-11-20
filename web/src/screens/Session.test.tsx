@@ -347,6 +347,18 @@ describe('SessionView', () => {
     expect(Array.from(container.querySelectorAll('.avatar')).map((e) => e.textContent)).toEqual(['Y', label[0].toUpperCase()])
   })
 
+  it('lists the hook sets applied to the session in its details', async () => {
+    const s = server({
+      pages: [() => json(page(rows(1, 't5')))],
+      detail: () => json(detail('claude', { hook_sets: [{ id: 'h1', name: 'guard', content_hash: 'abc' }] })),
+    })
+    render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+    await showDetailsTab('Details')
+    const term = await screen.findByText('Hook sets')
+    expect(term.tagName).toBe('DT')
+    expect(term.nextElementSibling).toHaveTextContent('guard')
+  })
+
   it('refreshes delivery after this tab successfully resumes', async () => {
     let count = 1
     const s = server({

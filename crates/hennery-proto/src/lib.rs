@@ -9,6 +9,7 @@ pub mod delegation_status;
 pub mod files;
 pub mod form_schema;
 pub mod frames;
+pub mod hooks;
 pub mod mcp_source;
 pub mod paths;
 pub mod plugin;

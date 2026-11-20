@@ -1507,6 +1507,7 @@ fn launching(
         cwd: std::env::temp_dir(),
         profile: Default::default(),
         mcp_servers: Vec::new(),
+        hooks: None,
     };
     session::launch(uplink.clone(), launch, options)
 }
@@ -1572,6 +1573,7 @@ async fn plan_mode_model_reset_is_repaired_for_operator_and_delegated_starts() {
             cwd: cwd.clone(),
             profile: Default::default(),
             mcp_servers: Vec::new(),
+            hooks: None,
         };
         let _handle = if delegated {
             session::launch_delegated_in(uplink.clone(), launch, SessionOptions::default(), 1, vec![cwd])

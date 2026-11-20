@@ -32,6 +32,7 @@ pub fn features() -> Vec<String> {
         "web_push".to_owned(),
         "session_defaults".to_owned(),
         "skills".to_owned(),
+        "hook_sets".to_owned(),
     ]
 }
 
@@ -75,7 +76,7 @@ mod tests {
         );
         assert_eq!(
             body,
-            serde_json::json!({"mode": "full", "features": ["mcp_connections", "mcp_stdio", "mcp_oauth", "web_push", "session_defaults", "skills"],
+            serde_json::json!({"mode": "full", "features": ["mcp_connections", "mcp_stdio", "mcp_oauth", "web_push", "session_defaults", "skills", "hook_sets"],
                 "collector_version": env!("CARGO_PKG_VERSION")})
         );
     }

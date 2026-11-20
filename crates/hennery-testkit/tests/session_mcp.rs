@@ -75,6 +75,7 @@ async fn attach(script: &FakeScript, attach: Attach, profile: Profile, mcp_serve
         cwd: std::env::temp_dir(),
         profile,
         mcp_servers,
+        hooks: None,
     };
     let handle = session::launch(uplink.clone(), launch, SessionOptions::default());
     wait_for(&uplink, |body| {
@@ -211,6 +212,7 @@ async fn the_sessions_secret_values_never_reach_what_it_reports() {
         cwd: std::env::temp_dir(),
         profile: Profile::Claude,
         mcp_servers: servers(),
+        hooks: None,
     };
     let handle = session::launch(uplink.clone(), launch, SessionOptions::default());
     wait_for(&uplink, |body| matches!(body, SessionBody::SessionStarted { .. })).await;
@@ -265,6 +267,7 @@ async fn an_adapters_errors_quoting_its_secrets_are_redacted_in_every_answer_and
         cwd: std::env::temp_dir(),
         profile: Profile::Claude,
         mcp_servers: servers(),
+        hooks: None,
     };
     let handle = session::launch(uplink.clone(), launch, SessionOptions::default());
     wait_for(&uplink, |body| matches!(body, SessionBody::HostNote { .. })).await;

@@ -738,6 +738,7 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
         config: Default::default(),
         hat_id: String::new(),
         mcp: Default::default(),
+        hooks: None,
     };
     let outcome = collector
         .state

@@ -92,6 +92,7 @@ fn every_collector_frame_round_trips() {
             config: Default::default(),
             hat_id: String::new(),
             mcp: Default::default(),
+            hooks: None,
         },
         CollectorFrame::ResumeSession {
             request_id: "r".into(),
@@ -103,6 +104,7 @@ fn every_collector_frame_round_trips() {
             config: Default::default(),
             hat_id: String::new(),
             mcp: Default::default(),
+            hooks: None,
         },
         CollectorFrame::Prompt {
             plugin_context: None,
@@ -198,6 +200,7 @@ fn resume_frames_and_host_notes_use_the_spec_field_names() {
         config: Default::default(),
         hat_id: String::new(),
         mcp: Default::default(),
+        hooks: None,
     };
     assert_eq!(
         serde_json::to_value(&resume).unwrap(),
@@ -296,6 +299,7 @@ fn session_detail_leaves_out_absent_optionals() {
         }),
         pending: vec![],
         mcp_delivery: None,
+        hook_sets: vec![],
     };
     assert_eq!(
         serde_json::to_value(&detail).unwrap(),
@@ -523,6 +527,7 @@ fn start_and_resume_carry_model_mode_and_axes_as_flat_fields() {
         config: config(),
         hat_id: String::new(),
         mcp: Default::default(),
+        hooks: None,
     };
     let expected = json!({
         "type": "start_session", "request_id": "r", "session_id": "s", "committed_seq": 0,
@@ -1071,5 +1076,103 @@ fn skill_frames_round_trip_and_are_not_probes() {
         serde_json::from_str::<Capabilities>("[\"skills\",\"nope\"]")
             .unwrap()
             .has(Capability::Skills)
+    );
+}
+
+#[test]
+fn hook_delivery_is_optional_on_the_wire_and_acknowledged() {
+    use hennery_proto::frames::{Capabilities, Capability, HookDelivery, HookSetDelivery, SkillSyncItem};
+    use hennery_proto::hooks::{CommandHook, HookKind, HookSetConfig, MatcherGroup};
+    let start = |hooks| CollectorFrame::StartSession {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        committed_seq: 0,
+        agent: "claude".into(),
+        cwd: "/tmp".into(),
+        config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
+        hooks,
+    };
+    let bare = start(None);
+    let value = serde_json::to_value(&bare).unwrap();
+    assert!(value.get("hooks").is_none());
+    assert_eq!(serde_json::from_value::<CollectorFrame>(value).unwrap(), bare);
+    assert!(bare.hooks_delivery().is_none());
+
+    let delivery = HookDelivery {
+        sets: vec![HookSetDelivery {
+            id: "h1".into(),
+            name: "audit".into(),
+            content_hash: "ab".into(),
+            hooks: HookSetConfig(
+                [(
+                    "Stop".to_string(),
+                    vec![MatcherGroup {
+                        matcher: None,
+                        hooks: vec![CommandHook {
+                            kind: HookKind::Command,
+                            command: "/x.sh".into(),
+                            timeout: Some(5),
+                        }],
+                    }],
+                )]
+                .into(),
+            ),
+        }],
+    };
+    let full = start(Some(delivery.clone()));
+    let value = serde_json::to_value(&full).unwrap();
+    assert_eq!(
+        value["hooks"]["sets"][0]["hooks"]["Stop"][0]["hooks"][0]["type"],
+        "command"
+    );
+    assert_eq!(serde_json::from_value::<CollectorFrame>(value).unwrap(), full);
+    assert_eq!(full.hooks_delivery(), Some(&delivery));
+
+    let resume = CollectorFrame::ResumeSession {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        committed_seq: 0,
+        agent: "claude".into(),
+        cwd: "/tmp".into(),
+        agent_session_id: "a1".into(),
+        config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
+        hooks: Some(delivery.clone()),
+    };
+    assert_eq!(resume.hooks_delivery(), Some(&delivery));
+    let attach = CollectorFrame::DelegatedAttach {
+        operator_initiated: false,
+        request_id: "r".into(),
+        session_id: "s".into(),
+        committed_seq: 0,
+        agent: "claude".into(),
+        cwd: "/tmp".into(),
+        config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
+        hooks: Some(delivery.clone()),
+        attach_generation: 1,
+        agent_session_id: None,
+    };
+    assert_eq!(attach.hooks_delivery(), Some(&delivery));
+    let sync = CollectorFrame::SkillSync {
+        revision: 1,
+        items: Vec::<SkillSyncItem>::new(),
+    };
+    assert!(sync.hooks_delivery().is_none());
+
+    assert!(
+        serde_json::to_value(Indexed::default())
+            .unwrap()
+            .get("hook_sets_applied")
+            .is_none()
+    );
+    assert!(
+        serde_json::from_str::<Capabilities>("[\"hook_sets\"]")
+            .unwrap()
+            .has(Capability::HookSets)
     );
 }

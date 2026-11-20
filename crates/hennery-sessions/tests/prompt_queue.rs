@@ -573,7 +573,7 @@ fn a_parent_origin_row_cannot_gain_operator_authority_from_equal_source_and_targ
     };
     assert!(
         !w.store
-            .attach_delegated("session", McpContext::NONE, &catalog, &hub)
+            .attach_delegated("session", McpContext::NONE, None, &catalog, &hub)
             .unwrap()
     );
     assert!(rx.try_recv().is_err());
@@ -655,7 +655,7 @@ fn parked_operator_queue_uses_the_existing_attach_generation_and_confirmed_confi
     };
     assert!(
         w.store
-            .attach_delegated("session", McpContext::NONE, &catalog, &hub)
+            .attach_delegated("session", McpContext::NONE, None, &catalog, &hub)
             .unwrap()
     );
     let CollectorFrame::DelegatedAttach {
@@ -1159,7 +1159,7 @@ fn an_unresolved_operator_receipt_fences_typed_input_even_without_a_turn_slot() 
         .unwrap();
     assert!(
         !w.store
-            .attach_delegated("session", McpContext::NONE, &operator_catalog(), &hub)
+            .attach_delegated("session", McpContext::NONE, None, &operator_catalog(), &hub)
             .unwrap()
     );
     w.conn()
@@ -1311,7 +1311,7 @@ fn explicit_park_holds_existing_queue_while_idle_park_resumes_it() {
         };
         let attached = w
             .store
-            .attach_delegated("session", McpContext::NONE, &catalog, &hub)
+            .attach_delegated("session", McpContext::NONE, None, &catalog, &hub)
             .unwrap();
         if reason == ParkReason::Operator {
             assert!(!attached, "explicit Park must hold the queue");
@@ -1320,7 +1320,7 @@ fn explicit_park_holds_existing_queue_while_idle_park_resumes_it() {
             w.queue("new operator send releases the hold");
             assert!(
                 w.store
-                    .attach_delegated("session", McpContext::NONE, &catalog, &hub)
+                    .attach_delegated("session", McpContext::NONE, None, &catalog, &hub)
                     .unwrap()
             );
         } else {
@@ -1717,7 +1717,7 @@ fn revocation_after_worker_preparation_fences_every_operator_handoff() {
     });
     assert!(
         !w.store
-            .attach_delegated("session", McpContext::NONE, &operator_catalog(), &hub)
+            .attach_delegated("session", McpContext::NONE, None, &operator_catalog(), &hub)
             .unwrap()
     );
     assert!(frames.try_recv().is_err());
@@ -1756,7 +1756,7 @@ fn operator_resume_requires_a_host_capability_instead_of_opaque_failure() {
     };
     assert!(
         !w.store
-            .attach_delegated("session", McpContext::NONE, &catalog, &hub)
+            .attach_delegated("session", McpContext::NONE, None, &catalog, &hub)
             .unwrap()
     );
     assert!(rx.try_recv().is_err());
@@ -1989,7 +1989,11 @@ fn source_policy_review_ordinary_resume_after_real_operator_queue_attach() {
         rules_name_other_hats: false,
     };
     let catalog = operator_catalog();
-    assert!(w.store.attach_delegated("session", context, &catalog, &hub).unwrap());
+    assert!(
+        w.store
+            .attach_delegated("session", context, None, &catalog, &hub)
+            .unwrap()
+    );
     let CollectorFrame::DelegatedAttach {
         request_id,
         attach_generation,

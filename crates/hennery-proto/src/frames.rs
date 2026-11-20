@@ -68,6 +68,8 @@ pub enum Capability {
     Steering,
     /// Skill delivery: `SkillSync`/`SkillArchive` in, `SkillFetch`/`SkillState` out (skills spec §6).
     Skills,
+    /// Per-session hook delivery: `hooks` on start/resume/delegated attach, acknowledged in `Indexed.hook_sets_applied` (skills spec §8).
+    HookSets,
 }
 
 /// The longest agent data root a host may report (plan 9d, O12's shape
@@ -445,6 +447,30 @@ pub struct McpDelivery {
     pub isolation_waived: bool,
 }
 
+/// One hook set in a `HookDelivery` (skills spec §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookSetDelivery {
+    pub id: String,
+    pub name: String,
+    pub content_hash: String,
+    pub hooks: crate::hooks::HookSetConfig,
+}
+
+/// The hook sets a start, resume or delegated attach delivers, in the order
+/// their groups are merged (skills spec §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookDelivery {
+    pub sets: Vec<HookSetDelivery>,
+}
+
+/// A hook set a host applied to a session (skills spec §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookSetApplied {
+    pub id: String,
+    pub name: String,
+    pub content_hash: String,
+}
+
 /// How a host keeps an agent's sessions to the servers hennery passes (ACP
 /// core §6). Lenient: a mechanism this build does not know reads as `none`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -637,6 +663,11 @@ pub struct Indexed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mcp_source_policy: Option<crate::mcp_source::McpSourceSnapshot>,
+    /// Host-owned acknowledgement of the hook sets applied, used only on
+    /// SessionStarted (skills spec §8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<crate::frames::HookSetApplied>>", optional)]
+    pub hook_sets_applied: Vec<HookSetApplied>,
     /// Host-owned adapter identity for authoritative start/resume snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -1112,6 +1143,42 @@ impl CollectorFrame {
         }
     }
 
+    /// A start's, resume's or delegated attach's hook sets; `None` for every
+    /// other frame, and for one without hook sets. Exhaustive on purpose, like
+    /// `mcp_delivery`: a new frame must say whether it carries hooks.
+    pub fn hooks_delivery(&self) -> Option<&HookDelivery> {
+        match self {
+            Self::StartSession { hooks, .. }
+            | Self::ResumeSession { hooks, .. }
+            | Self::DelegatedAttach { hooks, .. } => hooks.as_ref(),
+            Self::HelloAck { .. }
+            | Self::CancelCatalogProbe { .. }
+            | Self::HelloError { .. }
+            | Self::Steer { .. }
+            | Self::Prompt { .. }
+            | Self::DelegatedPrompt { .. }
+            | Self::ProbeCatalog { .. }
+            | Self::CancelTurn { .. }
+            | Self::SetConfig { .. }
+            | Self::SetIdleHold { .. }
+            | Self::SetIdleTimeout { .. }
+            | Self::AnswerPermission { .. }
+            | Self::AnswerElicitation { .. }
+            | Self::Ack { .. }
+            | Self::ResolvePath { .. }
+            | Self::ParkSession { .. }
+            | Self::CloseSession { .. }
+            | Self::ListProjects { .. }
+            | Self::BrowseDirectory { .. }
+            | Self::ReadFile { .. }
+            | Self::ForgetFiles { .. }
+            | Self::SkillSync { .. }
+            | Self::SkillArchive { .. }
+            | Self::ForgetHat { .. }
+            | Self::ForgetSession { .. } => None,
+        }
+    }
+
     /// The agent a start or resume names.
     pub fn agent(&self) -> Option<&str> {
         match self {
@@ -1181,6 +1248,11 @@ pub enum CollectorFrame {
         hat_id: String,
         #[serde(flatten)]
         mcp: McpDelivery,
+        /// The session's hook sets (skills spec §8); absent when none are
+        /// assigned. A nested key, not flattened.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        hooks: Option<HookDelivery>,
         #[ts(type = "number")]
         attach_generation: u64,
         agent_session_id: Option<String>,
@@ -1227,6 +1299,11 @@ pub enum CollectorFrame {
         hat_id: String,
         #[serde(flatten)]
         mcp: McpDelivery,
+        /// The session's hook sets (skills spec §8); absent when none are
+        /// assigned. A nested key, not flattened.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        hooks: Option<HookDelivery>,
     },
     /// Attach a parked, closed or failed session again: spawn the adapter and
     /// `session/load` it with replay suppression (ACP core §4.3, §4.5).
@@ -1253,6 +1330,11 @@ pub enum CollectorFrame {
         /// `session/load` (the spike).
         #[serde(flatten)]
         mcp: McpDelivery,
+        /// The session's hook sets (skills spec §8); absent when none are
+        /// assigned. A nested key, not flattened.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        hooks: Option<HookDelivery>,
     },
     Steer {
         request_id: String,

@@ -1,10 +1,11 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type RefObject, type KeyboardEvent } from 'react'
 import type { HeaderInfo } from './SessionHeader'
 import type { Item } from '../generated/view'
-import type { McpSessionDelivery, SessionCatalog } from '../generated/protocol'
+import type { HookSetApplied, McpSessionDelivery, SessionCatalog } from '../generated/protocol'
 import type { SessionConfigState } from '../hooks/useSessionConfig'
 import SessionSettings from './SessionSettings'
 import { agentLabel } from '../lib/agent'
+import { Text } from '../lib/text'
 import { useMediaQuery } from '../hooks/useMediaQuery'
 import { useModalLayer } from './ui'
 import McpDelivery from './McpDelivery'
@@ -31,6 +32,7 @@ interface Props {
   hatName?: string
   plan?: Extract<Item, { kind: 'plan' }>
   delivery?: McpSessionDelivery
+  hookSets?: HookSetApplied[]
   configuration?: SessionConfigState
   catalog?: SessionCatalog | null
   settingsFocus?: number
@@ -99,7 +101,7 @@ function SheetFocus({ dialog: ref, keys, onClose, trigger }: { dialog: RefObject
   return null
 }
 
-function Details({ info, agentSessionId, hostName, hatName, delivery, configuration, catalog, sourcePolicy }: Props) {
+function Details({ info, agentSessionId, hostName, hatName, delivery, hookSets, configuration, catalog, sourcePolicy }: Props) {
   return <>
     {configuration && <SessionSettings catalog={catalog ?? null} config={configuration} />}
     {info && <dl className="session-facts">
@@ -115,6 +117,12 @@ function Details({ info, agentSessionId, hostName, hatName, delivery, configurat
     </dl>}
     <McpSourcePolicy state={sourcePolicy} />
     <McpDelivery agent={info?.agent} delivery={delivery} />
+    {hookSets && hookSets.length > 0 && (
+      <dl className="session-facts">
+        <dt>Hook sets</dt>
+        <dd>{hookSets.map((set, i) => <span key={set.id}>{i > 0 && ', '}<Text>{set.name}</Text></span>)}</dd>
+      </dl>
+    )}
   </>
 }
 

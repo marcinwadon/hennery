@@ -238,3 +238,8 @@
 .delegation-limit-field .hint { grid-column:1/-1; margin:0; color:var(--hn-fg-3); font-family:var(--font-body); }
 .device-settings { max-width:none; margin-inline:0; }.device-settings > .card { width:100%; max-width:712px; align-self:flex-start; }.device-settings > .card > h2:first-child { margin:0 -16px 12px; padding:12px 16px; }
 .device-settings.account-sign-in > .cards > .card,.device-settings > .account-sign-in > .cards > .card { background:none; border-radius:0; }.device-settings .account-sign-in .btn { color:var(--st-fail-fg); }.device-settings .passkey-add .btn { color:var(--hn-fg-1); }.device-settings > .btn { align-self:flex-start; }
+
+/* Hook sets (skills phase 2): the JSON editor and its event table. */
+.hook-set-json { width:100%; font-family:var(--font-mono, monospace); font-size:13px; }
+.hook-set-events { border-collapse:collapse; margin:8px 0; font-size:13px; }
+.hook-set-events th, .hook-set-events td { border:1px solid var(--border); padding:6px 10px; text-align:left; }

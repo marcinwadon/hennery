@@ -14,6 +14,7 @@ pub mod delivery;
 pub mod egress;
 pub mod hats;
 pub mod health;
+pub mod hook_sets;
 pub mod hosts;
 pub mod json;
 pub mod lifecycle;

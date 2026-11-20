@@ -281,7 +281,7 @@ export type SessionConfig = { cache_retention?: CacheRetention, model?: string |
  * collector never sends a frame that needs a capability to a host that
  * lacks it.
  */
-export type Capability = "plugin_context" | "projects" | "images" | "files" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering" | "skills";
+export type Capability = "plugin_context" | "projects" | "images" | "files" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering" | "skills" | "hook_sets";
 
 /**
  * `hello.capabilities`. Deserialized leniently: a capability this build
@@ -446,6 +446,11 @@ cache_retention?: CacheRetention | null,
  * Host-owned acknowledgement, used only on SessionStarted.
  */
 mcp_source_policy?: McpSourceSnapshot,
+/**
+ * Host-owned acknowledgement of the hook sets applied, used only on
+ * SessionStarted (skills spec §8).
+ */
+hook_sets_applied?: Array<HookSetApplied>,
 /**
  * Host-owned adapter identity for authoritative start/resume snapshots.
  */
@@ -616,6 +621,53 @@ export type SkillFailed = { id: string, reason: SkillFailure,
 agent?: string | undefined, };
 
 /**
+ * The handler type. Only `command` exists: any other `type` value is a
+ * deserialisation error.
+ */
+export type HookKind = "command";
+
+/**
+ * One command handler.
+ */
+export type CommandHook = { type: HookKind,
+/**
+ * The program to run; it must already exist on the host.
+ */
+command: string,
+/**
+ * Seconds, 1 to 600, when present.
+ */
+timeout?: number, };
+
+/**
+ * A matcher and the handlers it runs.
+ */
+export type MatcherGroup = { matcher?: string, hooks: Array<CommandHook>, };
+
+/**
+ * A hook set's `hooks` object: event name to matcher groups.
+ *
+ * A newtype, so it is transparent on the wire and in the schema.
+ */
+export type HookSetConfig = Record<string, MatcherGroup[]>;
+
+/**
+ * One hook set in a `HookDelivery` (skills spec §8).
+ */
+export type HookSetDelivery = { id: string, name: string, content_hash: string, hooks: HookSetConfig, };
+
+/**
+ * The hook sets a start, resume or delegated attach delivers, in the order
+ * their groups are merged (skills spec §8).
+ */
+export type HookDelivery = { sets: Array<HookSetDelivery>, };
+
+/**
+ * A hook set a host applied to a session (skills spec §8).
+ */
+export type HookSetApplied = { id: string, name: string, content_hash: string, };
+
+/**
  * Host -> collector.
  */
 export type HostFrame = { "type": "authenticate", protocol_version: string, host_id: string, proof: string, } | { "type": "catalog", request_id: string, catalog: HostCatalog, } | { "type": "hello", protocol_version: string, host_version: string, host_id: string,
@@ -682,7 +734,12 @@ operator_initiated: boolean, } | { "type": "delegated_attach",
  * A collector-accepted operator queue resume uses ordinary operator
  * path authorization, while retaining the attach/configuration fence.
  */
-operator_initiated?: boolean, request_id: string, session_id: string, committed_seq: number, agent: string, cwd: string, hat_id: string, attach_generation: number, agent_session_id: string | null, cache_retention?: CacheRetention, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
+operator_initiated?: boolean, request_id: string, session_id: string, committed_seq: number, agent: string, cwd: string, hat_id: string,
+/**
+ * The session's hook sets (skills spec §8); absent when none are
+ * assigned. A nested key, not flattened.
+ */
+hooks?: HookDelivery, attach_generation: number, agent_session_id: string | null, cache_retention?: CacheRetention, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
 /**
  * Passed in `session/new` / `session/load`. Only to a host that
  * announced `mcp_servers`.
@@ -709,7 +766,12 @@ committed_seq: number, agent: string, cwd: string,
  * The session's hat (`sessions.hat_id`); empty for a session from
  * before hats. Carried, not yet used by the host (plan 8c).
  */
-hat_id?: string, cache_retention?: CacheRetention, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
+hat_id?: string,
+/**
+ * The session's hook sets (skills spec §8); absent when none are
+ * assigned. A nested key, not flattened.
+ */
+hooks?: HookDelivery, cache_retention?: CacheRetention, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
 /**
  * Passed in `session/new` / `session/load`. Only to a host that
  * announced `mcp_servers`.
@@ -734,7 +796,12 @@ agent_session_id: string,
 /**
  * As on `start_session`.
  */
-hat_id?: string, cache_retention?: CacheRetention, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
+hat_id?: string,
+/**
+ * The session's hook sets (skills spec §8); absent when none are
+ * assigned. A nested key, not flattened.
+ */
+hooks?: HookDelivery, cache_retention?: CacheRetention, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
 /**
  * Passed in `session/new` / `session/load`. Only to a host that
  * announced `mcp_servers`.
@@ -955,7 +1022,11 @@ pending: Array<PendingItem>,
  * What its latest start or resume was given (plan 8e decision E10);
  * absent for a session not started or resumed since plan 8e.
  */
-mcp_delivery?: McpSessionDelivery | undefined, session_id: string,
+mcp_delivery?: McpSessionDelivery | undefined,
+/**
+ * The hook sets its latest start or resume applied (skills spec §8).
+ */
+hook_sets?: Array<HookSetApplied>, session_id: string,
 /**
  * An operator shortcut in navigation; independent of idle parking holds.
  */
@@ -1504,6 +1575,67 @@ reported_at?: number | undefined, };
  * 404 `not_found`.
  */
 export type SkillHostsResponse = { skill_id: string, hosts: Array<SkillHostState>, };
+
+/**
+ * One hook set in `GET /api/hook-sets` (skills spec §9): its identity, its
+ * content hash, the events it names and the hosts it is assigned to.
+ */
+export type HookSetItem = { id: string, name: string, content_hash: string, events: Array<string>, host_ids: Array<string>, created_at: number, updated_at: number, };
+
+/**
+ * `GET /api/hook-sets/{id}`: the item and its `hooks`. 404 `hook_set_not_found`.
+ */
+export type HookSetDetail = { item: HookSetItem, hooks: HookSetConfig, };
+
+/**
+ * `POST /api/hook-sets` (skills spec §9): a name (the skill-name rules) and
+ * its `hooks`. Step-up. 201 with the `HookSetItem`.
+ *
+ * Its own codes: 400 `invalid_body`; 400 `invalid_hook_set` (a bad name, or
+ * `hooks` that break the limits; the message names the `HookSetError`); 409
+ * `hook_set_exists` (the name is taken); 409 `too_many_hook_sets`.
+ */
+export type CreateHookSetRequest = { name: string, hooks: HookSetConfig, };
+
+/**
+ * `PUT /api/hook-sets/{id}`: replaces a hook set's `hooks`. Step-up. The
+ * same codes as `POST /api/hook-sets` except the name ones, and 404
+ * `hook_set_not_found`.
+ */
+export type ReplaceHookSetRequest = { hooks: HookSetConfig, };
+
+/**
+ * `PUT /api/hook-sets/{id}/hosts`: the hosts a hook set is assigned to,
+ * replacing the set. Step-up. 200 with the `HookSetHostsResponse`; 404
+ * `hook_set_not_found`; 400 `unknown_host`.
+ */
+export type SetHookSetHostsRequest = { host_ids: Array<string>, };
+
+/**
+ * A hook set's state on one host.
+ */
+export type HookSetHostStatus = "assigned" | "unsupported" | "offline";
+
+/**
+ * One host's state for a hook set in a `HookSetHostsResponse`.
+ */
+export type HookSetHostState = { host_id: string, status: HookSetHostStatus, };
+
+/**
+ * `GET /api/hook-sets/{id}/hosts`: per-host state of one hook set. 404
+ * `hook_set_not_found`.
+ */
+export type HookSetHostsResponse = { hook_set_id: string, hosts: Array<HookSetHostState>, };
+
+/**
+ * One event in `GET /api/hook-sets/events`: whether each agent runs it.
+ */
+export type HookEventSupport = { event: string, claude: boolean, codex: boolean, };
+
+/**
+ * `GET /api/hook-sets/events`: every accepted event and its agent support.
+ */
+export type HookEventsResponse = { events: Array<HookEventSupport>, };
 
 /**
  * `GET /api/skills/hat-hosts/{hat_id}`: the hosts that have sessions of the

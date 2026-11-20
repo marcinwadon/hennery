@@ -368,6 +368,7 @@ fn start(request_id: &str, session_id: &str) -> CollectorFrame {
         config: Default::default(),
         hat_id: String::new(),
         mcp: Default::default(),
+        hooks: None,
     }
 }
 
@@ -665,6 +666,7 @@ fn resume(request_id: &str, session_id: &str, committed_seq: u64, agent_session_
         config: Default::default(),
         hat_id: String::new(),
         mcp: Default::default(),
+        hooks: None,
     }
 }
 
@@ -846,6 +848,7 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
             Capability::Steering,
             Capability::PluginContext,
             Capability::Skills,
+            Capability::HookSets,
         ])
     );
 }

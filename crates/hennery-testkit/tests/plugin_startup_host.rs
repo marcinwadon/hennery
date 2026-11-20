@@ -191,6 +191,7 @@ async fn startup_context_does_not_leak_to_owned_child_or_bypass_config_and_close
             cwd: dir.path().canonicalize().unwrap(),
             profile: Profile::Generic,
             mcp_servers: vec![],
+            hooks: None,
         },
         SessionOptions {
             test_hooks: Some(hooks.clone()),

@@ -10,7 +10,7 @@ import type { HatItem, HostItem, SkillHostState } from '../generated/protocol'
 import { useResource } from '../hooks/useResource'
 import { Text, visible } from '../lib/text'
 
-function statusWord(state: SkillHostState | undefined): string | null {
+export function skillStatusWord(state: SkillHostState | undefined): string | null {
   if (!state) return null
   switch (state.status) {
     case 'applied':
@@ -30,6 +30,25 @@ function statusWord(state: SkillHostState | undefined): string | null {
   }
 }
 
+export interface HostState {
+  host_id: string
+  status: string
+}
+
+interface GenericProps<S extends HostState> {
+  /** Names what is being linked; a new id reads the states again. */
+  subject: string
+  load(): Promise<{ hosts: S[] }>
+  save(ids: string[]): Promise<{ hosts: S[] }>
+  legend: string
+  statusWord(state: S | undefined): string | null
+  /** `null` while they load or when they could not be read. */
+  hosts: HostItem[] | null
+  hats: HatItem[] | null
+  refresh?: number
+  onChanged?(): void
+}
+
 interface Props {
   skillId: string
   /** `null` while they load or when they could not be read. */
@@ -41,9 +60,28 @@ interface Props {
   onChanged?(): void
 }
 
-export default function SkillHosts({ skillId, hosts, hats, refresh = 0, onChanged }: Props) {
+export default function SkillHosts({ skillId, hosts, hats, refresh, onChanged }: Props) {
   const client = useClient()
-  const states = useResource(() => skillHosts(client, skillId), [skillId])
+  return (
+    <HostChecklist
+      subject={skillId}
+      load={() => skillHosts(client, skillId)}
+      save={(ids) => setSkillHosts(client, skillId, ids)}
+      legend="Hosts that link this skill"
+      statusWord={skillStatusWord}
+      hosts={hosts}
+      hats={hats}
+      refresh={refresh}
+      onChanged={onChanged}
+    />
+  )
+}
+
+export function HostChecklist<S extends HostState>({
+  subject, load, save: persist, legend, statusWord, hosts, hats, refresh = 0, onChanged,
+}: GenericProps<S>) {
+  const client = useClient()
+  const states = useResource(load, [subject])
   const { reload } = states
   const seen = useRef(refresh)
   useEffect(() => {
@@ -71,7 +109,7 @@ export default function SkillHosts({ skillId, hosts, hats, refresh = 0, onChange
     setError(null)
     try {
       const ids = await next(ticked)
-      states.set(await setSkillHosts(client, skillId, ids))
+      states.set(await persist(ids))
       onChanged?.()
     } catch (err) {
       setError(messageOf(err))
@@ -110,7 +148,7 @@ export default function SkillHosts({ skillId, hosts, hats, refresh = 0, onChange
         </button>
       </div>
       <fieldset className="mounts" disabled={hosts === null || current === null} aria-busy={busy}>
-        <legend>Hosts that link this skill</legend>
+        <legend>{legend}</legend>
         {hosts !== null && live.length === 0 && <p className="hint">No host is paired yet.</p>}
         {live.map((host) => {
           const word = statusWord(current?.find((s) => s.host_id === host.host_id))

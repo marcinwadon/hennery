@@ -137,9 +137,12 @@ async fn drain_target(state: &AppState, target: &str) -> anyhow::Result<()> {
     let candidate = if session.lifecycle == "active" {
         None
     } else {
-        let head = match state.store.delegated_attach_candidate(target, &state.hub)? {
+        // Assigned hook sets go with the attach; a host that cannot apply
+        // them refuses it for good (skills spec §8).
+        let hooks = crate::api::hook_delivery(state, &session.host_id)?.is_some();
+        let head = match state.store.delegated_attach_candidate(target, &state.hub, hooks)? {
             Some(head) => Some(head),
-            None => state.store.notice_attach_candidate(target, &state.hub)?,
+            None => state.store.notice_attach_candidate(target, &state.hub, hooks)?,
         };
         let Some(head) = head else { return Ok(()) };
         if let Some(code) = head.refusal {
@@ -160,6 +163,7 @@ async fn drain_target(state: &AppState, target: &str) -> anyhow::Result<()> {
                 &state.hub,
                 &session.host_id,
                 code != "agent_has_no_record",
+                hooks,
             ) != Some(Some(code))
             {
                 return Ok(());
@@ -293,8 +297,14 @@ async fn drain_target(state: &AppState, target: &str) -> anyhow::Result<()> {
             state.store.dispatch_child_notice(target, &catalog, &state.hub)?;
         } else {
             let mcp = crate::api::mcp_context(state, &session.host_id, &session.agent)?;
-            state.store.attach_delegated(target, mcp, &catalog, &state.hub)?;
-            state.store.attach_notice_parent(target, mcp, &catalog, &state.hub)?;
+            // The host's hook sets, as a start carries them (skills spec §8).
+            let hooks = crate::api::hook_delivery(state, &session.host_id)?;
+            state
+                .store
+                .attach_delegated(target, mcp, hooks.clone(), &catalog, &state.hub)?;
+            state
+                .store
+                .attach_notice_parent(target, mcp, hooks, &catalog, &state.hub)?;
         }
         Ok::<_, anyhow::Error>(())
     };

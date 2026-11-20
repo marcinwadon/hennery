@@ -38,7 +38,7 @@ async fn the_owner_learns_the_mode_and_the_features() {
     metadata.as_object_mut().unwrap().remove("source_commit");
     assert_eq!(
         metadata,
-        serde_json::json!({"mode": "full", "features": ["mcp_connections", "mcp_stdio", "mcp_oauth", "web_push", "session_defaults", "skills"],
+        serde_json::json!({"mode": "full", "features": ["mcp_connections", "mcp_stdio", "mcp_oauth", "web_push", "session_defaults", "skills", "hook_sets"],
             "collector_version": env!("CARGO_PKG_VERSION")})
     );
     let typed: CapabilitiesResponse = serde_json::from_value(body).unwrap();

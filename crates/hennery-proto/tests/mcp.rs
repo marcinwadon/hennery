@@ -37,6 +37,7 @@ fn start(hat_id: &str, mcp: McpDelivery) -> CollectorFrame {
         config: Default::default(),
         hat_id: hat_id.into(),
         mcp,
+        hooks: None,
     }
 }
 
@@ -97,6 +98,7 @@ fn start_and_resume_carry_the_hat_and_the_servers() {
             isolation_waived: true,
             ..mcp
         },
+        hooks: None,
     };
     let value = serde_json::to_value(&resume).unwrap();
     assert_eq!(

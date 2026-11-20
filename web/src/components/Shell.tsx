@@ -71,7 +71,7 @@ function Frame({ caps, route }: { caps: CapabilitiesResponse; route: Route }) {
       : route.name === 'settings' ? <Settings push={caps.features.includes('web_push')} sessions={caps.mode === 'full'} />
       : route.name === 'new' ? <NewSessionFrame><NewSession /></NewSessionFrame>
       : route.name === 'mcp' ? caps.features.includes('mcp_connections') ? <Mcp stdio={caps.features.includes('mcp_stdio')} oauth={caps.features.includes('mcp_oauth')} /> : <Placeholder title="MCP" text="The MCP gateway is not part of this deployment." />
-      : route.name === 'skills' ? caps.features.includes('skills') ? <Skills /> : <Placeholder title="Skills" text="Skills are not part of this deployment." />
+      : route.name === 'skills' ? caps.features.includes('skills') ? <Skills hookSets={caps.features.includes('hook_sets')} /> : <Placeholder title="Skills" text="Skills are not part of this deployment." />
       : route.name === 'session' ? <SessionRoute key={route.id} id={route.id ?? ''} /> : null}
       </Suspense>
     </main><BottomNavigation mode={caps.mode} current={current} /></div>

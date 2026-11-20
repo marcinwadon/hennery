@@ -31,6 +31,10 @@ pub enum RequestError {
     /// waived. Nothing was sent.
     McpUndeliverable,
     McpSourceUnsupported,
+    /// The host's connection did not announce `hook_sets`, and the start,
+    /// resume or attach carries hook sets (skills spec §8). Nothing was
+    /// sent.
+    HookSetsUnsupported,
     /// The connection has `MAX_PROBES` probes in flight already; nothing
     /// was sent.
     Busy,
@@ -160,6 +164,10 @@ struct HostConn {
 }
 
 impl HostConn {
+    /// The frame carries hook sets this connection cannot apply.
+    fn refuses_hooks(&self, frame: &CollectorFrame) -> bool {
+        frame.hooks_delivery().is_some() && !self.capabilities.has(Capability::HookSets)
+    }
     fn adapt_context(&self, frame: &mut CollectorFrame) {
         if !self.capabilities.has(Capability::PluginContext)
             && let CollectorFrame::Prompt { plugin_context, .. } = frame
@@ -207,6 +215,12 @@ impl HostConn {
         {
             return false;
         }
+        self.takes_mcp(frame) && !self.refuses_hooks(frame)
+    }
+
+    /// The MCP part of `takes`: whether the servers (or the source policy)
+    /// the frame carries may go out on this connection.
+    fn takes_mcp(&self, frame: &CollectorFrame) -> bool {
         let Some(mcp) = frame.mcp_delivery() else {
             return true;
         };
@@ -654,7 +668,11 @@ impl Hub {
             };
             host.adapt_context(&mut frame);
             if !host.takes(&frame) {
-                return Err(if frame.mcp_delivery().is_some_and(|mcp| mcp.source_policy.is_some()) {
+                // An MCP refusal is reported as MCP; the hook sets' only
+                // when the servers would have gone out.
+                return Err(if host.takes_mcp(&frame) && host.refuses_hooks(&frame) {
+                    RequestError::HookSetsUnsupported
+                } else if frame.mcp_delivery().is_some_and(|mcp| mcp.source_policy.is_some()) {
                     RequestError::McpSourceUnsupported
                 } else {
                     RequestError::McpUndeliverable
