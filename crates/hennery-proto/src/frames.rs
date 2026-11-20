@@ -623,6 +623,23 @@ pub enum ConfigValue {
     Id(String),
 }
 
+/// Requested ACP wire protocol. Existing records remain on v1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub enum AcpProtocolPreference {
+    #[default]
+    #[serde(rename = "v1")]
+    V1,
+    #[serde(rename = "v2")]
+    V2,
+    #[serde(rename = "v2-v1", alias = "v2/v1")]
+    V2V1,
+}
+impl AcpProtocolPreference {
+    pub fn is_v1(&self) -> bool {
+        *self == Self::V1
+    }
+}
+
 /// Model, mode and the other config axes of a session (ACP core §3.3,
 /// §4.3): what a start asks for, and what a resume re-applies. `model` and
 /// `mode` are the values of the adapter's model and mode options; `axes`
@@ -630,6 +647,9 @@ pub enum ConfigValue {
 /// the start request, so the wire stays `model?, mode?, axes{}`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionConfig {
+    #[serde(default, skip_serializing_if = "AcpProtocolPreference::is_v1")]
+    #[ts(as = "Option<AcpProtocolPreference>", optional)]
+    pub protocol: AcpProtocolPreference,
     #[serde(default, skip_serializing_if = "crate::usage::CacheRetention::is_inherit")]
     #[ts(as = "Option<crate::usage::CacheRetention>", optional)]
     pub cache_retention: crate::usage::CacheRetention,
@@ -643,7 +663,7 @@ pub struct SessionConfig {
 
 impl SessionConfig {
     pub fn is_empty(&self) -> bool {
-        self.model.is_none() && self.mode.is_none() && self.axes.is_empty()
+        self.protocol.is_v1() && self.model.is_none() && self.mode.is_none() && self.axes.is_empty()
     }
 }
 
@@ -659,6 +679,12 @@ impl SessionConfig {
 /// mode deltas are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct Indexed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub acp_protocol: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub acp_fallback: Option<String>,
     /// The attached adapter advertised the steering extension in initialize.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[ts(as = "Option<bool>", optional)]
@@ -733,6 +759,7 @@ impl Indexed {
             return None;
         }
         Some(SessionConfig {
+            protocol: Default::default(),
             cache_retention: Default::default(),
             model: self.current_model.clone(),
             mode: self.current_mode.clone(),

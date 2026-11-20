@@ -5,6 +5,7 @@ import { ApiFailure } from '../api/errors'
 import type { HatItem, HatSessionDefaults, HostCatalog } from '../generated/protocol'
 import { fieldsOf, flatConfig, resolveDefaults, securityWarnings, sparseConfig, usableCatalog, supports, valueLabel } from '../lib/defaults'
 import { useAccentStyle } from '../lib/theme'
+import ProtocolControl from './ProtocolControl'
 import ConfirmDialog from './ConfirmDialog'
 import { ConfigControl } from './LaunchConfig'
 
@@ -15,14 +16,15 @@ export default function DefaultsEditor({ hat, record, catalog, onSaved, onReload
   const [conflict, setConflict] = useState(false), [saved, setSaved] = useState(false)
   const accent = useAccentStyle(hat.colour), flat = flatConfig(edits)
   const fields = fieldsOf(catalog), known = new Map(fields.map(f => [f.key, f.option]))
-  const keys = [...new Set([...fields.map(f => f.key), ...Object.keys(flat)])]
+  const keys = [...new Set([...fields.map(f => f.key), ...Object.keys(flat)])].filter(key => key !== 'protocol')
   const preview = catalog ? resolveDefaults(catalog, edits, {}) : null
   const effective = flatConfig(preview?.config ?? {})
   const dirty = JSON.stringify(edits) !== JSON.stringify(base.config)
   const replacements = Object.keys(flat).filter(key => flatConfig(base.config)[key] !== flat[key])
-  const invalidReplacement = replacements.some(key => !usableCatalog(catalog) || !known.has(key) || !supports(known.get(key)!, flat[key]))
+  const invalidReplacement = replacements.filter(key => key !== 'protocol').some(key => !usableCatalog(catalog) || !known.has(key) || !supports(known.get(key)!, flat[key]))
   const warnings = catalog ? [...new Set([...securityWarnings(catalog, edits), ...securityWarnings(catalog, preview?.config ?? {})])] : ['Permission settings are not verified without a fresh host settings preview.']
   return <section className="defaults-editor hn-accent-scope" style={accent} aria-label={`Defaults for ${hat.name}`}><h2><bdi>{hat.name}</bdi></h2><p className="hint">{record.agent} · Saved preferences. Reset removes only this hat’s override.</p>
+    <ProtocolControl value={edits.protocol} inherit disabled={hat.purging} onChange={protocol => { setEdits(({ protocol: _old, ...other }) => ({ ...other, ...(protocol ? { protocol } : {}) })); setSaved(false) }} />
     <div className="config-fields">{keys.map(key => {
       const option = known.get(key), overridden = Object.hasOwn(flat, key)
       return <div className="config-field" key={key}>{option ? <ConfigControl option={option} value={overridden ? flat[key] : effective[key]} inherited={!overridden} disabled={!usableCatalog(catalog) || hat.purging} onChange={value => { setEdits(sparseConfig({ ...flat, [key]: value })); setSaved(false) }} /> : <p><bdi>{key}: {String(flat[key])}</bdi> · Stored value unavailable in this preview</p>}
@@ -42,6 +44,6 @@ export default function DefaultsEditor({ hat, record, catalog, onSaved, onReload
     {confirm && <ConfirmDialog title={`Save defaults for ${hat.name}`} confirm="Confirm save" action={async () => {
       try { const updated = await putSessionDefaults(client, hat.id, base.agent, { revision: base.revision, config: edits }); setBase(updated); setEdits(updated.config); onSaved(updated); setSaved(true) }
       catch (err) { if (err instanceof ApiFailure && err.code === 'defaults_changed') { setConflict(true); setConfirm(false) } throw err }
-    }} onClose={() => setConfirm(false)}><p>Save these launcher preferences for <bdi>{hat.name}</bdi> / <bdi>{base.agent}</bdi>?</p><ul>{[...new Set([...Object.keys(flatConfig(base.config)), ...Object.keys(flat)])].filter(key => flatConfig(base.config)[key] !== flat[key]).map(key => <li key={key}><bdi>{known.get(key)?.name ?? key}: {String(flatConfig(base.config)[key] ?? 'Inherits')} → {String(flat[key] ?? 'Inherits')}</bdi></li>)}</ul>{warnings.map(warning => <p key={warning}>{warning}</p>)}<p>This affects later operator launches. Existing sessions keep their own settings.</p></ConfirmDialog>}
+    }} onClose={() => setConfirm(false)}><p>Save these launcher preferences for <bdi>{hat.name}</bdi> / <bdi>{base.agent}</bdi>?</p><ul>{[...new Set([...Object.keys(flatConfig(base.config)), ...Object.keys(flat)])].filter(key => flatConfig(base.config)[key] !== flat[key]).map(key => <li key={key}><bdi>{known.get(key)?.name ?? (key === 'protocol' ? 'ACP protocol' : key)}: {String(flatConfig(base.config)[key] ?? 'Inherits')} → {String(flat[key] ?? 'Inherits')}</bdi></li>)}</ul>{warnings.map(warning => <p key={warning}>{warning}</p>)}<p>This affects later operator launches. Existing sessions keep their own settings.</p></ConfirmDialog>}
   </section>
 }

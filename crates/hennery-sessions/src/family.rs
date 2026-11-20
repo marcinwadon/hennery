@@ -12,7 +12,7 @@ fn item(conn: &Connection, owner: &str, id: &str) -> Result<Option<SessionItem>>
     Ok(conn
         .query_row(
             "SELECT id,host_id,agent,cwd,title,lifecycle,activity,failure_reason,presumed_parked,
-                git_branch,git_dirty,model,mode,created_at,last_event_at,hat_id,title_source,project_root,sidebar_pinned
+                git_branch,git_dirty,model,mode,created_at,last_event_at,hat_id,title_source,project_root,sidebar_pinned,background_info,acp_protocol,acp_fallback
              FROM sessions WHERE owner_id = ?1 AND id = ?2 AND lifecycle<>'deleted'
         AND NOT EXISTS(SELECT 1 FROM purged_hats h WHERE h.owner_id = ?1 AND h.hat_id=sessions.hat_id)",
             params![owner, id],

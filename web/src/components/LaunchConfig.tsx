@@ -3,6 +3,8 @@ import type { ConfigValue, SessionConfig } from '../generated/protocol'
 import type { ConfigOption } from '../lib/catalog'
 import { fieldsOf, flatConfig, resolveDefaults, sparseConfig, type Picks, valueLabel } from '../lib/defaults'
 import type { LaunchContext } from './CatalogContext'
+import ProtocolControl from './ProtocolControl'
+import { protocolValue } from '../lib/protocol'
 import ComposerSettings, { SettingsSummary } from './ComposerSettings'
 import { modelLabel } from '../lib/agent'
 
@@ -24,12 +26,14 @@ export default function LaunchConfig({ context, picks, onPicks, expanded, onExpa
   const effective = flatConfig(result?.config ?? {})
   const requested = Object.keys(picks).filter(key => picks[key] !== null)
   const summaryFields = fieldsOf(context.catalog).filter(({ key, option }) => Object.hasOwn(effective, key) && (['model', 'mode', 'effort', 'reasoning_effort'].includes(key) || ['model', 'mode', 'thought_level'].includes(option.category ?? '')))
-  const summary = summaryFields.map(({ key }) => modelLabel(valueLabel(context.catalog, key, effective[key]))).join(' · ')
+  const requestedProtocol = protocolValue(picks.protocol === null ? undefined : picks.protocol ?? context.defaults?.config.protocol)
+  const summary = [...summaryFields.map(({ key }) => modelLabel(valueLabel(context.catalog, key, effective[key]))), ...(requestedProtocol ? [`ACP ${requestedProtocol === 'v2-v1' ? 'v2 / v1' : requestedProtocol}`] : [])].join(' · ')
   const warning = !!context.error || context.state === 'unavailable' || !!result?.blocked || !!result?.notices.length || !!result?.warnings.length
   const mode = summaryFields.find(({ key, option }) => key === 'mode' || option.category === 'mode')
   return <section className="launch-config" aria-label="Session settings"><SettingsSummary trigger={trigger} summary={summary || 'Agent defaults'} expanded={expanded} open={() => onExpanded(true)} warning={warning} launch />
     <div className="catalog-age"><span>{age}</span> {context.refresh && <button type="button" className="btn btn-ghost" disabled={context.refreshing} onClick={context.refresh}>{context.refreshing ? 'Refreshing…' : 'Refresh'}</button>}</div>
     {expanded && <ComposerSettings trigger={trigger} close={() => onExpanded(false)}>
+    <ProtocolControl value={requestedProtocol} onChange={value => onPicks({ ...picks, protocol: value ?? null })} />
     {context.error && <p role="alert">{context.error}</p>}
     {!context.catalog ? <p role="status">Agent defaults are unknown. Hat overrides and your choices will still be requested and checked after starting.</p> : <>
       <p className="config-readback">Requested for this start: <bdi>{summary || 'Agent defaults'}</bdi></p>

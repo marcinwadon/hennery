@@ -14,6 +14,7 @@ import type { Item, ItemPage } from '../generated/view'
 import { foldVerdict } from '../lib/delivery'
 
 export interface ItemsState {
+  before_turn?: string
   items: Item[]
   /** Bounded question reads whose groups have not been paged in. */
   pinned: Item[]
@@ -66,11 +67,16 @@ const groupOf = (item: Item): string => item.turn_id ?? 'start'
 /** The items of `list` that are items, each id once (the first kept). */
 function distinct(list: readonly unknown[], held: ReadonlySet<string> = new Set()): Item[] {
   const seen = new Set(held)
+  const positions = new Map<string, number>()
   const out: Item[] = []
   for (const value of list) {
     if (isItem(value) && !seen.has(value.id)) {
       seen.add(value.id)
+      positions.set(value.id, out.length)
       out.push(value)
+    } else if (isItem(value) && !held.has(value.id)) {
+      const at = positions.get(value.id)
+      if (at !== undefined && value.version >= out[at].version) out[at] = foldVerdict(out[at], value)
     }
   }
   return out
@@ -80,7 +86,7 @@ function distinct(list: readonly unknown[], held: ReadonlySet<string> = new Set(
  *  Absent when nothing is older, or the first group is the session's start. */
 export function beforeTurnOf(state: ItemsState): string | undefined {
   if (!state.older) return undefined
-  return state.items[0]?.turn_id
+  return state.before_turn ?? state.items[0]?.turn_id
 }
 
 /** Whether a new item of a group not loaded comes after every loaded one. */
@@ -95,7 +101,7 @@ export function itemsReducer(state: ItemsState, action: ItemsAction): ItemsState
     case 'loaded': {
       if (!isItemPage(action.page)) return state
       const { page } = action
-      return { items: distinct(page.items), pinned: [], older: page.older, epoch: page.epoch, revision: page.revision }
+      return { items: distinct(page.items), pinned: [], older: page.older, epoch: page.epoch, revision: page.revision, before_turn: page.before_turn }
     }
     case 'prepended': {
       if (!isItemPage(action.page)) return state
@@ -105,7 +111,7 @@ export function itemsReducer(state: ItemsState, action: ItemsAction): ItemsState
         return pin && pin.version > item.version ? foldVerdict(item, pin) : pin ? foldVerdict(pin, item) : item
       })
       const joined = new Set(before.map(i => i.id))
-      return { ...state, items: [...before, ...state.items], pinned: state.pinned.filter(i => !joined.has(i.id)), older: action.page.older }
+      return { ...state, items: [...before, ...state.items], pinned: state.pinned.filter(i => !joined.has(i.id)), older: action.page.older, before_turn: action.page.before_turn }
     }
     case 'pin':
     case 'upsert': {

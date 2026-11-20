@@ -9,6 +9,7 @@
 import { memo, useState } from 'react'
 import type { SessionSummary } from '../generated/view'
 import { agentLabel, modelLabel } from '../lib/agent'
+import { BackgroundCount } from './BackgroundTasks'
 import { statusOf } from '../lib/status'
 import { basename, relTime } from '../lib/time'
 import { Link } from '../router'
@@ -68,7 +69,7 @@ function SessionRow({ session, selected, selection, hostName, now, table, indent
       >
         <div className="sess-row1">
           {indent && <span className="sess-branch" aria-hidden="true">↳</span>}
-          <span className={'sess-led led-' + status.tone} role="img" aria-label={status.label} title={markerTitle}><Icon name={status.tone === 'attn' ? 'hand-raised' : status.tone === 'run' ? 'play-circle' : status.tone === 'fail' ? 'exclamation-circle' : 'clock'} size={14} /></span>
+          <span className={'sess-led led-' + status.tone} role="img" aria-label={status.label} title={markerTitle}>{status.tone === 'background' ? <span className="background-ring" aria-hidden="true" /> : <Icon name={status.tone === 'attn' ? 'hand-raised' : status.tone === 'run' ? 'play-circle' : status.tone === 'fail' ? 'exclamation-circle' : 'clock'} size={14} />}</span>
           <span className="sess-kind sess-agent">{agentLabel(session.agent)}</span>
           <span className="sess-name">
             {session.unseen && <span className="unseen-dot" role="img" aria-label="Unseen" title="New activity you have not seen" />}
@@ -87,9 +88,10 @@ function SessionRow({ session, selected, selection, hostName, now, table, indent
               <bdi>{hostName}</bdi>
             </span>
           )}
-          {(status.tone === 'attn' || status.tone === 'fail' || status.label === 'Host offline' || status.label === 'Waiting on children' || status.label === 'Parent is handling' || status.label === 'Answer pending delivery') && (
+          {(status.tone === 'attn' || status.tone === 'fail' || status.tone === 'background' || status.label === 'Host offline' || status.label === 'Waiting on children' || status.label === 'Parent is handling' || status.label === 'Answer pending delivery') && (
             <span className={'sess-flag sess-flag-' + status.tone}>{status.label}</span>
           )}
+          <BackgroundCount value={session.background} stale={session.presumed_parked} />
           {status.resume && <span className="sess-resume">Resume</span>}
         </div>
       </Link>

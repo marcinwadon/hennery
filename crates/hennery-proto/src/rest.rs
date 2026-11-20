@@ -32,13 +32,37 @@ pub struct IdleHoldState {
 }
 
 /// `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema, TS)]
 pub struct StartSessionRequest {
+    #[serde(skip)]
+    #[ts(skip)]
+    pub protocol_explicit: bool,
     pub host_id: String,
     pub agent: String,
     pub cwd: String,
     #[serde(flatten)]
     pub config: SessionConfig,
+}
+
+impl<'de> Deserialize<'de> for StartSessionRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct Address {
+            host_id: String,
+            agent: String,
+            cwd: String,
+        }
+        let address: Address = serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?;
+        let config = serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            protocol_explicit: value.get("protocol").is_some(),
+            host_id: address.host_id,
+            agent: address.agent,
+            cwd: address.cwd,
+            config,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -277,8 +301,33 @@ pub enum TitleSource {
 /// One session as the session list shows it (ACP core §8, §9; frontend
 /// §5), read from `sessions` alone: never the catalogue, commands or plan
 /// (P-23). The detail serves it as stored; the list, `bounded`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct BackgroundInfo {
+    pub active: u32,
+    pub done: u32,
+    pub all: u32,
+    pub stale: bool,
+    pub items: Vec<BackgroundItem>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct BackgroundItem {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub background: Option<BackgroundInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub acp_protocol: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub acp_fallback: Option<String>,
     pub session_id: String,
     /// An operator shortcut in navigation; independent of idle parking holds.
     #[serde(default)]

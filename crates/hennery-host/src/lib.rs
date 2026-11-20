@@ -1,6 +1,8 @@
 //! The hennery host: runs ACP adapters for one machine and relays their
 //! sessions to the collector (ACP core spec §2).
 
+pub mod acp_activity;
+mod acp_driver;
 pub mod adapter;
 pub mod agent_home;
 pub mod connection;

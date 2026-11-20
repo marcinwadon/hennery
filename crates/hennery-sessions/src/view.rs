@@ -379,6 +379,7 @@ pub(crate) fn read_page(
     // whole-branch review).
     let mut groups = PageGroups {
         groups: VecDeque::new(),
+        cursors: VecDeque::new(),
         bytes: 0,
         budget,
         dropped: false,
@@ -394,15 +395,16 @@ pub(crate) fn read_page(
                 continue;
             }
             if event.kind == "user_turn" {
-                groups.push(written(store, id, fold.take())?);
+                groups.push(written(store, id, fold.take())?, fold.turn().map(str::to_owned));
             }
             fold.apply(event, &unanswerable);
         }
     }
-    groups.push(written(store, id, fold.take())?);
+    groups.push(written(store, id, fold.take())?, fold.turn().map(str::to_owned));
     older |= groups.dropped;
     // Each item's text is dropped as the page's is written: the two are
     // never both held whole (the security review's 6c).
+    let before_cursor = groups.cursors.front().cloned().flatten();
     let mut page = String::from("{\"items\":[");
     let mut first = true;
     while let Some(group) = groups.groups.pop_front() {
@@ -415,15 +417,20 @@ pub(crate) fn read_page(
         }
     }
     page.push_str(&format!(
-        "],\"revision\":{revision},\"epoch\":{},\"older\":{older}}}",
+        "],\"revision\":{revision},\"epoch\":{},\"older\":{older}",
         serde_json::to_string(epoch())?
     ));
+    if let Some(cursor) = before_cursor {
+        page.push_str(&format!(",\"before_turn\":{}", serde_json::to_string(&cursor)?));
+    }
+    page.push('}');
     Ok(Some(page))
 }
 
 /// A page's groups, oldest first, each as its items' JSON.
 struct PageGroups {
     groups: VecDeque<Vec<String>>,
+    cursors: VecDeque<Option<String>>,
     bytes: usize,
     budget: usize,
     /// Groups were left out for the budget.
@@ -433,14 +440,16 @@ struct PageGroups {
 impl PageGroups {
     /// Add the next group; then leave out the oldest while the page is
     /// past its budget, never the newest.
-    fn push(&mut self, items: Vec<String>) {
+    fn push(&mut self, items: Vec<String>, cursor: Option<String>) {
         if items.is_empty() {
             return;
         }
         self.bytes += items.iter().map(String::len).sum::<usize>();
         self.groups.push_back(items);
+        self.cursors.push_back(cursor);
         while self.bytes > self.budget && self.groups.len() > 1 {
             let oldest = self.groups.pop_front().unwrap_or_default();
+            self.cursors.pop_front();
             self.bytes -= oldest.iter().map(String::len).sum::<usize>();
             self.dropped = true;
         }

@@ -55,6 +55,15 @@ pub enum Body {
     /// The agent's reasoning: consecutive thought chunks, merged.
     Thinking(Text),
     ToolCall(ToolCall),
+    Terminal {
+        terminal_id: String,
+        command: Option<String>,
+        cwd: Option<String>,
+        output: String,
+        #[ts(type = "number | null")]
+        exit_code: Option<i64>,
+        signal: Option<String>,
+    },
     /// The agent's plan, as its latest update in the group left it.
     Plan {
         entries: Vec<PlanEntry>,

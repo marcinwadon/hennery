@@ -18,6 +18,7 @@ import PluginContext from './items/PluginContext'
 import QuestionCard from './items/QuestionCard'
 import Thinking from './items/Thinking'
 import ToolCall from './items/ToolCall'
+import Terminal from './items/Terminal'
 import Unrecognised from './items/Unrecognised'
 import UserTurn from './items/UserTurn'
 import { ArtifactCard } from './SessionFiles'
@@ -34,6 +35,8 @@ export function ItemView({ item, env }: { item: Item; env: ItemEnv }) {
       return <AgentMessage item={item} env={env} />
     case 'thinking':
       return <Thinking item={item} env={env} />
+    case 'terminal':
+      return <Terminal item={item} />
     case 'tool_call':
       return <ToolCall item={item} env={env} />
     case 'plan':

@@ -16,6 +16,7 @@ import { sessionPath } from './SessionRow'
 import { reasonWords } from './items/Marker'
 import SessionName, { useSessionName } from './SessionNames'
 import RenameSession from './RenameSession'
+import BackgroundTasks from './BackgroundTasks'
 
 /** What the header reads: a list summary or a session's detail. */
 export type HeaderInfo = SessionItem & { question_waits?: boolean; operator_attention?: number; review?: ReviewResult; parent_handled_questions?: number; family?: FamilySummary }
@@ -68,6 +69,7 @@ export default function SessionHeader({ id, info, hostName, menu, detailsOpen, t
         family: info.family,
         lifecycle: info.lifecycle,
         activity: info.activity,
+        background: info.background,
         question_waits: !!info.question_waits,
         presumed_parked: !!info.presumed_parked,
       })
@@ -83,10 +85,11 @@ export default function SessionHeader({ id, info, hostName, menu, detailsOpen, t
         {renaming ? <RenameSession key={id} id={id} title={named?.title ?? ''} canReset={named?.title_source === 'operator'} saved={session => { setSavedName({ before: info, session }); finish() }} cancel={finish} /> : <h1 className="conv-name" aria-label={titleName.text}>{onRename && info ? <button ref={titleButton} type="button" className="session-title-button" aria-label="Rename session" title="Rename session" onClick={onRename}><SessionName session={{ ...named, session_id: id }} /></button> : <SessionName session={{ ...named, session_id: id }} />}</h1>}
         {status && (
           <span className={'badge badge-' + status.tone}>
-            <Glyph name={status.tone === 'attn' ? 'hand-raised' : status.tone === 'run' ? 'play-circle' : status.tone === 'fail' ? 'exclamation-circle' : 'clock'} size={14} />
+            {status.tone === 'background' ? <span className="background-ring" aria-hidden="true" /> : <Glyph name={status.tone === 'attn' ? 'hand-raised' : status.tone === 'run' ? 'play-circle' : status.tone === 'fail' ? 'exclamation-circle' : 'clock'} size={14} />}
             {status.label}
           </span>
         )}
+        {info && <BackgroundTasks value={info.background} stale={!!info.presumed_parked || hostConnected === false} />}
         {position >= 0 && <nav className="waiting-navigation" aria-label="Waiting sessions">
           <span>{position + 1} / {waiting.length}{complete ? ' waiting' : ' loaded waiting'}</span>
           {previous ? <Link to={sessionPath(previous.session_id)} aria-label="Previous waiting session">↑</Link> : <button type="button" aria-label="Previous waiting session" disabled>↑</button>}
@@ -123,6 +126,7 @@ export default function SessionHeader({ id, info, hostName, menu, detailsOpen, t
               <bdi>{info.mode}</bdi>
             </span>
           )}
+          {info.acp_protocol && <span className="meta-pill" title={info.acp_fallback || undefined}>ACP v{info.acp_protocol}{info.acp_fallback ? ` · ${info.acp_fallback}` : ''}</span>}
           {delivery && <span className="meta-pill">{delivery.servers} MCP servers</span>}
           {info.family && (info.family.parent || info.family.child_counts.total > 0) && <button type="button" className="meta-toggle" onClick={openFamily}>Family{info.family.child_counts.total > 0 ? ` · ${info.family.child_counts.total}` : ''}</button>}
           {info.lifecycle === 'failed' && info.failure_reason && (

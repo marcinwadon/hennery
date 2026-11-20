@@ -183,11 +183,12 @@ impl Store {
         )?;
         // Operator input has no delegation grant. The current configuration is
         // retained only for the existing automatic-resume confirmation gate.
-        let config = crate::store::stored_config(tx.query_row(
+        let mut config = crate::store::stored_config(tx.query_row(
             "SELECT model,mode,config_axes FROM sessions WHERE owner_id = ?1 AND id=?2",
             params![self.owner_id(), session],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?)?;
+        config.protocol = crate::background::requested_protocol(&tx, self.owner_id(), session)?;
         let config = serde_json::to_string(&config)?;
         tx.execute(
             "INSERT INTO session_dispatch_queue(owner_id,operation_id,source_id,target_id,accepted_revision,payload,required_config,origin,image_bytes)
@@ -367,7 +368,7 @@ impl Store {
     pub fn operator_dispatch_ready(&self, session: &str) -> Result<bool> {
         Ok(self.conn().query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.owner_id = ?1 AND s.id=?2 AND s.lifecycle='active'
-             AND s.open_turn_id IS NULL AND COALESCE(s.activity,'idle')<>'blocked' AND s.close_requested=0
+             AND s.open_turn_id IS NULL AND COALESCE(s.activity,'idle') NOT IN ('blocked','running') AND s.close_requested=0
              AND s.configuration_error IS NULL AND s.presumed_parked=0 AND s.prompt_queue_held=0
              AND NOT EXISTS(SELECT 1 FROM hosts h WHERE h.owner_id = ?1 AND h.id=s.host_id AND h.revoked_at IS NOT NULL)
              AND NOT EXISTS(SELECT 1 FROM session_dispatch_queue q WHERE q.owner_id = ?1 AND q.target_id=?2 AND q.origin='operator' AND q.state IN ('awaiting_reconciliation','steering'))
@@ -415,7 +416,7 @@ impl Store {
         let head: Option<(String, String, String, String, bool)> = tx
             .query_row(
                 "SELECT q.operation_id,q.payload,s.host_id,q.state,
-             s.lifecycle='active' AND s.open_turn_id IS NULL AND COALESCE(s.activity,'idle')<>'blocked'
+             s.lifecycle='active' AND s.open_turn_id IS NULL AND COALESCE(s.activity,'idle') NOT IN ('blocked','running')
              AND s.close_requested=0 AND s.presumed_parked=0 AND s.configuration_error IS NULL AND s.prompt_queue_held=0 AND q.retry_after<=CAST(round(unixepoch('subsec')*1000) AS INTEGER)
              AND NOT EXISTS(SELECT 1 FROM hosts h WHERE h.owner_id = ?1 AND h.id=s.host_id AND h.revoked_at IS NOT NULL)
              AND NOT EXISTS(SELECT 1 FROM pending p WHERE p.owner_id = ?1 AND p.session_id=s.id AND p.state='open')

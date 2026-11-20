@@ -15,13 +15,15 @@ use serde_json::Value;
 /// (ACP core §4.6). Without option ids nothing here can answer it.
 pub fn permission(payload: &Value, option_ids: Option<&[String]>) -> Request {
     let title = payload
-        .pointer("/toolCall/title")
+        .get("title")
+        .or_else(|| payload.pointer("/toolCall/title"))
         .or_else(|| payload.pointer("/_meta/permission/title"))
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
         .map(|t| clip(t, LABEL_MAX_BYTES));
     let tool_call_id = payload
         .pointer("/toolCall/toolCallId")
+        .or_else(|| payload.pointer("/subject/toolCallId"))
         .and_then(Value::as_str)
         .filter(|id| id.len() <= ID_MAX_BYTES)
         .map(str::to_string);

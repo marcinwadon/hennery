@@ -169,6 +169,7 @@ tool_args! {
 fn strict_config<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<crate::frames::SessionConfig, D::Error> {
     let fields = ConfigFields::deserialize(deserializer)?;
     Ok(crate::frames::SessionConfig {
+        protocol: Default::default(),
         cache_retention: Default::default(),
         model: fields.model,
         mode: fields.mode,

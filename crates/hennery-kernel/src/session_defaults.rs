@@ -200,6 +200,7 @@ mod tests {
     }
     fn config() -> SessionConfig {
         SessionConfig {
+            protocol: Default::default(),
             cache_retention: Default::default(),
             model: Some("model-a".into()),
             mode: Some("full".into()),

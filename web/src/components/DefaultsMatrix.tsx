@@ -3,6 +3,7 @@ import type { ConfigValue, HatItem, HatSessionDefaults, HostCatalog, SessionConf
 import { fieldsOf, flatConfig, resolveDefaults, securityWarnings, sparseConfig, usableCatalog, valueLabel } from '../lib/defaults'
 import { putSessionDefaults } from '../api/defaults'
 import { useClient } from '../app-client'
+import ProtocolControl from './ProtocolControl'
 import ConfirmDialog from './ConfirmDialog'
 import { ConfigControl } from './LaunchConfig'
 
@@ -22,7 +23,7 @@ export default function DefaultsMatrix({ hats, records, catalog, onSaved }: {
   return <>
     <div className="defaults-matrix-scroll"><table className="defaults-matrix"><caption>Click a hat cell to override. Reset follows the agent default again.</caption>
       <thead><tr><th scope="col">Setting</th><th scope="col">Agent default</th>{hats.map(hat => <th scope="col" key={hat.id}><bdi>{hat.name}</bdi></th>)}</tr></thead>
-      <tbody>{fields.map(({ key, option }) => <tr key={key}><th scope="row">{option.name}</th><td><bdi>{valueLabel(catalog, key, flatConfig(catalog?.defaults ?? {})[key])}</bdi><span className="config-source">base</span></td>{hats.map(hat => {
+      <tbody><tr><th scope="row">ACP protocol</th><td>v1<span className="config-source">default</span></td>{hats.map(hat => <td key={hat.id}><ProtocolControl value={records[hat.id]?.config.protocol} inherit disabled={!records[hat.id] || hat.purging} onChange={value => propose(hat, 'protocol', 'ACP protocol', value)} /></td>)}</tr>{fields.map(({ key, option }) => <tr key={key}><th scope="row">{option.name}</th><td><bdi>{valueLabel(catalog, key, flatConfig(catalog?.defaults ?? {})[key])}</bdi><span className="config-source">base</span></td>{hats.map(hat => {
         const stored = records[hat.id], result = stored && catalog ? resolveDefaults(catalog, stored.config, {}) : null
         const overridden = !!stored && Object.hasOwn(flatConfig(stored.config), key)
         return <td key={hat.id} className={overridden ? 'matrix-override' : 'matrix-inherits'}><div role="group" aria-label={`${option.name} for ${hat.name}`}>

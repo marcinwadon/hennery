@@ -773,10 +773,12 @@ async fn execute(state: &AppState, command: &mut Command, args: Value) -> Result
     let id = command.session_id.clone();
     let response = match command.tool.as_str() {
         "session_create" | "session_clone" => {
+            let protocol_explicit = args.get("config").and_then(|v| v.get("protocol")).is_some();
             let q: Create = decode(args)?;
             crate::api::start_in_hat(
                 state_,
                 StartSessionRequest {
+                    protocol_explicit,
                     host_id: q.host_id,
                     cwd: q.cwd,
                     agent: q.agent,

@@ -216,6 +216,66 @@ pub fn merge(call: &mut ToolCall, update: &Value) -> bool {
     *call != before
 }
 
+/// V2 fields are patches: omission preserves, null clears, and arrays replace
+/// even when empty. Keep the v1 merge contract for historical adapter traces.
+pub fn merge_v2(call: &mut ToolCall, update: &Value) -> bool {
+    let before = call.clone();
+    merge(call, update);
+    for (key, field) in [
+        ("title", &mut call.title),
+        ("kind", &mut call.tool_kind),
+        ("status", &mut call.status),
+    ] {
+        if update.get(key) == Some(&Value::Null) {
+            *field = None;
+        } else if let Some(value) = update.get(key).and_then(Value::as_str) {
+            *field = Some(clip(value, LABEL_MAX_BYTES));
+        }
+    }
+    if update.get("rawInput") == Some(&Value::Null) {
+        call.input = None;
+    } else if update
+        .get("rawInput")
+        .is_some_and(|value| value.as_object().is_some_and(|fields| fields.is_empty()))
+    {
+        call.input = Some(serde_json::json!({}));
+    }
+    if update.get("rawOutput") == Some(&Value::Null) {
+        call.output = None;
+        call.fabricated = None;
+    }
+    if update
+        .get("content")
+        .is_some_and(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+    {
+        call.content.clear();
+    }
+    if update
+        .get("locations")
+        .is_some_and(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty))
+    {
+        call.locations.clear();
+    }
+    *call != before
+}
+
+pub fn append_content(call: &mut ToolCall, content: &Value) -> bool {
+    if call.content.len() >= CONTENT_MAX_BLOCKS {
+        let changed = !call.truncated;
+        call.truncated = true;
+        return changed;
+    }
+    let (block, truncated) = content_block(content);
+    if let ToolContent::Text { text } = &block {
+        let output = call.output.get_or_insert_with(String::new);
+        let (_, cut_off) = crate::cap::append(output, text, TEXT_MAX_BYTES);
+        call.truncated |= cut_off;
+    }
+    call.content.push(block);
+    call.truncated |= truncated;
+    true
+}
+
 /// What a tool call weighs held in memory, near enough: its strings' bytes.
 pub fn weight(call: &ToolCall) -> usize {
     let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);

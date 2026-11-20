@@ -395,7 +395,7 @@ export default function NewSession() {
             const fields = new Map(fieldsOf(actual).map(field => [field.key, field.option]))
             const values = flatConfig(actual ?? {})
             const choices = Object.entries(flatConfig(launchConfig)).filter(([key, value]) => {
-              if (security.has(key)) return false
+              if (key === 'protocol' || security.has(key)) return false
               const option = fields.get(key)
               return !option || !supports(option, value) || values[key] !== value || option.current !== value
             }).map(([key]) => ({ key, label: fields.get(key)?.name ?? key }))

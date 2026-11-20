@@ -152,7 +152,7 @@ export async function confirmStart(
 ): Promise<'confirmed' | 'hat_changed' | 'config_unconfirmed'> {
   const deadline = Date.now() + timeoutMs
   const path = `/api/sessions/${encodeURIComponent(id)}`
-  const expected = flatConfig(requested)
+  const { protocol: _protocol, ...expected } = flatConfig(requested)
   do {
     const left = deadline - Date.now()
     if (left <= 0) break
@@ -161,6 +161,11 @@ export async function confirmStart(
       if (detail.hat_id !== hat) return 'hat_changed'
       if (detail.failure_reason || ['failed', 'closed', 'parked'].includes(detail.lifecycle)) return 'config_unconfirmed'
       if (detail.lifecycle === 'active') {
+        if (requested.protocol) {
+          const actual = detail.acp_protocol
+          if (requested.protocol === 'v2-v1' ? actual !== 1 && actual !== 2 : actual !== (requested.protocol === 'v2' ? 2 : 1)) return 'config_unconfirmed'
+          if (Object.keys(expected).length === 0) return 'confirmed'
+        }
         if (!verifyConfig) return 'confirmed'
         const catalog = await client.request<import('../generated/protocol').SessionCatalog>('GET', `${path}/catalog`, undefined, { timeoutMs: Math.max(1, deadline - Date.now()) })
         onCatalog?.(catalog)

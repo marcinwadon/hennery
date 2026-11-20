@@ -1,4 +1,5 @@
 import type { ConfigValue, HostCatalog, SessionConfig } from '../generated/protocol'
+import { protocolValue } from './protocol'
 import { catalogFields, configOptions, type ConfigOption } from './catalog'
 
 export type Picks = Record<string, ConfigValue | null>
@@ -17,11 +18,11 @@ export function securityKeys(catalog: Pick<HostCatalog, 'security'>): Set<string
   return new Set(['mode', ...Object.keys(catalog.security.axes)])
 }
 export function flatConfig(config: SessionConfig): Record<string, ConfigValue> {
-  return { ...(config.axes ?? {}), ...(config.model == null ? {} : { model: config.model }), ...(config.mode == null ? {} : { mode: config.mode }) }
+  return { ...(config.axes ?? {}), ...(config.protocol ? { protocol: config.protocol } : {}), ...(config.model == null ? {} : { model: config.model }), ...(config.mode == null ? {} : { mode: config.mode }) }
 }
 export function sparseConfig(flat: Record<string, ConfigValue>): SessionConfig {
-  const { model, mode, ...axes } = flat
-  return { ...(typeof model === 'string' ? { model } : {}), ...(typeof mode === 'string' ? { mode } : {}), ...(Object.keys(axes).length ? { axes } : {}) }
+  const { model, mode, protocol, ...axes } = flat
+  return { ...(protocolValue(protocol) ? { protocol: protocolValue(protocol) } : {}), ...(typeof model === 'string' ? { model } : {}), ...(typeof mode === 'string' ? { mode } : {}), ...(Object.keys(axes).length ? { axes } : {}) }
 }
 export function supports(option: ConfigOption, value: ConfigValue): boolean {
   return option.kind === 'boolean' ? typeof value === 'boolean' : typeof value === 'string' && option.choices.some(choice => choice.value === value)
@@ -49,6 +50,7 @@ export function resolveDefaults(catalog: HostCatalog, stored: SessionConfig, pic
   let blocked = false
   const security = securityKeys(catalog)
   for (const [key, value] of Object.entries(baseline)) {
+    if (key === 'protocol' && protocolValue(value)) { flat[key] = value; sources[key] = 'Agent default'; continue }
     const option = offered.get(key)
     if (option && supports(option, value)) { flat[key] = value; sources[key] = 'Agent default' }
     else {
@@ -59,6 +61,11 @@ export function resolveDefaults(catalog: HostCatalog, stored: SessionConfig, pic
   // Model is resolved first, independently of catalog ordering.
   const keys = [...new Set(['model', ...Object.keys(saved), ...Object.keys(picks)])]
   const overlay = (key: string) => {
+    if (key === 'protocol') {
+      const value = Object.hasOwn(picks, key) ? picks[key] : saved[key]
+      if (protocolValue(value)) { flat[key] = value as string; sources[key] = Object.hasOwn(picks, key) ? 'Your choice' : 'Hat override' }
+      return
+    }
     const explicit = Object.hasOwn(picks, key), value = explicit ? picks[key] : saved[key]
     if (value === undefined || value === null) return
     const option = offered.get(key)
@@ -86,6 +93,7 @@ export function resolveDefaults(catalog: HostCatalog, stored: SessionConfig, pic
 /** Use adapter display labels in the UI; exact ids remain in requests. */
 export function valueLabel(catalog: Pick<HostCatalog, 'config_options'> | null, key: string, value: ConfigValue | undefined): string {
   if (value === undefined) return 'Agent default'
+  if (key === 'protocol') return value === 'v2-v1' ? 'v2 / v1' : String(value)
   if (typeof value === 'boolean') return value ? 'On' : 'Off'
   const option = fieldsOf(catalog).find(field => field.key === key)?.option
   return option?.kind === 'select' ? option.choices.find(choice => choice.value === value)?.name ?? value : value

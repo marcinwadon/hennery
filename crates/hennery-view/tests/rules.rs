@@ -63,6 +63,221 @@ fn text(item: &Item) -> &str {
 }
 
 #[test]
+fn v2_message_identity_survives_interleaved_chunks_and_whole_upserts() {
+    let mut fold = Fold::new();
+    for (i, id, value) in [(1, "a", "first"), (2, "b", "second"), (3, "a", " tail")] {
+        let mut event = acp(
+            i,
+            json!({"sessionUpdate":"agent_message_chunk","messageId":id,"content":{"type":"text","text":value}}),
+        );
+        event.body["indexed"]["acp_protocol"] = json!(2);
+        fold.apply(&event, &none);
+    }
+    let items = fold.take();
+    assert_eq!(items.len(), 2);
+    assert_eq!(text(&items[0]), "first tail");
+    let mut replacement = acp(
+        4,
+        json!({"sessionUpdate":"agent_message","messageId":"a","content":[{"type":"text","text":"replacement"}]}),
+    );
+    replacement.body["indexed"]["acp_protocol"] = json!(2);
+    fold.apply(&replacement, &none);
+    let changed = fold.take();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].id, items[0].id);
+    assert_eq!(text(&changed[0]), "replacement");
+}
+
+#[test]
+fn v2_terminal_snapshots_replace_and_chunks_append() {
+    let mut fold = Fold::new();
+    for (id, update) in [
+        (
+            1,
+            json!({"sessionUpdate":"terminal_update","terminalId":"t","command":"test","output":{"data":"b2xk"}}),
+        ),
+        (
+            2,
+            json!({"sessionUpdate":"terminal_update","terminalId":"t","output":{"data":"bmV3"}}),
+        ),
+        (
+            3,
+            json!({"sessionUpdate":"terminal_output_chunk","terminalId":"t","data":"IQ=="}),
+        ),
+        (
+            4,
+            json!({"sessionUpdate":"terminal_update","terminalId":"t","exitStatus":{"exitCode":7}}),
+        ),
+    ] {
+        fold.apply(&acp(id, update), &none);
+    }
+    let items = fold.take();
+    assert_eq!(items.len(), 1);
+    match &items[0].body {
+        Body::Terminal { output, exit_code, .. } => {
+            assert_eq!(output, "new!");
+            assert_eq!(*exit_code, Some(7));
+        }
+        other => panic!("expected terminal: {other:?}"),
+    }
+}
+
+#[test]
+fn v2_terminal_byte_chunks_preserve_split_utf8_and_nullable_patches() {
+    let mut fold = Fold::new();
+    for (id, update) in [
+        (
+            1,
+            json!({"sessionUpdate":"terminal_update","terminalId":"t","command":"old"}),
+        ),
+        (
+            2,
+            json!({"sessionUpdate":"terminal_output_chunk","terminalId":"t","data":"4oI="}),
+        ),
+        (
+            3,
+            json!({"sessionUpdate":"terminal_output_chunk","terminalId":"t","data":"rA=="}),
+        ),
+        (
+            4,
+            json!({"sessionUpdate":"terminal_update","terminalId":"t","command":null}),
+        ),
+    ] {
+        fold.apply(&acp(id, update), &none);
+    }
+    let items = fold.take();
+    if let Body::Terminal { output, command, .. } = &items[0].body {
+        assert_eq!(output, "€");
+        assert!(command.is_none());
+    } else {
+        panic!("expected terminal");
+    }
+}
+
+#[test]
+fn v2_seed_restores_terminal_across_turns_and_partial_pages() {
+    let mut first = acp(
+        2,
+        json!({"sessionUpdate":"terminal_update","terminalId":"t","command":"sleep","output":{"data":"aGk="}}),
+    );
+    first.body["indexed"]["acp_protocol"] = json!(2);
+    first.body["_view_entity_prefix"] = json!("lineage");
+    let mut a = Fold::new();
+    a.apply(&turn(1, "A"), &none);
+    a.apply(&first, &none);
+    let (seed, bytes) = a.entity_state(&first).unwrap();
+    let mut last = acp(
+        4,
+        json!({"sessionUpdate":"terminal_update","terminalId":"t","exitStatus":{"exitCode":0}}),
+    );
+    last.body["indexed"]["acp_protocol"] = json!(2);
+    last.body["_view_entity_prefix"] = json!("lineage");
+    last.body["_view_seed"] = serde_json::to_value(&seed).unwrap();
+    use base64::Engine;
+    last.body["_view_terminal_bytes"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+    a.apply(&turn(3, "B"), &none);
+    a.apply(&last, &none);
+    let mut b = Fold::new();
+    b.apply(&turn(3, "B"), &none);
+    b.apply(&last, &none);
+    let full = a.take();
+    let partial = b.take();
+    let one = full.iter().find(|i| i.id == seed.id).unwrap();
+    let two = partial.iter().find(|i| i.id == seed.id).unwrap();
+    assert_eq!(one, two);
+    assert_eq!(full.iter().filter(|i| i.id == seed.id).count(), 1);
+    if let Body::Terminal {
+        command,
+        output,
+        exit_code,
+        ..
+    } = &two.body
+    {
+        assert_eq!(command.as_deref(), Some("sleep"));
+        assert_eq!(output, "hi");
+        assert_eq!(*exit_code, Some(0));
+    } else {
+        panic!("expected terminal");
+    }
+}
+
+#[test]
+fn v2_seed_keeps_sparse_tool_input_and_lineages_separate() {
+    let mut first = acp(
+        1,
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"t","title":"root tool","rawInput":{"path":"x"}}),
+    );
+    first.body["indexed"]["acp_protocol"] = json!(2);
+    first.body["_view_entity_prefix"] = json!("root");
+    let mut a = Fold::new();
+    a.apply(&first, &none);
+    let (seed, _) = a.entity_state(&first).unwrap();
+    let mut patch = acp(
+        3,
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"t","status":"completed"}),
+    );
+    patch.body["indexed"]["acp_protocol"] = json!(2);
+    patch.body["_view_entity_prefix"] = json!("root");
+    patch.body["_view_seed"] = serde_json::to_value(seed).unwrap();
+    let mut b = Fold::new();
+    b.apply(&turn(2, "B"), &none);
+    b.apply(&patch, &none);
+    let mut child = patch.clone();
+    child.event_id = 4;
+    child.body.as_object_mut().unwrap().remove("_view_seed");
+    child.body["_view_entity_prefix"] = json!("child");
+    child.body["payload"]["update"]["title"] = json!("child tool");
+    b.apply(&child, &none);
+    let items = b.take();
+    let calls: Vec<_> = items
+        .iter()
+        .filter_map(|i| if let Body::ToolCall(c) = &i.body { Some(c) } else { None })
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].title.as_deref(), Some("root tool"));
+    assert_eq!(calls[0].input, Some(json!({"path":"x"})));
+    assert_eq!(calls[1].title.as_deref(), Some("child tool"));
+}
+
+#[test]
+fn v2_tool_patches_clear_fields_and_stream_content_without_replacing_old_content() {
+    let mut fold = Fold::new();
+    for (id, update) in [
+        (
+            1,
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"t","title":"old","content":[{"type":"content","content":{"type":"text","text":"first"}}]}),
+        ),
+        (
+            2,
+            json!({"sessionUpdate":"tool_call_content_chunk","toolCallId":"t","content":{"type":"content","content":{"type":"text","text":"second"}}}),
+        ),
+        (
+            3,
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"t","title":null,"content":[]}),
+        ),
+    ] {
+        let mut event = acp(id, update);
+        event.body["indexed"]["acp_protocol"] = json!(2);
+        fold.apply(&event, &none);
+        if id == 2 {
+            let items = fold.take();
+            if let Body::ToolCall(call) = &items[0].body {
+                assert_eq!(call.content.len(), 2);
+            } else {
+                panic!("expected tool");
+            }
+        }
+    }
+    let items = fold.take();
+    if let Body::ToolCall(call) = &items[0].body {
+        assert!(call.title.is_none());
+        assert!(call.content.is_empty());
+    } else {
+        panic!("expected tool");
+    }
+}
+
+#[test]
 fn chunks_merge_keeping_the_first_timestamp_until_another_item() {
     let events = [
         turn(1, "t1"),

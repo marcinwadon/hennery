@@ -16,6 +16,7 @@ description = "Pure display fold for hennery session events"
 dist = false
 
 [dependencies]
+base64.workspace = true
 hennery-proto.workspace = true
 schemars.workspace = true
 serde.workspace = true

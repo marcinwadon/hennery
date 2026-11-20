@@ -1256,6 +1256,7 @@ fn changed_model_does_not_inherit_another_models_nonsecurity_axes() {
     use hennery_sessions::delegation_runtime::launch_configuration;
     let mut c = catalog();
     c.defaults = SessionConfig {
+        protocol: Default::default(),
         cache_retention: Default::default(),
         model: Some("opus".into()),
         mode: Some("default".into()),
@@ -2794,6 +2795,7 @@ fn required_model_mode_and_axes_hold_mismatch_then_current_repair_releases() {
     for field in ["model", "mode", "effort"] {
         let (w, p) = pair();
         let required = SessionConfig {
+            protocol: Default::default(),
             cache_retention: Default::default(),
             model: Some("wanted".into()),
             mode: Some("plan".into()),
@@ -2826,6 +2828,7 @@ fn required_model_mode_and_axes_hold_mismatch_then_current_repair_releases() {
 async fn configuration_mismatch_expires_visibly_after_a_bounded_wait() {
     let (w, p) = pair();
     let required = SessionConfig {
+        protocol: Default::default(),
         cache_retention: Default::default(),
         model: Some("wanted".into()),
         mode: Some("plan".into()),
@@ -4429,6 +4432,7 @@ fn current_path_rule_blocks_cross_hat_allocation_and_queued_dispatch() {
 fn evidence_validator_requires_each_independent_proof_field() {
     use hennery_sessions::delegation_runtime::evidence_satisfies;
     let required = SessionConfig {
+        protocol: Default::default(),
         cache_retention: Default::default(),
         model: Some("wanted".into()),
         mode: Some("default".into()),

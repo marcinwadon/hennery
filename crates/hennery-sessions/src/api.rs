@@ -472,6 +472,7 @@ async fn new_like_this(
     start_in_hat(
         state,
         StartSessionRequest {
+            protocol_explicit: true,
             host_id: source.host_id,
             agent: source.agent,
             cwd,
@@ -552,7 +553,7 @@ pub(crate) async fn start_in_hat(
     // configuration and are left alone, as in the launcher.
     if external.as_ref().is_some_and(|c| c.tool == "session_create") {
         match state.hosts.session_defaults(&hat.hat_id, &req.agent) {
-            Ok(Some(defaults)) => fill_defaults(&mut req.config, defaults.config),
+            Ok(Some(defaults)) => fill_defaults(&mut req.config, defaults.config, req.protocol_explicit),
             Ok(None) => {}
             Err(err) => return internal(err),
         }
@@ -670,7 +671,10 @@ pub(crate) async fn start_in_hat(
 
 /// Every model, mode and axis the request leaves unset takes the saved
 /// default; what it names wins. Cache retention is not a saved default.
-fn fill_defaults(config: &mut SessionConfig, defaults: SessionConfig) {
+fn fill_defaults(config: &mut SessionConfig, defaults: SessionConfig, protocol_explicit: bool) {
+    if !protocol_explicit {
+        config.protocol = defaults.protocol;
+    }
     if config.model.is_none() {
         config.model = defaults.model;
     }
@@ -2920,6 +2924,32 @@ mod not_sent_tests {
             let (_, body) = answer(response).await;
             let message = body["message"].as_str().unwrap();
             assert!(!message.contains(&token) && message.contains("<redacted>"), "{message}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod acp_protocol_defaults_tests {
+    use super::*;
+    use hennery_proto::frames::AcpProtocolPreference as P;
+    #[test]
+    fn omitted_protocol_inherits_and_explicit_v1_wins() {
+        for (extra, expected) in [
+            (serde_json::json!({}), P::V2),
+            (serde_json::json!({"protocol":"v1"}), P::V1),
+        ] {
+            let mut value = serde_json::json!({"host_id":"h","agent":"a","cwd":"/tmp"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let mut req: StartSessionRequest = serde_json::from_value(value).unwrap();
+            let defaults = SessionConfig {
+                protocol: P::V2,
+                ..Default::default()
+            };
+            fill_defaults(&mut req.config, defaults, req.protocol_explicit);
+            assert_eq!(req.config.protocol, expected);
         }
     }
 }

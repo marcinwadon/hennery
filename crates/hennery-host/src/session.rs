@@ -7,10 +7,12 @@
 //! park, close). The ACP connection runs in a task of its own, so a dead
 //! adapter never takes the actor's teardown down with it.
 
+use crate::acp_driver::Driver as ConnectionTo;
 use crate::adapter::{Adapter, ExitInfo, KILL_GRACE, scrub};
 pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::profile::{Profile, Secrets};
 use crate::uplink::Uplink;
+use agent_client_protocol::Responder;
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::v1::schema::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
@@ -19,7 +21,6 @@ use agent_client_protocol::v1::schema::{
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
-use agent_client_protocol::v1::{ConnectionTo, Responder};
 use agent_client_protocol::{Agent, ByteStreams, Client, ErrorCode, UntypedMessage};
 use hennery_proto::delegation_host::{ConfigCompleteness, ConfigEvidence, PromptFence};
 use hennery_proto::frames::{
@@ -87,6 +88,14 @@ const HISTORY_KINDS: &[&str] = &[
     "tool_call",
     "tool_call_update",
     "plan",
+    "user_message",
+    "agent_message",
+    "agent_thought",
+    "session_message",
+    "session_message_chunk",
+    "tool_call_content_chunk",
+    "terminal_output_chunk",
+    "plan_update",
 ];
 
 /// Update kinds that describe the adapter's current state: passed through
@@ -97,6 +106,10 @@ const STATE_KINDS: &[&str] = &[
     "current_mode_update",
     "usage_update",
     "session_info_update",
+    "state_update",
+    "terminal_update",
+    "subagent_update",
+    "replay_complete",
 ];
 
 /// Messages from the connection task to a session actor.
@@ -550,6 +563,7 @@ fn launch_inner(
     }));
     let hook_set_hashes = hook_set_hashes(launch.hooks.as_ref());
     let actor = Actor {
+        protocol: Mutex::new((1, None)),
         cache_retention: (launch.profile == Profile::Claude).then_some(launch.config.cache_retention),
         hook_sets_applied: launch
             .hooks
@@ -568,7 +582,7 @@ fn launch_inner(
         options,
         catalogue: Mutex::new(Catalogue::default()),
         questions: Mutex::new(Questions::default()),
-        inbound: OnceLock::new(),
+        inbound: Mutex::new(None),
         probe: Mutex::new(None),
         base_probe: Mutex::new(None),
         project_probe: Mutex::new(None),
@@ -684,7 +698,7 @@ const MAX_QUESTION_TITLE: usize = 200;
 /// option ids are; the collector puts it on one line.
 fn question_title(kind: PendingKind, params: &Value) -> Option<String> {
     let title = match kind {
-        PendingKind::Permission => params.pointer("/toolCall/title"),
+        PendingKind::Permission => params.get("title").or_else(|| params.pointer("/toolCall/title")),
         PendingKind::Elicitation => params.get("message"),
     }?
     .as_str()?;
@@ -901,6 +915,7 @@ enum Early {
 /// to open, and the unknown kinds that were dropped (ACP core §4.5).
 #[derive(Default)]
 struct Replay {
+    v2_live: bool,
     kept: Vec<Early>,
     unknown: BTreeMap<String, usize>,
 }
@@ -911,7 +926,10 @@ impl Replay {
             .as_str()
             .unwrap_or("<none>")
             .to_string();
-        if STATE_KINDS.contains(&kind.as_str()) {
+        if kind == "replay_complete" {
+            self.v2_live = true;
+        }
+        if self.v2_live || STATE_KINDS.contains(&kind.as_str()) {
             self.kept.push(Early::Update(payload));
         } else if !HISTORY_KINDS.contains(&kind.as_str()) {
             *self.unknown.entry(kind).or_default() += 1;
@@ -970,6 +988,7 @@ impl Drop for AcpTask {
 }
 
 struct Actor {
+    protocol: Mutex<(u16, Option<String>)>,
     cache_retention: Option<hennery_proto::usage::CacheRetention>,
     /// The delivered hook sets that reach the agent (skills spec §8).
     hook_sets_applied: Vec<hennery_proto::frames::HookSetApplied>,
@@ -988,7 +1007,7 @@ struct Actor {
     questions: Mutex<Questions>,
     /// The inbound channel, for the questions' withdrawal watchers and the
     /// git probe.
-    inbound: OnceLock<mpsc::UnboundedSender<Inbound>>,
+    inbound: Mutex<Option<mpsc::UnboundedSender<Inbound>>>,
     /// The git probe of the last turn's end, if it still runs: a newer one
     /// replaces it, which aborts it, and so does the actor's end.
     probe: Mutex<Option<Watcher>>,
@@ -1040,7 +1059,7 @@ impl Actor {
     }
     fn send_steering(
         &self,
-        conn: &ConnectionTo<Agent>,
+        conn: &ConnectionTo,
         session: &SessionId,
         request_id: String,
         content: Vec<Value>,
@@ -1151,7 +1170,13 @@ impl Actor {
         self.secrets.redact(&err.to_string())
     }
 
-    fn emit(&self, body: SessionBody) {
+    fn emit(&self, mut body: SessionBody) {
+        if let SessionBody::AcpUpdate { indexed, .. } = &mut body {
+            let version = self.protocol.lock().expect("protocol lock").0;
+            if version == 2 {
+                indexed.acp_protocol = Some(version);
+            }
+        }
         // ACP core §8: an adapter can echo its MCP config in an error or on
         // stderr.
         let body = self.secrets.redact_body(body);
@@ -1192,6 +1217,10 @@ impl Actor {
         });
         let mut indexed = self.catalogue_extracts();
         indexed.steering_supported = steering_supported;
+        let protocol = self.protocol.lock().expect("protocol lock");
+        indexed.acp_protocol = (protocol.0 == 2 || protocol.1.is_some()).then_some(protocol.0);
+        indexed.acp_fallback = protocol.1.clone();
+        drop(protocol);
         indexed.cache_retention = self.cache_retention;
         indexed.hook_sets_applied = self.hook_sets_applied.clone();
         indexed.mcp_source_policy = self.mcp_source_policy.clone();
@@ -1234,7 +1263,8 @@ impl Actor {
 
     async fn run(self, launch: Launch, mut commands: mpsc::UnboundedReceiver<SessionCmd>) {
         let cwd = launch.cwd.clone();
-        self.drive(launch, &mut commands).await;
+        let deadline = Instant::now() + self.options.start_timeout;
+        self.drive(launch, &mut commands, deadline).await;
         if self.agent_session_id.lock().expect("agent session id lock").is_none()
             && let Some(roots) = self.options.project_roots.clone()
         {
@@ -1304,7 +1334,8 @@ impl Actor {
 
     /// The actor's life: start, then serve until it parks, closes or ends.
     /// Every return leaves the session's final frame in the outbox.
-    async fn drive(&self, launch: Launch, commands: &mut mpsc::UnboundedReceiver<SessionCmd>) {
+    async fn drive(&self, launch: Launch, commands: &mut mpsc::UnboundedReceiver<SessionCmd>, deadline: Instant) {
+        let retry_launch = launch.clone();
         let Launch {
             request_id,
             attach,
@@ -1413,8 +1444,13 @@ impl Actor {
         // into the connection task.
         let switch_tx = updates_tx.clone();
         let questions_tx = updates_tx.clone();
-        let _ = self.inbound.set(updates_tx.clone());
-        let (conn_tx, conn_rx) = oneshot::channel::<ConnectionTo<Agent>>();
+        *self.inbound.lock().expect("inbound lock") = Some(updates_tx.clone());
+        let (conn_tx, conn_rx) = oneshot::channel::<ConnectionTo>();
+        let protocol_preference = config.protocol;
+        let driver_slot = Arc::new(OnceLock::<ConnectionTo>::new());
+        let handler_driver = driver_slot.clone();
+        let activity = Arc::new(Mutex::new(crate::acp_activity::Activity::default()));
+        let handler_activity = activity.clone();
         let (_stop_tx, stop_rx) = oneshot::channel::<()>();
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
         let session_id = self.session_id.clone();
@@ -1422,15 +1458,31 @@ impl Actor {
         #[cfg(feature = "test-hooks")]
         let hooks = self.options.test_hooks.clone();
         let _acp = AcpTask(tokio::spawn(async move {
-            let result = Client
-                .v1()
+            let closed_driver = driver_slot.clone();
+            let ended_driver = driver_slot.clone();
+            let result = agent_client_protocol::Builder::new(Client)
                 .name("hennery-host")
+                .on_close(async move |_cx| {
+                    if let Some(driver) = closed_driver.get() {
+                        driver.closed();
+                    }
+                    Ok(())
+                })
                 // Raw handler: payloads are forwarded verbatim, including
                 // update kinds this build does not know (ACP core §2.4).
                 .on_receive_notification(
                     async move |msg: UntypedMessage, _cx| {
                         if msg.method == "session/update" {
-                            let _sent = updates_tx.send(Inbound::Update(msg.params));
+                            if handler_driver.get().and_then(ConnectionTo::root_session).as_deref()
+                                == msg.params["sessionId"].as_str()
+                            {
+                                handler_activity.lock().expect("activity lock").observe(&msg.params);
+                            }
+                            let payload = msg.params;
+                            let _sent = updates_tx.send(Inbound::Update(payload.clone()));
+                            if let Some(driver) = handler_driver.get() {
+                                driver.observe(&payload);
+                            }
                             #[cfg(feature = "test-hooks")]
                             if _sent.is_ok()
                                 && let Some(hooks) = &hooks
@@ -1465,13 +1517,30 @@ impl Actor {
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
-                .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
-                    let _ = conn_tx.send(conn);
-                    // Keep the connection up until the actor ends.
-                    let _ = stop_rx.await;
-                    Ok(())
-                })
+                .connect_with(
+                    transport,
+                    async move |conn: agent_client_protocol::ConnectionTo<Agent>| {
+                        use hennery_proto::frames::AcpProtocolPreference;
+                        let driver = ConnectionTo::new(
+                            conn,
+                            protocol_preference != AcpProtocolPreference::V1,
+                            protocol_preference != AcpProtocolPreference::V2,
+                        )
+                        .with_steering_required(matches!(
+                            profile,
+                            Profile::Claude | Profile::ClaudeOwnCli | Profile::Codex
+                        ));
+                        let _ = driver_slot.set(driver.clone());
+                        let _ = conn_tx.send(driver);
+                        // Keep the connection up until the actor ends.
+                        let _ = stop_rx.await;
+                        Ok(())
+                    },
+                )
                 .await;
+            if let Some(driver) = ended_driver.get() {
+                driver.closed();
+            }
             if let Err(err) = result {
                 let error = secrets.redact(&err.to_string());
                 tracing::debug!(%session_id, %error, "ACP connection ended");
@@ -1488,7 +1557,6 @@ impl Actor {
         };
         // One deadline for the whole start: the switches share it, so a slow
         // one cannot push the answer past the collector's start timeout.
-        let deadline = Instant::now() + self.options.start_timeout;
         // What the adapter sends before `session_started`, emitted after it.
         // Outside the start's future, so a start that runs out of time can
         // still say which questions it was holding back.
@@ -1521,7 +1589,22 @@ impl Actor {
         };
         let (agent_session, applied, images, agent_defaults, steering_supported) = match started {
             Ok(started) => started,
-            Err(error) => {
+            Err(mut error) => {
+                if let Some(cause) = conn.retry_v1() {
+                    error.code = cause.error_code();
+                    let reason = cause.reason().to_string();
+                    if config.protocol == hennery_proto::frames::AcpProtocolPreference::V2V1 {
+                        // A peer rejecting v2 may leave connection-local state,
+                        // and an accepted v2 handshake fixes its wire version.
+                        // Restart before any session/new or resume in both cases.
+                        adapter.terminate(self.options.kill_grace).await;
+                        drop(_acp);
+                        let mut retry = retry_launch;
+                        retry.config.protocol = hennery_proto::frames::AcpProtocolPreference::V1;
+                        *self.protocol.lock().expect("protocol lock") = (1, Some(reason));
+                        return Box::pin(self.drive(retry, commands, deadline)).await;
+                    }
+                }
                 self.begin_ending();
                 adapter.terminate(self.options.kill_grace).await;
                 return self.start_failed(request_id, error);
@@ -1548,6 +1631,8 @@ impl Actor {
                 },
             );
         }
+        let retained_fallback = self.protocol.lock().expect("protocol lock").1.clone();
+        *self.protocol.lock().expect("protocol lock") = (conn.version(), conn.fallback().or(retained_fallback));
         let applied_hung = applied.hung;
         *self.catalogue.lock().expect("catalogue lock") = Catalogue {
             options: applied.options,
@@ -1590,7 +1675,12 @@ impl Actor {
         }
         for early in early {
             match early {
-                Early::Update(payload) => self.emit(early_update(payload)),
+                Early::Update(payload) => {
+                    if payload["sessionId"].as_str() == Some(agent_session.to_string().as_str()) {
+                        activity.lock().expect("activity lock").observe(&payload);
+                    }
+                    self.emit(early_update(payload));
+                }
                 Early::Question(question) => self.open_question(question, None),
             }
         }
@@ -1737,7 +1827,7 @@ impl Actor {
                             tracing::info!(%turn_id, "ignoring duplicate prompt delivery");
                             continue;
                         }
-                        if turn.is_some() {
+                        if turn.is_some() || (conn.version() == 2 && activity.lock().expect("activity lock").foreground_busy()) {
                             self.reject(request_id, "turn_in_progress", "a turn is already running".into());
                             continue;
                         }
@@ -1922,7 +2012,7 @@ impl Actor {
                 // Never with a question open, in a turn or not: it has no
                 // timeout (ACP core §4.6).
                 _ = idle_deadline(idle_timeout, idle_since),
-                    if !idle_held && turn.is_none() && configs.out.is_none() && configs.orphan.is_none() && !self.has_questions() =>
+                    if !idle_held && !activity.lock().expect("activity lock").blocks_parking() && turn.is_none() && configs.out.is_none() && configs.orphan.is_none() && !self.has_questions() =>
                 {
                     tracing::info!(session_id = %self.session_id, "reaping idle session");
                     self.begin_ending();
@@ -1980,7 +2070,7 @@ impl Actor {
     /// switch's own answer — out of the order the operator sent them in.
     fn send_next_switch(
         &self,
-        conn: &ConnectionTo<Agent>,
+        conn: &ConnectionTo,
         session: &SessionId,
         updates_tx: &mpsc::UnboundedSender<Inbound>,
         configs: &mut PendingConfigs,
@@ -2156,8 +2246,9 @@ impl Actor {
         }
         match inbound {
             Inbound::Update(payload) => {
+                let activity = payload["update"]["sessionUpdate"] == "state_update";
                 self.emit(self.live_update(payload, turn));
-                false
+                activity
             }
             Inbound::SteeringAnswer { request_id, outcome } => {
                 self.emit(SessionBody::SteeringResult { request_id, outcome });
@@ -2197,7 +2288,10 @@ impl Actor {
     /// Resolve repository metadata after attachment without holding the actor.
     /// The ordered result follows session_started; actor shutdown aborts it.
     fn probe_project_root(&self, cwd: &std::path::Path) {
-        let (Some(roots), Some(inbound)) = (self.options.project_roots.clone(), self.inbound.get().cloned()) else {
+        let (Some(roots), Some(inbound)) = (
+            self.options.project_roots.clone(),
+            self.inbound.lock().expect("inbound lock").clone(),
+        ) else {
             return;
         };
         let cwd = cwd.to_path_buf();
@@ -2223,7 +2317,10 @@ impl Actor {
     /// to be over (it is bounded too), so a quick first turn cannot cost the
     /// base and the states stay in order. Turns' probes replace each other.
     fn probe_git(&self, cwd: &std::path::Path, base: bool) {
-        let (Some(git), Some(inbound)) = (self.options.git.clone(), self.inbound.get().cloned()) else {
+        let (Some(git), Some(inbound)) = (
+            self.options.git.clone(),
+            self.inbound.lock().expect("inbound lock").clone(),
+        ) else {
             return;
         };
         let cwd = cwd.to_path_buf();
@@ -2306,7 +2403,7 @@ impl Actor {
         // watcher reports that through the ordered channel, and stops when
         // the question is answered or cancelled.
         let cancellation = responder.cancellation();
-        let withdrawal = self.inbound.get().cloned().map(|inbound| {
+        let withdrawal = self.inbound.lock().expect("inbound lock").clone().map(|inbound| {
             let pending_id = pending_id.clone();
             Watcher(Some(tokio::spawn(async move {
                 cancellation.cancelled().await;
@@ -2320,7 +2417,10 @@ impl Actor {
             _withdrawal: withdrawal,
         };
         let mut questions = self.questions.lock().expect("questions lock");
-        if turn.is_some() && questions.cancelled_turn.as_deref() == turn {
+        if self.protocol.lock().expect("protocol lock").0 == 1
+            && turn.is_some()
+            && questions.cancelled_turn.as_deref() == turn
+        {
             // Asked in a turn the operator already stopped.
             drop(questions);
             self.resolve_cancelled(question, PendingReason::TurnCancelled);
@@ -2337,6 +2437,11 @@ impl Actor {
     /// (ACP core §4.6): `pending_resolved{cancelled, reason}` each, oldest
     /// first.
     fn cancel_questions(&self, reason: PendingReason) {
+        if reason == PendingReason::TurnCancelled && self.protocol.lock().expect("protocol lock").0 == 2 {
+            // v2 agents withdraw foreground requests themselves; independent
+            // background requests must survive foreground cancellation.
+            return;
+        }
         let open = std::mem::take(&mut self.questions.lock().expect("questions lock").open);
         for question in open {
             self.resolve_cancelled(question, reason);
@@ -2450,7 +2555,12 @@ impl Actor {
     fn live_update(&self, payload: Value, turn: Option<&str>) -> SessionBody {
         let mut body = update(payload, turn);
         if let SessionBody::AcpUpdate { indexed, payload } = &mut body {
-            let notification = serde_json::from_value::<SessionNotification>(payload.clone()).ok();
+            let mut normalized = payload.clone();
+            if let Some(update) = normalized.get_mut("update") {
+                *update =
+                    crate::acp_driver::actor_response(update.take(), self.protocol.lock().expect("protocol lock").0);
+            }
+            let notification = serde_json::from_value::<SessionNotification>(normalized).ok();
             let mode = match notification.map(|n| n.update) {
                 Some(SessionUpdate::ConfigOptionUpdate(update)) if !update.config_options.is_empty() => {
                     *self.catalogue.lock().expect("catalogue lock") = Catalogue {
@@ -2585,7 +2695,12 @@ impl Actor {
         self.end_turn(turn.id, TurnOutcome::Cancelled, None, Some(message.clone()));
         // The cancel already answered the turn's questions; any asked
         // outside it go the same way.
-        self.cancel_questions(PendingReason::TurnCancelled);
+        let reason = if self.protocol.lock().expect("protocol lock").0 == 2 {
+            PendingReason::SessionParked
+        } else {
+            PendingReason::TurnCancelled
+        };
+        self.cancel_questions(reason);
         adapter.terminate(self.options.kill_grace).await;
         // No `adapter_exited` follows a stop the host asked for, so the
         // note keeps the adapter's last words (already scrubbed, bounded).
@@ -2696,7 +2811,7 @@ async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<Pr
 /// (its `CODEX_CONFIG` `hooks`) are checked and trusted before any session
 /// exists (skills spec §8).
 async fn negotiate(
-    conn: &ConnectionTo<Agent>,
+    conn: &ConnectionTo,
     cwd: PathBuf,
     attach: &Attach,
     mcp: &SessionMcp,
@@ -2717,7 +2832,7 @@ async fn negotiate(
         .and_then(Value::as_bool)
         == Some(true);
     if let Some(sent) = codex_trust {
-        crate::hook_sets::trust_codex(conn, &cwd, sent)
+        crate::hook_sets::trust_codex_driver(conn, &cwd, sent)
             .await
             .map_err(|error| StartError {
                 code: "hook_sets_refused",
@@ -2817,8 +2932,7 @@ pub(crate) async fn probe_catalog(
         let (_stop_tx, stop_rx) = oneshot::channel::<()>();
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
         let _acp = AcpTask(tokio::spawn(async move {
-            let _ = Client
-                .v1()
+            let _ = agent_client_protocol::Builder::new(Client)
                 .name("hennery-catalog-probe")
                 .on_receive_notification(
                     async move |msg: UntypedMessage, _cx| {
@@ -2835,11 +2949,14 @@ pub(crate) async fn probe_catalog(
                     },
                     agent_client_protocol::on_receive_request!(),
                 )
-                .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
-                    let _ = ready_tx.send(conn);
-                    let _ = stop_rx.await;
-                    Ok(())
-                })
+                .connect_with(
+                    transport,
+                    async move |conn: agent_client_protocol::ConnectionTo<Agent>| {
+                        let _ = ready_tx.send(ConnectionTo::new(conn, false, true));
+                        let _ = stop_rx.await;
+                        Ok(())
+                    },
+                )
                 .await;
         }));
         let conn = ready_rx
@@ -2956,7 +3073,11 @@ fn held_questions(replay: &Replay, updates: &mut mpsc::UnboundedReceiver<Inbound
 
 /// Startup/load may seed its catalog from the last non-empty option snapshot.
 fn config_update(payload: &Value) -> Option<Vec<SessionConfigOption>> {
-    let notification = serde_json::from_value::<SessionNotification>(payload.clone()).ok()?;
+    let mut normalized = payload.clone();
+    if let Some(update) = normalized.get_mut("update") {
+        *update = crate::acp_driver::actor_response(update.take(), 2);
+    }
+    let notification = serde_json::from_value::<SessionNotification>(normalized).ok()?;
     match notification.update {
         SessionUpdate::ConfigOptionUpdate(update) if !update.config_options.is_empty() => Some(update.config_options),
         _ => None,
@@ -3001,7 +3122,7 @@ struct Applied {
 /// checked against the read-back. Whatever did not take is reported in
 /// `failures`; the start goes on.
 async fn apply_config(
-    conn: &ConnectionTo<Agent>,
+    conn: &ConnectionTo,
     session: &SessionId,
     catalogue: Announced,
     wanted: &SessionConfig,
@@ -3303,6 +3424,17 @@ fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v2_resume_preserves_current_state_and_live_updates_after_replay_boundary() {
+        let mut replay = super::Replay::default();
+        replay.observe(serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message","messageId":"old","content":[]}}));
+        replay.observe(serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"replay_complete"}}));
+        replay.observe(serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"state_update","state":"idle","background":[{"type":"terminal","terminalId":"active"}]}}));
+        replay.observe(serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","messageId":"new","content":{"type":"text","text":"live"}}}));
+        assert_eq!(replay.kept.len(), 3);
+        assert!(replay.unknown.is_empty());
+    }
+
     use super::*;
 
     fn prompt_mailbox() -> (SessionHandle, mpsc::UnboundedReceiver<SessionCmd>) {

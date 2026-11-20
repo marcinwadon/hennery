@@ -301,6 +301,15 @@ pub fn deliver_codex_config(agent: &mut AgentCommand, source: Option<CodexConfig
 /// must not be trusted in its place. Codex skips an untrusted hook
 /// silently, so anything but `trusted: true` is an error.
 pub async fn trust_codex(conn: &ConnectionTo<Agent>, cwd: &Path, sent: &HookSetConfig) -> Result<(), HookSetsError> {
+    let driver = crate::acp_driver::Driver::new(conn.clone().into_raw(), false, false);
+    trust_codex_driver(&driver, cwd, sent).await
+}
+
+pub(crate) async fn trust_codex_driver(
+    conn: &crate::acp_driver::Driver,
+    cwd: &Path,
+    sent: &HookSetConfig,
+) -> Result<(), HookSetsError> {
     let listed = call(conn, "_codex/hooks/list", json!({ "cwd": cwd })).await?;
     let entries: Vec<(&Value, &str, &str)> = listed
         .get("hooks")
@@ -405,7 +414,7 @@ fn snake_case(event: &str) -> String {
     out
 }
 
-async fn call(conn: &ConnectionTo<Agent>, method: &str, params: Value) -> Result<Value, HookSetsError> {
+async fn call(conn: &crate::acp_driver::Driver, method: &str, params: Value) -> Result<Value, HookSetsError> {
     let request = UntypedMessage::new(method, params).expect("JSON value is serializable");
     conn.send_request(request)
         .block_task()

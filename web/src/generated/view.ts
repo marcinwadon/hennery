@@ -20,7 +20,7 @@ ts: string, } & ({ "kind": "artifact", artifact: ArtifactRevision, } | { "kind":
 /**
  * A text block went past `TEXT_MAX_BYTES` and was cut there.
  */
-truncated?: boolean, } | { "kind": "message" } & Text | { "kind": "thinking" } & Text | { "kind": "tool_call" } & ToolCall | { "kind": "plan", entries: Array<PlanEntry>,
+truncated?: boolean, } | { "kind": "message" } & Text | { "kind": "thinking" } & Text | { "kind": "tool_call" } & ToolCall | { "kind": "terminal", terminal_id: string, command: string | null, cwd: string | null, output: string, exit_code: number | null, signal: string | null, } | { "kind": "plan", entries: Array<PlanEntry>,
 /**
  * Steps past `PLAN_MAX_ENTRIES` were left out, or a step was cut.
  */
@@ -30,7 +30,7 @@ export type Body = { "kind": "artifact", artifact: ArtifactRevision, } | { "kind
 /**
  * A text block went past `TEXT_MAX_BYTES` and was cut there.
  */
-truncated?: boolean, } | { "kind": "message" } & Text | { "kind": "thinking" } & Text | { "kind": "tool_call" } & ToolCall | { "kind": "plan", entries: Array<PlanEntry>,
+truncated?: boolean, } | { "kind": "message" } & Text | { "kind": "thinking" } & Text | { "kind": "tool_call" } & ToolCall | { "kind": "terminal", terminal_id: string, command: string | null, cwd: string | null, output: string, exit_code: number | null, signal: string | null, } | { "kind": "plan", entries: Array<PlanEntry>,
 /**
  * Steps past `PLAN_MAX_ENTRIES` were left out, or a step was cut.
  */
@@ -197,7 +197,11 @@ update_kind: string,
  */
 raw: string, truncated?: boolean, };
 
-export type ItemPage = { items: Array<Item>,
+export type ItemPage = {
+/**
+ * Pagination boundary independent of cross-turn entity placement.
+ */
+before_turn?: string, items: Array<Item>,
 /**
  * The session's greatest event id when the page was read: no item
  * here is from a later event. The item stream resumes after it.

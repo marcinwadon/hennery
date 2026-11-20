@@ -280,7 +280,7 @@ impl Store {
                 return Ok(false);
             }
             let (host,agent,cwd,available):(String,String,String,bool)=tx.query_row("SELECT host_id,agent,cwd,
-            lifecycle = 'active' AND open_turn_id IS NULL AND COALESCE(activity,'idle') <> 'blocked'
+            lifecycle = 'active' AND open_turn_id IS NULL AND COALESCE(activity,'idle') NOT IN ('blocked','running')
             AND NOT EXISTS(SELECT 1 FROM session_dispatch_queue q WHERE q.owner_id=?1 AND q.target_id=?2 AND q.state IN ('queued','waiting_config'))
             AND NOT EXISTS(SELECT 1 FROM pending q WHERE q.owner_id = ?1 AND q.session_id = sessions.id AND q.state = 'open')
             FROM sessions WHERE owner_id = ?1 AND id = ?2",params![self.owner_id(),parent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;

@@ -12,6 +12,7 @@
   --st-wait-fg:#a44d0f; --st-wait-bg:#fde6d7; --st-wait-solid:#ff7918; --st-wait-line:#fdbb8d;
   --st-run-fg:#0f741f; --st-run-bg:#f1f9f4; --st-run-solid:#17b530;
   --st-start-fg:#2257be; --st-start-bg:#f5f8ff; --st-start-solid:#2c71f6;
+  --st-background-fg:#6450a4; --st-background-bg:#f1edf9;
   --st-idle-fg:#49494a; --st-idle-bg:#f0f1f3; --st-idle-solid:#a8a8aa;
   --st-park-fg:#686869; --st-park-bg:#f0f1f3; --st-park-solid:#c3c3c5;
   --st-fail-fg:#bf2e2e; --st-fail-bg:#fcf6f8; --st-fail-solid:#f73b3b;
@@ -41,6 +42,7 @@
   --st-wait-fg:#fdbb8d; --st-wait-bg:rgb(255 121 24 / .15); --st-wait-line:rgb(255 121 24 / .45);
   --st-run-fg:#8bd999; --st-run-bg:rgb(23 181 48 / .13);
   --st-start-fg:#95b7fa; --st-start-bg:rgb(44 113 246 / .16);
+  --st-background-fg:#c3aaf5; --st-background-bg:rgb(167 128 231 / .15);
   --st-idle-fg:#c3c3c5; --st-idle-bg:#2a2d2f; --st-idle-solid:#89898a;
   --st-park-fg:#a8a8aa; --st-park-bg:#2a2d2f; --st-park-solid:#686869;
   --st-fail-fg:#f99c9e; --st-fail-bg:rgb(247 59 59 / .14);

@@ -347,6 +347,7 @@ async fn live_claude_haiku_plan_configuration_survives_late_updates() -> Result<
     let (agent, profile) = command(&cwd, "claude", false)?;
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory()?);
     let wanted = SessionConfig {
+        protocol: Default::default(),
         cache_retention: Default::default(),
         model: Some("haiku".into()),
         mode: Some("plan".into()),
@@ -1903,6 +1904,7 @@ fn codex_parent_medium_is_explicit_catalog_checked_and_does_not_raise_child_effo
             json!({"id":"reasoning_effort","options":[{"value":"low"},{"value":"medium"}]}),
         ],
         defaults: SessionConfig {
+            protocol: Default::default(),
             cache_retention: Default::default(),
             model: Some("gpt-6-sol".into()),
             mode: Some("read-only".into()),
