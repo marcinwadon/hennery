@@ -1,7 +1,7 @@
 // Server answers for the management screens' tests: one of each item, with
 // every field set (an absent optional field makes for false passes), and
 // overridable per test.
-import type { HatItem, HostItem, McpConnectionItem, PurgePreview, SkillItem } from './generated/protocol'
+import type { HatItem, HookSetItem, HostItem, McpConnectionItem, PurgePreview, SkillItem } from './generated/protocol'
 
 export function host(over: Partial<HostItem> = {}): HostItem {
   return {
@@ -80,6 +80,19 @@ export function skill(over: Partial<SkillItem> = {}): SkillItem {
     name: 'pdf-tools',
     description: 'Work with PDF files',
     content_hash: 'abcdef0123456789abcdef',
+    host_ids: [],
+    created_at: 1790000000000,
+    updated_at: 1790000100000,
+    ...over,
+  }
+}
+
+export function hookSet(over: Partial<HookSetItem> = {}): HookSetItem {
+  return {
+    id: 'h1',
+    name: 'guard',
+    content_hash: 'fedcba9876543210fedcba',
+    events: ['PreToolUse'],
     host_ids: [],
     created_at: 1790000000000,
     updated_at: 1790000100000,

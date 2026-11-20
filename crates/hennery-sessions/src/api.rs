@@ -21,7 +21,7 @@ use hennery_kernel::hats::{Resolution, SessionHat};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::operator::Authenticated;
 use hennery_kernel::secret::unix_now;
-use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody, SessionConfig};
+use hennery_proto::frames::{Capability, CollectorFrame, HookDelivery, Indexed, SessionBody, SessionConfig};
 use hennery_proto::rest::{
     AGENT_MAX_JSON_BYTES, AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, DeleteResult,
     EventDto, HostRemovalItem, LifecycleResponse, NewLikeThisResponse, OpenTurn, PendingItem, PromptRequest,
@@ -230,7 +230,7 @@ fn request_failed_for_session(err: RequestError, session_id: Option<String>) -> 
                 // The host's own refusal of the servers answers as the
                 // hub's does (`McpUndeliverable` below): one status for
                 // the code on every path (api-8e-8f, item 14).
-                MCP_UNDELIVERABLE | crate::mcp_source::UNSUPPORTED => StatusCode::CONFLICT,
+                MCP_UNDELIVERABLE | crate::mcp_source::UNSUPPORTED | HOOK_SETS_UNSUPPORTED => StatusCode::CONFLICT,
                 "unknown_agent" | "start_failed" => StatusCode::BAD_GATEWAY,
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
@@ -260,6 +260,13 @@ fn request_failed_for_session(err: RequestError, session_id: Option<String>) -> 
             "mcp_isolation_unavailable",
             "the host cannot keep this agent's session to its MCP servers",
         ),
+        // The hub refused to send a start or resume its hook sets, as for
+        // the servers above (skills spec §8).
+        RequestError::HookSetsUnsupported => refuse(
+            StatusCode::CONFLICT,
+            HOOK_SETS_UNSUPPORTED,
+            "the host cannot apply the hook sets assigned to it",
+        ),
     }
 }
 
@@ -272,11 +279,13 @@ fn request_failed_for_session(err: RequestError, session_id: Option<String>) -> 
 fn resume_failed(err: RequestError) -> Response {
     match err {
         RequestError::Rejected { code, message } => {
-            let status = if code == MCP_UNDELIVERABLE || code == crate::mcp_source::UNSUPPORTED {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
+            let status =
+                if code == MCP_UNDELIVERABLE || code == crate::mcp_source::UNSUPPORTED || code == HOOK_SETS_UNSUPPORTED
+                {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
             error(status, &code, crate::redact::shown(&message))
         }
         other => request_failed(other),
@@ -464,6 +473,10 @@ pub(crate) async fn start_in_hat(
         Ok(context) => context,
         Err(err) => return internal(err),
     };
+    let hooks = match hook_delivery(&state, &req.host_id) {
+        Ok(hooks) => hooks,
+        Err(err) => return internal(err),
+    };
     let session_id = external
         .as_ref()
         .map(|c| c.session_id.clone())
@@ -509,6 +522,7 @@ pub(crate) async fn start_in_hat(
         // The hat just stored, and what it was given (plan 8e).
         hat_id: hat.hat_id.clone(),
         mcp: mcp.frame(),
+        hooks,
     };
     let undo = Undo::Start {
         session_id: session_id.clone(),
@@ -546,7 +560,10 @@ pub(crate) async fn start_in_hat(
         ),
         // Never sent.
         Err(
-            err @ (RequestError::NotConnected | RequestError::McpUndeliverable | RequestError::McpSourceUnsupported),
+            err @ (RequestError::NotConnected
+            | RequestError::McpUndeliverable
+            | RequestError::McpSourceUnsupported
+            | RequestError::HookSetsUnsupported),
         ) => {
             if expected_hat.is_some() {
                 if let Err(e) = state.store.mark_failed(&session_id, not_sent_reason(&err)) {
@@ -579,11 +596,12 @@ fn fill_defaults(config: &mut SessionConfig, defaults: SessionConfig) {
 
 /// Why a start or resume the hub never sent fails: the host went away, or
 /// its connection no longer takes the servers the decision read (a
-/// reconnect in between; api-8e-8f A2).
+/// reconnect in between; api-8e-8f A2), or never took the hook sets.
 fn not_sent_reason(err: &RequestError) -> &'static str {
     match err {
         RequestError::McpSourceUnsupported => crate::mcp_source::UNSUPPORTED,
         RequestError::McpUndeliverable => MCP_UNDELIVERABLE,
+        RequestError::HookSetsUnsupported => HOOK_SETS_UNSUPPORTED,
         _ => "host_offline",
     }
 }
@@ -608,6 +626,17 @@ fn resume_not_sent(state: &AppState, session_id: &str, err: RequestError) -> Res
 /// The code a start or resume the hub refused for its MCP servers fails
 /// with (plan 8c's `mcp_isolation_unavailable`).
 const MCP_UNDELIVERABLE: &str = "mcp_isolation_unavailable";
+
+/// The code a start or resume the hub refused for its hook sets fails with
+/// (skills spec §8).
+pub(crate) const HOOK_SETS_UNSUPPORTED: &str = "hook_sets_unsupported";
+
+/// The hook sets assigned to `host_id`, as a start, resume or delegated
+/// attach carries them (skills spec §8); `None` when none are assigned.
+pub(crate) fn hook_delivery(state: &AppState, host_id: &str) -> anyhow::Result<Option<HookDelivery>> {
+    let sets = state.hosts.hook_sets_for_host(host_id)?;
+    Ok((!sets.is_empty()).then_some(HookDelivery { sets }))
+}
 
 /// What the delivery decision reads of `host_id` outside the store (lane
 /// L2): its live connection's capability and `agent`'s isolation, from the
@@ -793,6 +822,10 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Ok(policy) => policy,
         Err(err) => return internal(err),
     };
+    let hook_sets = match state.store.hook_sets_applied(&id) {
+        Ok(applied) => applied,
+        Err(err) => return internal(err),
+    };
     Json(SessionDetail {
         agent_session_id: session.agent_session_id,
         mcp_source_policy,
@@ -801,6 +834,7 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         open_turn,
         pending,
         mcp_delivery,
+        hook_sets,
     })
     .into_response()
 }
@@ -978,6 +1012,10 @@ pub(crate) async fn resume_authorized(
         Ok(context) => context,
         Err(err) => return internal(err),
     };
+    let hooks = match hook_delivery(&state, &session.host_id) {
+        Ok(hooks) => hooks,
+        Err(err) => return internal(err),
+    };
     let (agent_session_id, committed_seq, config, mcp) = match state.store.request_resume_authorized(
         &id,
         &hat.hat_id,
@@ -1042,6 +1080,7 @@ pub(crate) async fn resume_authorized(
         // what it was given, with a fresh token (plan 8e).
         hat_id: hat.hat_id.clone(),
         mcp: mcp.frame(),
+        hooks,
     };
     let undo = Undo::Start { session_id: id.clone() };
     match crate::external_control::guarded_request(
@@ -1059,9 +1098,12 @@ pub(crate) async fn resume_authorized(
         // Still `starting`: the next handshake reconciles it (ACP core §3.4).
         Err(RequestError::DeliveryUnknown) => request_failed(RequestError::DeliveryUnknown),
         // Never sent: the host went away since the check above, or no
-        // longer takes the servers.
+        // longer takes the servers or the hook sets.
         Err(
-            err @ (RequestError::NotConnected | RequestError::McpUndeliverable | RequestError::McpSourceUnsupported),
+            err @ (RequestError::NotConnected
+            | RequestError::McpUndeliverable
+            | RequestError::McpSourceUnsupported
+            | RequestError::HookSetsUnsupported),
         ) => resume_not_sent(&state, &id, err),
         // The socket task has already failed the session with the host's
         // code (`Undo::Start`).
@@ -2739,6 +2781,23 @@ mod not_sent_tests {
             (StatusCode::CONFLICT, Some(MCP_UNDELIVERABLE))
         );
         assert_eq!(failure(&state, "s1"), ("failed".into(), Some(MCP_UNDELIVERABLE.into())));
+    }
+
+    /// Skills spec §8: a host without `hook_sets` is refused the resume
+    /// with its own reason, not the servers'.
+    #[tokio::test]
+    async fn a_resume_refused_for_its_hook_sets_fails_hook_sets_unsupported() {
+        let (_dir, state) = state();
+        assert!(state.store.create_session("s1", "h", "a", "/p", "hat", None).unwrap());
+        let (status, body) = answer(resume_not_sent(&state, "s1", RequestError::HookSetsUnsupported)).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some(HOOK_SETS_UNSUPPORTED))
+        );
+        assert_eq!(
+            failure(&state, "s1"),
+            ("failed".into(), Some(HOOK_SETS_UNSUPPORTED.into()))
+        );
     }
 
     #[tokio::test]

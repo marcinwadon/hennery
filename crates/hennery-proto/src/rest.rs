@@ -402,6 +402,10 @@ pub struct SessionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "McpSessionDelivery | undefined", optional)]
     pub mcp_delivery: Option<McpSessionDelivery>,
+    /// The hook sets its latest start or resume applied (skills spec §8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<crate::frames::HookSetApplied>>", optional)]
+    pub hook_sets: Vec<crate::frames::HookSetApplied>,
 }
 
 /// Where a pending request stands (ACP core §4.6): `open`, then
@@ -913,6 +917,100 @@ pub struct SkillHostsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct HatHostsResponse {
     pub host_ids: Vec<String>,
+}
+
+/// One hook set in `GET /api/hook-sets` (skills spec §9): its identity, its
+/// content hash, the events it names and the hosts it is assigned to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookSetItem {
+    pub id: String,
+    pub name: String,
+    pub content_hash: String,
+    pub events: Vec<String>,
+    pub host_ids: Vec<String>,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
+/// `GET /api/hook-sets/{id}`: the item and its `hooks`. 404 `hook_set_not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookSetDetail {
+    pub item: HookSetItem,
+    pub hooks: crate::hooks::HookSetConfig,
+}
+
+/// `POST /api/hook-sets` (skills spec §9): a name (the skill-name rules) and
+/// its `hooks`. Step-up. 201 with the `HookSetItem`.
+///
+/// Its own codes: 400 `invalid_body`; 400 `invalid_hook_set` (a bad name, or
+/// `hooks` that break the limits; the message names the `HookSetError`); 409
+/// `hook_set_exists` (the name is taken); 409 `too_many_hook_sets`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CreateHookSetRequest {
+    pub name: String,
+    pub hooks: crate::hooks::HookSetConfig,
+}
+
+/// `PUT /api/hook-sets/{id}`: replaces a hook set's `hooks`. Step-up. The
+/// same codes as `POST /api/hook-sets` except the name ones, and 404
+/// `hook_set_not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceHookSetRequest {
+    pub hooks: crate::hooks::HookSetConfig,
+}
+
+/// `PUT /api/hook-sets/{id}/hosts`: the hosts a hook set is assigned to,
+/// replacing the set. Step-up. 200 with the `HookSetHostsResponse`; 404
+/// `hook_set_not_found`; 400 `unknown_host`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct SetHookSetHostsRequest {
+    pub host_ids: Vec<String>,
+}
+
+/// A hook set's state on one host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HookSetHostStatus {
+    /// Assigned; the next session start on the host receives it.
+    Assigned,
+    /// The host lacks the `hook_sets` capability.
+    Unsupported,
+    /// The host has no ready connection to the collector.
+    Offline,
+}
+
+/// One host's state for a hook set in a `HookSetHostsResponse`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookSetHostState {
+    pub host_id: String,
+    pub status: HookSetHostStatus,
+}
+
+/// `GET /api/hook-sets/{id}/hosts`: per-host state of one hook set. 404
+/// `hook_set_not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookSetHostsResponse {
+    pub hook_set_id: String,
+    pub hosts: Vec<HookSetHostState>,
+}
+
+/// One event in `GET /api/hook-sets/events`: whether each agent runs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookEventSupport {
+    pub event: String,
+    pub claude: bool,
+    pub codex: bool,
+}
+
+/// `GET /api/hook-sets/events`: every accepted event and its agent support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HookEventsResponse {
+    pub events: Vec<HookEventSupport>,
 }
 
 /// `GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):

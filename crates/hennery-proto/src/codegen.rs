@@ -2,7 +2,7 @@
 //! with `--check`, fails if the checked-in copies differ.
 
 use crate::plugin_management;
-use crate::{delegation, frames, plugin, rest};
+use crate::{delegation, frames, hooks, plugin, rest};
 use schemars::generate::SchemaSettings;
 use ts_rs::{Config, TS};
 
@@ -145,6 +145,16 @@ pub fn render_schema() -> String {
         rest::SkillHostStatus,
         rest::SkillHostState,
         rest::SkillHostsResponse,
+        rest::HookSetItem,
+        rest::HookSetDetail,
+        rest::CreateHookSetRequest,
+        rest::ReplaceHookSetRequest,
+        rest::SetHookSetHostsRequest,
+        rest::HookSetHostStatus,
+        rest::HookSetHostState,
+        rest::HookSetHostsResponse,
+        rest::HookEventSupport,
+        rest::HookEventsResponse,
         rest::HatHostsResponse,
         rest::PathRuleItem,
         rest::PathRuleInput,
@@ -361,6 +371,13 @@ pub fn render_ts() -> String {
         frames::SkillSyncItem,
         frames::SkillFailure,
         frames::SkillFailed,
+        hooks::HookKind,
+        hooks::CommandHook,
+        hooks::MatcherGroup,
+        hooks::HookSetConfig,
+        frames::HookSetDelivery,
+        frames::HookDelivery,
+        frames::HookSetApplied,
         frames::HostFrame,
         frames::CollectorFrame,
         rest::StartSessionRequest,
@@ -423,6 +440,16 @@ pub fn render_ts() -> String {
         rest::SkillHostStatus,
         rest::SkillHostState,
         rest::SkillHostsResponse,
+        rest::HookSetItem,
+        rest::HookSetDetail,
+        rest::CreateHookSetRequest,
+        rest::ReplaceHookSetRequest,
+        rest::SetHookSetHostsRequest,
+        rest::HookSetHostStatus,
+        rest::HookSetHostState,
+        rest::HookSetHostsResponse,
+        rest::HookEventSupport,
+        rest::HookEventsResponse,
         rest::HatHostsResponse,
         rest::PathRuleItem,
         rest::PathRuleInput,

@@ -864,7 +864,7 @@ fn d2_resume_and_dispatch_require_fresh_complete_generation_evidence() {
         .unwrap();
     assert!(
         w.store
-            .attach_delegated("child", McpContext::NONE, &catalog, &hub)
+            .attach_delegated("child", McpContext::NONE, None, &catalog, &hub)
             .unwrap()
     );
     let frame = rx.try_recv().unwrap();

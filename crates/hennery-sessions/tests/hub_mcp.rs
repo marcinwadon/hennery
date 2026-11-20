@@ -79,6 +79,7 @@ fn start(agent: &str, servers: bool, waived: bool) -> CollectorFrame {
             },
             isolation_waived: waived,
         },
+        hooks: None,
     }
 }
 
@@ -196,6 +197,7 @@ fn resume(agent: &str, waived: bool) -> CollectorFrame {
         config,
         hat_id,
         mcp,
+        hooks,
     } = start(agent, true, waived)
     else {
         unreachable!()
@@ -210,6 +212,7 @@ fn resume(agent: &str, waived: bool) -> CollectorFrame {
         config,
         hat_id,
         mcp,
+        hooks,
     }
 }
 
@@ -253,4 +256,58 @@ async fn a_frame_without_a_delivery_goes_out_on_any_connection() {
         content: vec![],
     };
     assert_eq!(send(&hub, conn_id, &mut rx, prompt).await, Ok(()));
+}
+
+/// Skills spec §8: hook sets go only to a connection that announced
+/// `hook_sets`; the refusal is its own unless the servers are refused
+/// too, which is reported as MCP; a start without hook sets is unaffected.
+#[tokio::test]
+async fn hook_sets_go_only_where_they_are_announced() {
+    use hennery_proto::frames::{HookDelivery, HookSetDelivery};
+    let with_hooks = |mut frame: CollectorFrame| {
+        if let CollectorFrame::StartSession { hooks, .. } = &mut frame {
+            *hooks = Some(HookDelivery {
+                sets: vec![HookSetDelivery {
+                    id: "hs1".into(),
+                    name: "guard".into(),
+                    content_hash: "0".repeat(64),
+                    hooks: Default::default(),
+                }],
+            });
+        }
+        frame
+    };
+    let cases = [
+        // (capabilities, frame, expected)
+        (
+            vec![Capability::HookSets],
+            with_hooks(start("claude", false, false)),
+            Ok(()),
+        ),
+        (
+            vec![],
+            with_hooks(start("claude", false, false)),
+            Err(RequestError::HookSetsUnsupported),
+        ),
+        (
+            vec![],
+            with_hooks(start("claude", true, false)),
+            Err(RequestError::McpUndeliverable),
+        ),
+        (
+            vec![Capability::HookSets],
+            with_hooks(start("claude", true, false)),
+            Err(RequestError::McpUndeliverable),
+        ),
+        (vec![], start("claude", false, false), Ok(())),
+    ];
+    for (capabilities, frame, expected) in cases {
+        let hub = Hub::new();
+        let (conn_id, mut rx) = connect(&hub, Capabilities(capabilities.clone()));
+        let result = send(&hub, conn_id, &mut rx, frame).await;
+        assert_eq!(result, expected, "{capabilities:?}");
+        if expected.is_err() {
+            assert!(rx.try_recv().is_err(), "sent anyway: {capabilities:?}");
+        }
+    }
 }

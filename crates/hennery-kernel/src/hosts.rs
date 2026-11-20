@@ -661,6 +661,7 @@ fn try_revoke(conn: &Connection, owner: &str, host_id: &str, now: i64) -> Result
     )?;
     if changed > 0 {
         crate::skills::drop_host_assignments(&tx, owner, host_id)?;
+        crate::hook_sets::drop_host_assignments(&tx, owner, host_id)?;
     }
     tx.commit()?;
     Ok(changed > 0)

@@ -12,9 +12,9 @@ use anyhow::{Context, Result};
 use hennery_gateway::revocation::Cut;
 use hennery_gateway::session::{NoSessionMcp, SessionMcp, SessionRef};
 use hennery_proto::frames::{
-    AgentHome, AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, ForgetKind, ForgetReason, Indexed,
-    McpIsolation, McpServer, ParkReason, PendingKind, PendingReason, PendingResolution, SessionBody, SessionConfig,
-    TurnOutcome,
+    AgentHome, AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, ForgetKind, ForgetReason,
+    HookSetApplied, Indexed, McpIsolation, McpServer, ParkReason, PendingKind, PendingReason, PendingResolution,
+    SessionBody, SessionConfig, TurnOutcome,
 };
 use hennery_proto::rest::{
     AnswerRequest, AttachmentUsage, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES, EventDto, HostRemovalState,
@@ -482,6 +482,8 @@ END;",
     include_str!("external_capacity.sql"),
     include_str!("steering.sql"),
     include_str!("files.sql"),
+    // The hook sets the latest start or resume applied (skills spec §8).
+    "ALTER TABLE sessions ADD COLUMN hook_sets_applied TEXT NOT NULL DEFAULT '[]';",
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -2344,6 +2346,24 @@ impl Store {
         ))
     }
 
+    /// The hook sets the session's latest start or resume applied, as its
+    /// host acknowledged them (skills spec §8); empty for none, or for no
+    /// such session.
+    pub fn hook_sets_applied(&self, id: &str) -> Result<Vec<HookSetApplied>> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT hook_sets_applied FROM sessions WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
+                [id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match stored {
+            Some(json) => serde_json::from_str(&json).context("a stored hook set acknowledgement"),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// What the session's latest start or resume was given (decision
     /// E10); `None` before one since plan 8e.
     pub fn mcp_delivery(&self, id: &str) -> Result<Option<McpSessionDelivery>> {
@@ -3478,7 +3498,7 @@ impl Store {
                  mcp_delivery_mode = NULL, mcp_delivery_servers = NULL, mcp_delivery_at = NULL,
                  mcp_source_requested = NULL, mcp_source_applied = NULL,
                  usage_context = NULL, usage_cost = NULL, usage_totals = NULL,
-                 cache_retention = 'inherit', cache_retention_attached = NULL,
+                 cache_retention = 'inherit', cache_retention_attached = NULL, hook_sets_applied = '[]',
                  idle_pinned = 0, idle_hold_dirty = 0, prompt_queue_dirty = 0, prompt_queue_held = 0, sidebar_pinned = 0
              WHERE id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
@@ -4299,9 +4319,16 @@ impl Store {
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
                     tx.execute(
-                        "UPDATE sessions SET mcp_source_applied = mcp_source_requested, steering_supported=?3
+                        "UPDATE sessions SET mcp_source_applied = mcp_source_requested, steering_supported=?3,
+                             hook_sets_applied=?4
                          WHERE owner_id = ?1 AND id = ?2",
-                        params![self.owner, session_id, indexed.steering_supported],
+                        params![
+                            self.owner,
+                            session_id,
+                            indexed.steering_supported,
+                            // What the host applied this start (skills spec §8).
+                            serde_json::to_string(&indexed.hook_sets_applied)?
+                        ],
                     )?;
                     // The catalogue after the start's switches (P-13).
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;

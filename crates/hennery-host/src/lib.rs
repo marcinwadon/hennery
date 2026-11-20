@@ -10,6 +10,7 @@ pub mod files;
 pub mod forget;
 pub mod forget_codex;
 pub mod git;
+pub mod hook_sets;
 pub mod identity;
 pub mod logging;
 pub mod outbox;

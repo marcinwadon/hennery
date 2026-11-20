@@ -236,6 +236,7 @@ impl Setup {
             config: Default::default(),
             hat_id: String::new(),
             mcp: Default::default(),
+            hooks: None,
         }
     }
 }
@@ -359,6 +360,7 @@ async fn a_load_under_another_root_registers_both_and_says_so() {
             config: Default::default(),
             hat_id: String::new(),
             mcp: Default::default(),
+            hooks: None,
         })
         .await;
     let SessionBody::SessionStarted { agent_home, .. } = collector.fact().await else {
@@ -445,6 +447,7 @@ async fn an_attach_waits_out_a_forget_of_the_same_agent_session() {
         config: Default::default(),
         hat_id: String::new(),
         mcp: Default::default(),
+        hooks: None,
     };
     collector.send(&resume("r2")).await;
     loop {

@@ -165,6 +165,7 @@ async fn run_sessions_with_the_token() {
         config: Default::default(),
         hat_id: "hat-1".into(),
         mcp: servers(),
+        hooks: None,
     };
     let resume = CollectorFrame::ResumeSession {
         request_id: "r3".into(),
@@ -176,6 +177,7 @@ async fn run_sessions_with_the_token() {
         config: Default::default(),
         hat_id: "hat-1".into(),
         mcp: servers(),
+        hooks: None,
     };
     for (frame, session, kind) in [
         (start("r1", "s1", "claude"), "s1", "session_started"),

@@ -500,6 +500,11 @@
           "const": "skills",
           "description": "Skill delivery: `SkillSync`/`SkillArchive` in, `SkillFetch`/`SkillState` out (skills spec §6).",
           "type": "string"
+        },
+        {
+          "const": "hook_sets",
+          "description": "Per-session hook delivery: `hooks` on start/resume/delegated attach, acknowledged in `Indexed.hook_sets_applied` (skills spec §8).",
+          "type": "string"
         }
       ]
     },
@@ -819,6 +824,17 @@
             "hat_id": {
               "type": "string"
             },
+            "hooks": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HookDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's hook sets (skills spec §8); absent when none are\nassigned. A nested key, not flattened."
+            },
             "isolation_waived": {
               "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
               "type": "boolean"
@@ -990,6 +1006,17 @@
               "description": "The session's hat (`sessions.hat_id`); empty for a session from\nbefore hats. Carried, not yet used by the host (plan 8c).",
               "type": "string"
             },
+            "hooks": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HookDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's hook sets (skills spec §8); absent when none are\nassigned. A nested key, not flattened."
+            },
             "isolation_waived": {
               "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
               "type": "boolean"
@@ -1075,6 +1102,17 @@
             "hat_id": {
               "description": "As on `start_session`.",
               "type": "string"
+            },
+            "hooks": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HookDelivery"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's hook sets (skills spec §8); absent when none are\nassigned. A nested key, not flattened."
             },
             "isolation_waived": {
               "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
@@ -1627,6 +1665,33 @@
         }
       ]
     },
+    "CommandHook": {
+      "additionalProperties": false,
+      "description": "One command handler.",
+      "properties": {
+        "command": {
+          "description": "The program to run; it must already exist on the host.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Seconds, 1 to 600, when present.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/HookKind"
+        }
+      },
+      "required": [
+        "type",
+        "command"
+      ],
+      "type": "object"
+    },
     "ConfigCompleteness": {
       "enum": [
         "complete",
@@ -1806,6 +1871,23 @@
       },
       "required": [
         "name"
+      ],
+      "type": "object"
+    },
+    "CreateHookSetRequest": {
+      "additionalProperties": false,
+      "description": "`POST /api/hook-sets` (skills spec §9): a name (the skill-name rules) and\nits `hooks`. Step-up. 201 with the `HookSetItem`.\n\nIts own codes: 400 `invalid_body`; 400 `invalid_hook_set` (a bad name, or\n`hooks` that break the limits; the message names the `HookSetError`); 409\n`hook_set_exists` (the name is taken); 409 `too_many_hook_sets`.",
+      "properties": {
+        "hooks": {
+          "$ref": "#/$defs/HookSetConfig"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "hooks"
       ],
       "type": "object"
     },
@@ -2536,6 +2618,232 @@
       "required": [
         "delegation_enabled",
         "revision"
+      ],
+      "type": "object"
+    },
+    "HookDelivery": {
+      "description": "The hook sets a start, resume or delegated attach delivers, in the order\ntheir groups are merged (skills spec §8).",
+      "properties": {
+        "sets": {
+          "items": {
+            "$ref": "#/$defs/HookSetDelivery"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sets"
+      ],
+      "type": "object"
+    },
+    "HookEventSupport": {
+      "description": "One event in `GET /api/hook-sets/events`: whether each agent runs it.",
+      "properties": {
+        "claude": {
+          "type": "boolean"
+        },
+        "codex": {
+          "type": "boolean"
+        },
+        "event": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "claude",
+        "codex"
+      ],
+      "type": "object"
+    },
+    "HookEventsResponse": {
+      "description": "`GET /api/hook-sets/events`: every accepted event and its agent support.",
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/HookEventSupport"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "events"
+      ],
+      "type": "object"
+    },
+    "HookKind": {
+      "description": "The handler type. Only `command` exists: any other `type` value is a\ndeserialisation error.",
+      "enum": [
+        "command"
+      ],
+      "type": "string"
+    },
+    "HookSetApplied": {
+      "description": "A hook set a host applied to a session (skills spec §8).",
+      "properties": {
+        "content_hash": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "content_hash"
+      ],
+      "type": "object"
+    },
+    "HookSetConfig": {
+      "additionalProperties": {
+        "items": {
+          "$ref": "#/$defs/MatcherGroup"
+        },
+        "type": "array"
+      },
+      "description": "A hook set's `hooks` object: event name to matcher groups.\n\nA newtype, so it is transparent on the wire and in the schema.",
+      "type": "object"
+    },
+    "HookSetDelivery": {
+      "description": "One hook set in a `HookDelivery` (skills spec §8).",
+      "properties": {
+        "content_hash": {
+          "type": "string"
+        },
+        "hooks": {
+          "$ref": "#/$defs/HookSetConfig"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "content_hash",
+        "hooks"
+      ],
+      "type": "object"
+    },
+    "HookSetDetail": {
+      "description": "`GET /api/hook-sets/{id}`: the item and its `hooks`. 404 `hook_set_not_found`.",
+      "properties": {
+        "hooks": {
+          "$ref": "#/$defs/HookSetConfig"
+        },
+        "item": {
+          "$ref": "#/$defs/HookSetItem"
+        }
+      },
+      "required": [
+        "item",
+        "hooks"
+      ],
+      "type": "object"
+    },
+    "HookSetHostState": {
+      "description": "One host's state for a hook set in a `HookSetHostsResponse`.",
+      "properties": {
+        "host_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/HookSetHostStatus"
+        }
+      },
+      "required": [
+        "host_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "HookSetHostStatus": {
+      "description": "A hook set's state on one host.",
+      "oneOf": [
+        {
+          "const": "assigned",
+          "description": "Assigned; the next session start on the host receives it.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "The host lacks the `hook_sets` capability.",
+          "type": "string"
+        },
+        {
+          "const": "offline",
+          "description": "The host has no ready connection to the collector.",
+          "type": "string"
+        }
+      ]
+    },
+    "HookSetHostsResponse": {
+      "description": "`GET /api/hook-sets/{id}/hosts`: per-host state of one hook set. 404\n`hook_set_not_found`.",
+      "properties": {
+        "hook_set_id": {
+          "type": "string"
+        },
+        "hosts": {
+          "items": {
+            "$ref": "#/$defs/HookSetHostState"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hook_set_id",
+        "hosts"
+      ],
+      "type": "object"
+    },
+    "HookSetItem": {
+      "description": "One hook set in `GET /api/hook-sets` (skills spec §9): its identity, its\ncontent hash, the events it names and the hosts it is assigned to.",
+      "properties": {
+        "content_hash": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "events": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "host_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "content_hash",
+        "events",
+        "host_ids",
+        "created_at",
+        "updated_at"
       ],
       "type": "object"
     },
@@ -3337,6 +3645,13 @@
           "description": "On an update the adapter sent before the session was announced:\nreplayed by `session/load`, or sent while the start ran (ACP core\n§4.5). What it says may be older than what the collector holds, so\nits title only fills an empty one (plan 6b decision 2).",
           "type": "boolean"
         },
+        "hook_sets_applied": {
+          "description": "Host-owned acknowledgement of the hook sets applied, used only on\nSessionStarted (skills spec §8).",
+          "items": {
+            "$ref": "#/$defs/HookSetApplied"
+          },
+          "type": "array"
+        },
         "mcp_source_policy": {
           "anyOf": [
             {
@@ -3527,6 +3842,28 @@
       },
       "required": [
         "password"
+      ],
+      "type": "object"
+    },
+    "MatcherGroup": {
+      "additionalProperties": false,
+      "description": "A matcher and the handlers it runs.",
+      "properties": {
+        "hooks": {
+          "items": {
+            "$ref": "#/$defs/CommandHook"
+          },
+          "type": "array"
+        },
+        "matcher": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "hooks"
       ],
       "type": "object"
     },
@@ -5946,6 +6283,19 @@
         }
       ]
     },
+    "ReplaceHookSetRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/hook-sets/{id}`: replaces a hook set's `hooks`. Step-up. The\nsame codes as `POST /api/hook-sets` except the name ones, and 404\n`hook_set_not_found`.",
+      "properties": {
+        "hooks": {
+          "$ref": "#/$defs/HookSetConfig"
+        }
+      },
+      "required": [
+        "hooks"
+      ],
+      "type": "object"
+    },
     "ReplaceSkillArchiveRequest": {
       "additionalProperties": false,
       "description": "`PUT /api/skills/{id}/archive`: replaces a skill's content with a new\ntar.gz (base64, as `CreateSkillRequest`). Step-up. The same codes as\n`POST /api/skills`, and 404 `not_found`.",
@@ -6664,6 +7014,13 @@
           "description": "The hat the session belongs to (umbrella §8.2), decided at its\nstart: a hat's id, or empty for a session from before hats whose\nhost and owner had no default hat to give it.",
           "type": "string"
         },
+        "hook_sets": {
+          "description": "The hook sets its latest start or resume applied (skills spec §8).",
+          "items": {
+            "$ref": "#/$defs/HookSetApplied"
+          },
+          "type": "array"
+        },
         "host_id": {
           "type": "string"
         },
@@ -7023,6 +7380,22 @@
       },
       "required": [
         "data"
+      ],
+      "type": "object"
+    },
+    "SetHookSetHostsRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/hook-sets/{id}/hosts`: the hosts a hook set is assigned to,\nreplacing the set. Step-up. 200 with the `HookSetHostsResponse`; 404\n`hook_set_not_found`; 400 `unknown_host`.",
+      "properties": {
+        "host_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "host_ids"
       ],
       "type": "object"
     },

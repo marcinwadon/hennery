@@ -1,3 +1,5 @@
+-- Rewind hook set acknowledgements (v47) before rebuilding a historical fixture.
+ALTER TABLE sessions DROP COLUMN hook_sets_applied;
 -- Rewind session files (v46) before rebuilding a historical fixture.
 DROP TRIGGER artifact_session_deleted;
 DROP TABLE artifact_revisions;

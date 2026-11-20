@@ -428,6 +428,7 @@ async fn handshake(
                 Capability::Steering,
                 Capability::PluginContext,
                 Capability::Skills,
+                Capability::HookSets,
             ]),
             mcp_isolation: announce.mcp_isolation,
             runtime_profiles: announce.runtime_profiles,
@@ -637,6 +638,7 @@ struct AttachRequest {
     attach: Attach,
     config: SessionConfig,
     mcp: McpDelivery,
+    hooks: Option<hennery_proto::frames::HookDelivery>,
 }
 
 /// Start or resume a session (ACP core §4.3), idempotently (§2.2).
@@ -690,6 +692,16 @@ fn attach(
             request_id: req.request_id,
             code: "mcp_isolation_unavailable".into(),
             message: problem,
+        });
+        return Ok(());
+    }
+    // Hook sets for an agent that cannot run them are refused before
+    // anything is spawned, never dropped (skills spec §8, fail-closed).
+    if req.hooks.is_some() && !profile.supports_hook_sets() {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "hook_sets_unsupported".into(),
+            message: format!("agent {} cannot run hook sets", req.agent),
         });
         return Ok(());
     }
@@ -801,6 +813,16 @@ fn spawn_or_restart(
         return;
     }
     if let Some(handle) = map.handles.get(&req.session_id).filter(|h| !h.is_ended())
+        && handle.hook_set_hashes() != session::hook_set_hashes(req.hooks.as_ref())
+    {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "hook_sets_conflict".into(),
+            message: "the running process keeps the hook sets it was started with".into(),
+        });
+        return;
+    }
+    if let Some(handle) = map.handles.get(&req.session_id).filter(|h| !h.is_ended())
         && handle.send(SessionCmd::Restart {
             request_id: req.request_id.clone(),
         })
@@ -823,6 +845,7 @@ fn spawn_or_restart(
         profile,
         mcp_source_policy: req.mcp.source_policy,
         mcp_servers: req.mcp.mcp_servers,
+        hooks: req.hooks,
     };
     let handle = match req.generation {
         Some(generation) => session::launch_delegated_in(uplink.clone(), launch, options, generation, req.roots),
@@ -940,6 +963,7 @@ fn handle(
             config,
             hat_id: _,
             mcp,
+            hooks,
             attach_generation,
             agent_session_id,
         } => attach(
@@ -963,6 +987,7 @@ fn handle(
                 cwd,
                 config,
                 mcp,
+                hooks,
                 attach: match agent_session_id {
                     Some(agent_session_id) => Attach::Load { agent_session_id },
                     None => Attach::New,
@@ -995,6 +1020,7 @@ fn handle(
             // Carried for plan 8h's composed `CODEX_HOME`; unused here.
             hat_id: _,
             mcp,
+            hooks,
         } => attach(
             cfg,
             uplink,
@@ -1011,6 +1037,7 @@ fn handle(
                 attach: Attach::New,
                 config,
                 mcp,
+                hooks,
             },
         )?,
         CollectorFrame::ResumeSession {
@@ -1023,6 +1050,7 @@ fn handle(
             config,
             hat_id: _,
             mcp,
+            hooks,
         } => attach(
             cfg,
             uplink,
@@ -1039,6 +1067,7 @@ fn handle(
                 attach: Attach::Load { agent_session_id },
                 config,
                 mcp,
+                hooks,
             },
         )?,
         CollectorFrame::Steer {
@@ -1371,6 +1400,7 @@ mod tests {
                     cwd: "/tmp".into(),
                     profile: Profile::Claude,
                     mcp_servers: vec![],
+                    hooks: None,
                 },
                 SessionOptions::default(),
             );
@@ -1399,6 +1429,7 @@ mod tests {
                         }),
                         ..Default::default()
                     },
+                    hooks: None,
                 },
                 command,
                 Profile::Claude,
@@ -1409,6 +1440,73 @@ mod tests {
                 if code == "mcp_source_policy_conflict" && request_id == "later")
             );
             assert_eq!(handle.mcp_source_policy(), initial.as_ref());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_actor_keeps_the_hook_sets_it_was_started_with() {
+        use hennery_proto::frames::{HookDelivery, HookSetDelivery};
+        let delivery = |hash: &str| HookDelivery {
+            sets: vec![HookSetDelivery {
+                id: "hs-1".into(),
+                name: "guard".into(),
+                content_hash: hash.into(),
+                hooks: Default::default(),
+            }],
+        };
+        for (initial, later) in [
+            (None, Some(delivery("sha256:a"))),
+            (Some(delivery("sha256:a")), None),
+            (Some(delivery("sha256:a")), Some(delivery("sha256:b"))),
+        ] {
+            let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+            let command = AgentCommand::parse("unused-hook-sets-test-adapter").unwrap();
+            // No await before the assertion: the actor cannot spawn a process.
+            let handle = session::launch(
+                uplink.clone(),
+                Launch {
+                    mcp_source_policy: None,
+                    request_id: "original".into(),
+                    session_id: "s1".into(),
+                    attach: Attach::New,
+                    config: SessionConfig::default(),
+                    agent: command.clone(),
+                    cwd: "/tmp".into(),
+                    profile: Profile::Claude,
+                    mcp_servers: vec![],
+                    hooks: initial.clone(),
+                },
+                SessionOptions::default(),
+            );
+            let sessions = Arc::new(Mutex::new(SessionMap::default()));
+            sessions.lock().unwrap().handles.insert("s1".into(), handle.clone());
+            spawn_or_restart(
+                &uplink,
+                &sessions,
+                AttachRequest {
+                    generation: None,
+                    roots: vec![],
+                    request_id: "later".into(),
+                    session_id: "s1".into(),
+                    committed_seq: 0,
+                    agent: "claude".into(),
+                    cwd: "/tmp".into(),
+                    attach: Attach::Load {
+                        agent_session_id: "saved".into(),
+                    },
+                    config: SessionConfig::default(),
+                    mcp: McpDelivery::default(),
+                    hooks: later,
+                },
+                command,
+                Profile::Claude,
+                SessionOptions::default(),
+            );
+            assert!(
+                matches!(replies.try_recv().unwrap(), HostFrame::Error { code, request_id, .. }
+                if code == "hook_sets_conflict" && request_id == "later")
+            );
+            assert_eq!(handle.hook_set_hashes(), session::hook_set_hashes(initial.as_ref()));
         }
     }
 

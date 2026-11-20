@@ -142,7 +142,10 @@ fn probe_failed(err: RequestError) -> Response {
     match err {
         RequestError::NotConnected => error(StatusCode::CONFLICT, "host_offline", "the host is not connected"),
         // A probe carries no servers: `McpUndeliverable` cannot happen.
-        RequestError::Unsupported | RequestError::McpUndeliverable | RequestError::McpSourceUnsupported => error(
+        RequestError::Unsupported
+        | RequestError::McpUndeliverable
+        | RequestError::McpSourceUnsupported
+        | RequestError::HookSetsUnsupported => error(
             StatusCode::CONFLICT,
             "projects_unsupported",
             "this host cannot list or browse projects; update it",

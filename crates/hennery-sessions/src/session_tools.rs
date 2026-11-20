@@ -224,6 +224,7 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
         "session_changed",
         "host_offline",
         crate::mcp_source::UNSUPPORTED,
+        crate::api::HOOK_SETS_UNSUPPORTED,
         "not_found",
         "operation_conflict",
         "operator_required",

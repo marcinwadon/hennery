@@ -19,7 +19,7 @@ state stays outside Git; public issues are separate approved projections.
      external runtime, exact transcript bindings and retry-safe removal;
      proposed only, with upstream ownership-contract qualification required
      before enablement.
-   - [Skills and hooks catalogue](specs/2026-11-17-skills-hooks-catalogue.md) — phase 1 (skills) built, phase 2 (hook sets) pending: one catalogue of Agent Skills directories and command hook sets, assigned per host (a hat only pre-selects hosts), delivered as symlinks into both agents' skill directories and as per-session hooks through the adapters, with Codex trust recorded by the host; fail-closed hook delivery is the one open owner call.
+   - [Skills and hooks catalogue](specs/2026-11-17-skills-hooks-catalogue.md) — phases 1 and 2 built: one catalogue of Agent Skills directories and command hook sets, assigned per host (a hat only pre-selects hosts), delivered as symlinks into both agents' skill directories and as per-session hooks through the adapters, with Codex trust recorded by the host; fail-closed delivery decided and built in phase 2.
    - [Shared session work observations](specs/2026-11-06-session-work.md) — common UI/MCP facts, bounded response and plan observations, waiting/queue counts and explicit missing background telemetry; presentation status rules remain separate.
    - [Session usage and cache retention](specs/2026-11-02-session-usage.md) —
      durable runtime observations, partial family accounting, responsive Usage
@@ -64,6 +64,7 @@ state stays outside Git; public issues are separate approved projections.
      identity regression and Codex source audit; cross-platform status in PR #305.
 4. Plans:
    - [Skills catalogue, phase 1](superpowers/plans/2026-11-17-skills-catalogue-phase-1.md) — shared rules, wire types, kernel storage, collector push, `/api/skills`, host store and the `/skills` screen. Built; gates recorded in the PR.
+   - [Hook sets, phase 2](superpowers/plans/2026-11-18-hook-sets-phase-2.md) — shared hook rules, per-agent rendering, kernel storage, collector delivery and refusal, host injection and Codex trust, the Hook sets tab, live adapter probes. Built; gates recorded in the PR.
    - [Stable Recent positions](plans/2026-10-22-stable-recent.md) — operator-approved fixed positions for six visible visited sessions, position-based numbered shortcuts and independent window-local Back history. Implementation, regression probes and replay are recorded in the plan; independent review and CI remain parent-owned.
    - [New like this](plans/2026-10-22-new-like-this.md) — create a standalone empty session from the source's last reported launch settings, from header and list menus; server-side hat validation, configuration read-back and focus on its empty composer. Implemented and verified locally; independent review and platform CI remain parent-owned.
    - [Local OAuth callback](plans/2026-10-22-local-oauth-callback.md) — opt-in per-flow localhost provider redirect, a loopback CLI browser relay to the fixed collector, exact DCR/exchange matching and explicit command-before-Connect UI. API/CLI guards, real HTTPS domain-cookie browser tests, removal probes and timing load are recorded in the plan; independent review and Linux/macOS CI remain parent-owned. No deployment or live configuration change.

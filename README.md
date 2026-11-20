@@ -28,7 +28,9 @@ What works:
 - **Hats.** Path rules put each session in a hat by its project directory,
   for organising sessions and choosing their MCP servers.
 - **Skills.** Upload Agent Skills directories once and choose the hosts that
-  link them into `~/.claude/skills` and `~/.codex/skills`.
+  link them into `~/.claude/skills` and `~/.codex/skills`. Hook sets (command
+  hooks) are chosen the same way and apply to the next session start on Claude
+  and Codex hosts.
 - **MCP servers.** Connect a server with a static token or OAuth through the
   gateway, or configure local stdio servers for a host and hat, on the **MCP** screen.
 - **Session files.** Attach documents, CSVs, archives and other files to a prompt.

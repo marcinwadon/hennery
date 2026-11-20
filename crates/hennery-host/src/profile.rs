@@ -55,6 +55,44 @@ impl Profile {
         }
     }
 
+    /// Whether this profile can apply delivered hook sets (skills spec §8):
+    /// Claude through `_meta`, Codex through `CODEX_CONFIG` and its trust
+    /// call. An arbitrary agent has neither.
+    pub fn supports_hook_sets(self) -> bool {
+        match self {
+            Self::Claude | Self::ClaudeOwnCli | Self::Codex => true,
+            Self::Generic => false,
+        }
+    }
+
+    /// `session_meta_for`'s `_meta`, with a Claude profile's `hooks` as
+    /// `claudeCode.options.settings = {"hooks": ..}` beside every key it
+    /// already has (skills spec §8). Other profiles take hooks elsewhere,
+    /// so their `_meta` is unchanged.
+    pub fn session_meta_with_hooks(
+        self,
+        source: Option<&hennery_proto::mcp_source::McpSourceSnapshot>,
+        hooks: Option<&hennery_proto::hooks::HookSetConfig>,
+    ) -> Option<Map<String, Value>> {
+        let mut meta = self.session_meta_for(source);
+        if let (Self::Claude | Self::ClaudeOwnCli, Some(hooks), Some(meta)) = (self, hooks, meta.as_mut()) {
+            let options = meta
+                .entry("claudeCode")
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("static meta is an object")
+                .entry("options")
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("static meta is an object");
+            options.insert(
+                "settings".into(),
+                serde_json::json!({ "hooks": serde_json::to_value(hooks).expect("hook config serialises") }),
+            );
+        }
+        meta
+    }
+
     /// Installed identity announced in this connection's runtime metadata.
     pub fn runtime_profile(self) -> hennery_proto::delegation_host::RuntimeProfile {
         use hennery_proto::delegation_host::RuntimeProfile;
@@ -325,6 +363,44 @@ mod tests {
             assert_eq!(Value::Object(profile.session_meta().unwrap()), strict);
         }
         assert_eq!(Profile::Generic.session_meta(), None);
+    }
+
+    #[test]
+    fn hooks_join_claudes_meta_beside_every_key_it_has() {
+        use hennery_proto::mcp_source::{McpSourcePolicy, McpSourceSnapshot};
+        let hooks: hennery_proto::hooks::HookSetConfig = serde_json::from_value(serde_json::json!({
+            "PreToolUse": [{"hooks": [{"type": "command", "command": "/bin/guard"}]}]
+        }))
+        .unwrap();
+        let settings =
+            serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "/bin/guard"}]}]}});
+        for profile in [Profile::Claude, Profile::ClaudeOwnCli] {
+            assert_eq!(
+                Value::Object(profile.session_meta_with_hooks(None, Some(&hooks)).unwrap()),
+                serde_json::json!({"claudeCode": {"options": {"extraArgs": {"strict-mcp-config": ""}, "settings": settings}}})
+            );
+            assert_eq!(profile.session_meta_with_hooks(None, None), profile.session_meta());
+        }
+        let native = McpSourceSnapshot {
+            policy: McpSourcePolicy::ManagedPlusNative,
+            revision: 1,
+            request_id: "r".into(),
+        };
+        assert_eq!(
+            Value::Object(
+                Profile::Claude
+                    .session_meta_with_hooks(Some(&native), Some(&hooks))
+                    .unwrap()
+            ),
+            serde_json::json!({"claudeCode": {"options": {"strictMcpConfig": false, "settings": settings}}})
+        );
+        for profile in [Profile::Codex, Profile::Generic] {
+            assert_eq!(profile.session_meta_with_hooks(None, Some(&hooks)), None);
+        }
+        assert!(Profile::Claude.supports_hook_sets());
+        assert!(Profile::ClaudeOwnCli.supports_hook_sets());
+        assert!(Profile::Codex.supports_hook_sets());
+        assert!(!Profile::Generic.supports_hook_sets());
     }
 
     #[test]

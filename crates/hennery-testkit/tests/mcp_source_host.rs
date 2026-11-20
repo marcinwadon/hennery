@@ -42,6 +42,7 @@ async fn attach_source(
         cwd: std::env::temp_dir().canonicalize().unwrap(),
         profile,
         mcp_servers,
+        hooks: None,
     };
     let handle = match generation {
         Some(generation) => session::launch_delegated(uplink.clone(), launch, SessionOptions::default(), generation),

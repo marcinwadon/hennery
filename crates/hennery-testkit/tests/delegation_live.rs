@@ -364,6 +364,7 @@ async fn live_claude_haiku_plan_configuration_survives_late_updates() -> Result<
             cwd: cwd.clone(),
             profile,
             mcp_servers: vec![],
+            hooks: None,
         },
         SessionOptions::default(),
         1,
@@ -2004,7 +2005,7 @@ async fn claude_child_configuration_without_inference(explicit_fast: bool) -> Re
             ).await?
         )?;
         let child = receipt.child_id.context("allocated child")?;
-        ensure!(h.state.store.attach_delegated(&child,mcp()?,&catalog,&h.state.hub)?,"attach handed off");
+        ensure!(h.state.store.attach_delegated(&child,mcp()?,None,&catalog,&h.state.hub)?,"attach handed off");
         let evidence = h.wait("configuration-only child readback", || {
             if let Some(row) = h.state.store.find_session(&child).ok().flatten().filter(|row|row.lifecycle=="failed") {
                 return Some(Err(row.failure_reason.unwrap_or_default()));

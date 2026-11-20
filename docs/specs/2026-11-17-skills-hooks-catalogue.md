@@ -353,4 +353,64 @@ Deviations from this design:
   `attachments/`.
 - One frame carries one archive (base64, no chunking).
 
-Hook sets (§8) are phase 2 and are not built.
+### Phase 2 built (2026-11-18)
+
+Phase 2 (hook sets, §8) is implemented.
+
+- Kernel migration 18 adds `hook_sets` and `hook_set_assignments`; feature
+  flag `hook_sets`; `Capability::HookSets`.
+- Routes: `GET|POST /api/hook-sets`, `GET /api/hook-sets/events`,
+  `GET|PUT|DELETE /api/hook-sets/{id}`, `GET|PUT /api/hook-sets/{id}/hosts`.
+- `StartSession`, `ResumeSession` and `DelegatedAttach` carry
+  `hooks: HookDelivery { sets }`. The host acknowledges what it applied in
+  `Indexed.hook_sets_applied` on `SessionStarted`; the collector stores it on
+  the session and session details show a "Hook sets" row.
+- Rendering: Claude gets `_meta.claudeCode.options.settings.hooks` beside the
+  unchanged `extraArgs` and `strictMcpConfig`. Codex gets `CODEX_CONFIG` with
+  hennery's hooks merged after the operator's own `CODEX_CONFIG` hooks (which
+  hennery then trusts too, since they come from the operator's agent command).
+  The operator's value is the one the adapter runs with: the `CODEX_CONFIG=`
+  argument of an `env(1)` wrapper (`/usr/bin/env CODEX_CONFIG=… <cmd>`, the
+  documented form) when there is one, rewritten in place with the merged
+  config, else the agent's environment. An `env` wrapper that drops the
+  environment (`-i`, `-u CODEX_CONFIG`) and sets no `CODEX_CONFIG` itself is
+  refused (`hook_sets_refused`) before spawning.
+  Only `type: "command"` handlers are accepted. Codex receives only
+  `SessionStart, SessionEnd, PreToolUse, PostToolUse, PermissionRequest,
+  PreCompact, PostCompact, SubagentStart, SubagentStop`.
+- Fail closed: the collector refuses a start to a host without the capability
+  (`hook_sets_unsupported`; the session is marked failed and delegated
+  attaches settle with the same code). The host refuses a `Generic` profile
+  before spawning (`HostFrame::Error hook_sets_unsupported`), refuses a hooks
+  change on a live actor (`hook_sets_conflict`), and fails the start
+  (`StartFailed hook_sets_refused`) when Codex's `_codex/hooks/list` does not
+  list exactly the delivered handlers (by `<event_snake>:<group>:<handler>`
+  position, and at each position a `command` handler with the delivered
+  command and matcher; the error names positions only), `_codex/hooks/trust`
+  does not answer `trusted: true`, or the adapter lacks the extension.
+- Hook sets apply at the next session start; there is no live sync.
+
+Deviations from this design:
+
+- Unsupported is refused pre-spawn with `HostFrame::Error`, not `start_failed`
+  as §8 says; `start_failed` (`hook_sets_refused`) is used for refusals after
+  the adapter exists.
+- No bundled files: commands must name programs already on the host.
+- The two hook-set JSON write routes take a body of 64 KiB plus 4 KiB of
+  room, not the plan's flat 64 KiB.
+- Per-host status for a hook set is `assigned | unsupported | offline`, shown
+  on the Hook sets tab and in session details, instead of a host Settings
+  listing of received sets.
+
+Limitation: an operator `CODEX_CONFIG` whose own `hooks` use non-command
+handlers or extra fields blocks hook-set delivery to that session with
+`hook_sets_refused`.
+
+Live probes (§10): `claude_runs_delivered_hooks_beside_file_hooks` and
+`codex_trusts_and_runs_delivered_hooks` in
+`crates/hennery-testkit/tests/hook_sets_live.rs` are ignored by default. Run
+them with `HENNERY_D4_PINNED_ADAPTER_ROOT`, `HENNERY_D4_CLAUDE_AUTH` and
+`HENNERY_D4_CODEX_AUTH` set:
+`cargo test -p hennery-testkit --test hook_sets_live -- --ignored --nocapture`.
+Re-run them at every adapter pin bump (§10). They have not been run against
+live adapters yet.

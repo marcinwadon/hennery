@@ -222,6 +222,7 @@ fn start(request: &str, session: &str) -> CollectorFrame {
         config: Default::default(),
         hat_id: "hat-1".into(),
         mcp: Default::default(),
+        hooks: None,
     }
 }
 

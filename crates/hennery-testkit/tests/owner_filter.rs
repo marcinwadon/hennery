@@ -242,6 +242,11 @@ const SOURCES: &[(&str, &str, usize)] = &[
         17,
     ),
     (
+        "hennery-kernel/src/hook_sets.rs",
+        include_str!("../../hennery-kernel/src/hook_sets.rs"),
+        15,
+    ),
+    (
         "hennery-kernel/src/push.rs",
         include_str!("../../hennery-kernel/src/push.rs"),
         20,
@@ -259,7 +264,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-sessions/src/store.rs",
         include_str!("../../hennery-sessions/src/store.rs"),
-        158,
+        159,
     ),
     (
         "hennery-gateway/src/store.rs",

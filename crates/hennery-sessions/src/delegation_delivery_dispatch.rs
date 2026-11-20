@@ -8,7 +8,7 @@ use crate::{
 use anyhow::Result;
 use hennery_proto::{
     delegation_host::{ConfigEvidence, HostCatalog, PromptFence},
-    frames::{Capability, CollectorFrame, SessionConfig},
+    frames::{Capability, CollectorFrame, HookDelivery, SessionConfig},
     plugin::InputOrigin,
     rest::EventDto,
 };
@@ -75,6 +75,7 @@ impl Store {
         &self,
         parent: &str,
         hub: &Hub,
+        hooks: bool,
     ) -> Result<Option<crate::delegation_dispatch::AttachCandidate>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -92,7 +93,7 @@ impl Store {
         if !parked || !same_hat_in(&tx, self.owner_id(), &host, &n.hat, &cwd)? {
             return Ok(None);
         }
-        let Some(refusal) = crate::delegation_dispatch::attach_availability(hub, &host, record.is_some()) else {
+        let Some(refusal) = crate::delegation_dispatch::attach_availability(hub, &host, record.is_some(), hooks) else {
             return Ok(None);
         };
         Ok(Some(crate::delegation_dispatch::AttachCandidate {
@@ -130,7 +131,7 @@ impl Store {
                 tx.execute(
                     "UPDATE delegation_notices SET state='operator_required',reason=?3
                     WHERE owner_id = ?1 AND delivery_id=?2 AND (
-                    ?3 IN ('auth_required','runtime_unavailable','cwd_unavailable','configuration_unavailable','agent_has_no_record','mcp_source_policy_unsupported') OR (?3 IN ('adapter_failed','catalog_unavailable','busy','timeout') AND deadline<=?4))",
+                    ?3 IN ('auth_required','runtime_unavailable','cwd_unavailable','configuration_unavailable','agent_has_no_record','mcp_source_policy_unsupported','hook_sets_unsupported') OR (?3 IN ('adapter_failed','catalog_unavailable','busy','timeout') AND deadline<=?4))",
                     params![self.owner_id(), n.id, code, now],
                 )?;
             }
@@ -142,6 +143,7 @@ impl Store {
         &self,
         parent: &str,
         mcp: McpContext,
+        hooks: Option<HookDelivery>,
         catalog: &HostCatalog,
         hub: &Hub,
     ) -> Result<bool> {
@@ -203,6 +205,7 @@ impl Store {
             config,
             hat_id: n.hat,
             mcp: given.frame(),
+            hooks,
             attach_generation: u64::try_from(generation)?,
             agent_session_id: agent_session,
         };

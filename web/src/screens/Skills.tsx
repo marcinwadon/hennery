@@ -1,12 +1,13 @@
 // Skills: the Agent Skills directories the collector keeps and the hosts
 // that link them for Claude Code and Codex. An upload, a replacement and a
 // deletion need a fresh step-up, which the client asks for when refused.
-import { useRef, useState } from 'react'
+import { useId, useRef, useState } from 'react'
 import { messageOf } from '../api/errors'
 import { hats as listHats, hosts as listHosts } from '../api/manage'
 import { createSkill, deleteSkill, listSkills, replaceSkillArchive, skill as readSkill } from '../api/skills'
 import { useClient } from '../app-client'
 import ConfirmDialog from '../components/ConfirmDialog'
+import HookSetsPanel from '../components/HookSetsPanel'
 import Markdown from '../components/Markdown'
 import SkillHosts from '../components/SkillHosts'
 import type { SkillItem } from '../generated/protocol'
@@ -15,7 +16,7 @@ import { fileToBase64 } from '../lib/image'
 import { Text } from '../lib/text'
 import '../manage.css'
 
-export default function Skills() {
+function SkillsTab() {
   const client = useClient()
   const list = useResource(() => listSkills(client))
   const hats = useResource(() => listHats(client))
@@ -71,7 +72,7 @@ export default function Skills() {
   const current = list.data?.find((s) => s.id === selected) ?? null
 
   return (
-    <div className="manage skills-screen">
+    <>
       <header className="manage-head">
         <h1 id="skills-heading" tabIndex={-1}>Skills</h1>
         <input
@@ -185,6 +186,55 @@ export default function Skills() {
           </p>
         </ConfirmDialog>
       )}
+    </>
+  )
+}
+
+const TABS = ['Skills', 'Hook sets'] as const
+
+export default function Skills({ hookSets = false }: { hookSets?: boolean }) {
+  const [tab, setTab] = useState<(typeof TABS)[number]>('Skills')
+  const base = useId()
+  const active = hookSets ? tab : 'Skills'
+  return (
+    <div className="manage skills-screen">
+      {hookSets && (
+        <div className="agent-tabs" role="tablist" aria-label="Catalogue">
+          {TABS.map((name, index) => (
+            <button
+              key={name}
+              role="tab"
+              type="button"
+              id={`${base}-${index}`}
+              aria-selected={active === name}
+              aria-controls={`${base}-panel`}
+              tabIndex={active === name ? 0 : -1}
+              onClick={() => setTab(name)}
+              onKeyDown={(event) => {
+                const next =
+                  event.key === 'Home' ? 0
+                  : event.key === 'End' ? TABS.length - 1
+                  : event.key === 'ArrowRight' ? (index + 1) % TABS.length
+                  : event.key === 'ArrowLeft' ? (index + TABS.length - 1) % TABS.length
+                  : -1
+                if (next < 0) return
+                event.preventDefault()
+                setTab(TABS[next])
+                document.getElementById(`${base}-${next}`)?.focus()
+              }}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+      )}
+      <div
+        id={`${base}-panel`}
+        role={hookSets ? 'tabpanel' : undefined}
+        aria-labelledby={hookSets ? `${base}-${TABS.indexOf(active)}` : undefined}
+      >
+        {active === 'Skills' ? <SkillsTab /> : <HookSetsPanel />}
+      </div>
     </div>
   )
 }

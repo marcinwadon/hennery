@@ -628,7 +628,7 @@ fn park_hold_allocation_publishes_before_receipt_and_resume_before_attach() {
     queue(&w, &p, "resume-work");
     assert!(
         w.store
-            .attach_delegated("child", McpContext::NONE, &catalog(), &hub)
+            .attach_delegated("child", McpContext::NONE, None, &catalog(), &hub)
             .unwrap()
     );
     let mut parent_held = false;
@@ -770,7 +770,7 @@ fn park_hold_failed_flush_compensates_child_resume_before_any_handoff() {
     raw(&w).execute_batch("CREATE TRIGGER fail_idle_clear BEFORE UPDATE OF idle_hold_dirty ON sessions WHEN NEW.idle_hold_dirty=0 BEGIN SELECT RAISE(ABORT,'fixture hold clear failed'); END;").unwrap();
     assert!(
         !w.store
-            .attach_delegated("child", McpContext::NONE, &catalog(), &hub)
+            .attach_delegated("child", McpContext::NONE, None, &catalog(), &hub)
             .unwrap()
     );
     assert_eq!(w.store.find_session("child").unwrap().unwrap().lifecycle, "parked");
@@ -785,7 +785,7 @@ fn park_hold_failed_flush_compensates_child_resume_before_any_handoff() {
     received_hold(&mut rx, "parent");
     assert!(
         w.store
-            .attach_delegated("child", McpContext::NONE, &catalog(), &hub)
+            .attach_delegated("child", McpContext::NONE, None, &catalog(), &hub)
             .unwrap(),
         "compensated launch remains retryable"
     );
@@ -1359,7 +1359,7 @@ fn explicit_operator_park_holds_delegated_followups_in_the_shared_fifo() {
         let (hub, mut frames) = connected();
         let attached = w
             .store
-            .attach_delegated("child", McpContext::NONE, &catalog(), &hub)
+            .attach_delegated("child", McpContext::NONE, None, &catalog(), &hub)
             .unwrap();
         assert_eq!(attached, reason == ParkReason::Idle);
         if reason == ParkReason::Operator {
@@ -2572,13 +2572,25 @@ fn d3_automatic_parent_resume_requires_genuine_park_and_fresh_proof() {
     };
     let mut unavailable = catalog();
     unavailable.config_options.clear();
-    assert!(!w.store.attach_notice_parent("parent", mcp, &unavailable, &h).unwrap());
+    assert!(
+        !w.store
+            .attach_notice_parent("parent", mcp, None, &unavailable, &h)
+            .unwrap()
+    );
     assert!(rx.try_recv().is_err());
     unavailable = catalog();
     unavailable.freshness = CatalogFreshness::Stale;
-    assert!(!w.store.attach_notice_parent("parent", mcp, &unavailable, &h).unwrap());
+    assert!(
+        !w.store
+            .attach_notice_parent("parent", mcp, None, &unavailable, &h)
+            .unwrap()
+    );
     assert!(rx.try_recv().is_err());
-    assert!(w.store.attach_notice_parent("parent", mcp, &catalog(), &h).unwrap());
+    assert!(
+        w.store
+            .attach_notice_parent("parent", mcp, None, &catalog(), &h)
+            .unwrap()
+    );
     let generation = match rx.try_recv().unwrap() {
         CollectorFrame::DelegatedAttach { attach_generation, .. } => attach_generation,
         other => panic!("{other:?}"),
@@ -2704,7 +2716,7 @@ fn automatic_resume_accepts_only_genuinely_parked_and_ready_host() {
             unavailable.config_options.clear();
             assert!(
                 !w.store
-                    .attach_delegated("child", McpContext::NONE, &unavailable, &h)
+                    .attach_delegated("child", McpContext::NONE, None, &unavailable, &h)
                     .unwrap()
             );
             assert!(!old_watch.token().is_cancelled());
@@ -2712,7 +2724,7 @@ fn automatic_resume_accepts_only_genuinely_parked_and_ready_host() {
         }
         assert_eq!(
             w.store
-                .attach_delegated("child", McpContext::NONE, &catalog(), &h)
+                .attach_delegated("child", McpContext::NONE, None, &catalog(), &h)
                 .unwrap(),
             expected,
             "{lifecycle} {presumed} {close} {host_ready}"
@@ -2744,7 +2756,7 @@ fn automatic_resume_invalidates_stored_proof_until_new_complete_generation() {
         .unwrap();
     assert!(
         w.store
-            .attach_delegated("child", McpContext::NONE, &catalog(), &h)
+            .attach_delegated("child", McpContext::NONE, None, &catalog(), &h)
             .unwrap()
     );
     let generation = match rx.try_recv().unwrap() {

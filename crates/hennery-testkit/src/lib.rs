@@ -283,6 +283,112 @@ pub struct FakeScript {
     /// Echo the actual ACP content blocks for same-prompt delivery tests.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub echo_prompt: bool,
+    /// Answer codex-acp's hook extension methods (skills spec §8): with
+    /// `None` they are `-32601 Method not found`, as from an adapter
+    /// without them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_hooks: Option<FakeCodexHooks>,
+}
+
+/// What the fake answers `_codex/hooks/list` and `_codex/hooks/trust` with.
+/// Both calls are logged to `session_log` as `{"method", "params"}` lines,
+/// and a `CODEX_CONFIG` the fake starts with as an `{"env": {"CODEX_CONFIG"}}`
+/// line, whether or not this is set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FakeCodexHooks {
+    /// Listed instead of the hooks of the `CODEX_CONFIG` the fake started
+    /// with ([`FakeHookEntry::listed_from`]), as an adapter that lists
+    /// other hooks than it was given would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_list: Option<Vec<FakeHookEntry>>,
+    /// `_codex/hooks/trust`'s `trusted`.
+    pub trusted: bool,
+}
+
+/// The events Codex runs (`hennery_proto::hooks::CODEX_EVENTS`): the
+/// pinned adapter lists hooks of these only.
+pub const FAKE_CODEX_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStart",
+    "SubagentStop",
+];
+
+/// The timeout the fake lists for a handler without one, in seconds.
+pub const FAKE_DEFAULT_TIMEOUT_SEC: u64 = 600;
+
+/// One `_codex/hooks/list` entry, listed with `source: "sessionFlags"` and
+/// `trustStatus: "untrusted"`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FakeHookEntry {
+    pub key: String,
+    pub handler_type: String,
+    pub command: String,
+    pub matcher: Option<String>,
+    pub timeout_sec: u64,
+    pub current_hash: String,
+}
+
+impl FakeHookEntry {
+    /// The entries the pinned codex-acp lists for a `CODEX_CONFIG`: one
+    /// per `command` handler of an event Codex runs, keyed
+    /// `/<session-flags>/config.toml:<event_snake>:<group>:<handler>`, its
+    /// hash `sha256:` and the hex SHA-256 of its command. None for a value
+    /// that is not a JSON object with a `hooks` object.
+    pub fn listed_from(codex_config: &str) -> Vec<FakeHookEntry> {
+        use sha2::Digest;
+        let config: serde_json::Value = serde_json::from_str(codex_config).unwrap_or_default();
+        let Some(hooks) = config.get("hooks").and_then(serde_json::Value::as_object) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for (event, groups) in hooks {
+            if !FAKE_CODEX_EVENTS.contains(&event.as_str()) {
+                continue;
+            }
+            let groups = groups.as_array().map(Vec::as_slice).unwrap_or_default();
+            for (g, group) in groups.iter().enumerate() {
+                let handlers = group["hooks"].as_array().map(Vec::as_slice).unwrap_or_default();
+                for (h, handler) in handlers.iter().enumerate() {
+                    if handler["type"] != "command" {
+                        continue;
+                    }
+                    let command = handler["command"].as_str().unwrap_or_default().to_string();
+                    entries.push(FakeHookEntry {
+                        key: format!("/<session-flags>/config.toml:{}:{g}:{h}", snake_case(event)),
+                        handler_type: "command".into(),
+                        matcher: group["matcher"].as_str().map(str::to_string),
+                        timeout_sec: handler["timeout"].as_u64().unwrap_or(FAKE_DEFAULT_TIMEOUT_SEC),
+                        current_hash: format!("sha256:{}", hex::encode(sha2::Sha256::digest(command.as_bytes()))),
+                        command,
+                    });
+                }
+            }
+        }
+        entries
+    }
+}
+
+/// `PreToolUse` is `pre_tool_use`.
+fn snake_case(event: &str) -> String {
+    let mut out = String::with_capacity(event.len() + 4);
+    for (i, c) in event.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -372,6 +478,7 @@ impl Default for FakeScript {
             codex_archive_links_archived: None,
             echo_servers: false,
             echo_prompt: false,
+            codex_hooks: None,
         }
     }
 }

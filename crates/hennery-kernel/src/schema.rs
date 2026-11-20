@@ -301,6 +301,20 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (owner_id, host_id),
         FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id));
     CREATE TABLE skill_revisions (owner_id TEXT PRIMARY KEY REFERENCES owners(id), revision INTEGER NOT NULL);",
+    // Skills catalogue, phase 2 (skills spec §8): hook sets and their host
+    // assignments; new tables only. No revision counter: hook sets are read
+    // when a session starts, not synced.
+    "CREATE TABLE hook_sets (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id),
+        name TEXT NOT NULL, hooks TEXT NOT NULL, content_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        UNIQUE (owner_id, name));
+    CREATE TABLE hook_set_assignments (
+        owner_id TEXT NOT NULL, hook_set_id TEXT NOT NULL, host_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_id, hook_set_id, host_id),
+        FOREIGN KEY (hook_set_id) REFERENCES hook_sets(id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id));",
 ];
 
 #[cfg(test)]

@@ -284,9 +284,12 @@ async fn attempt_once(state: &AppState, record: &ForgetRecord, wait: Duration) -
         }
         Err(RequestError::NotConnected) => (pending(RemovalPending::HostOffline), false, false),
         // A probe carries no servers: `McpUndeliverable` cannot happen.
-        Err(RequestError::Unsupported | RequestError::McpUndeliverable | RequestError::McpSourceUnsupported) => {
-            (pending(RemovalPending::HostNeedsUpdate), false, false)
-        }
+        Err(
+            RequestError::Unsupported
+            | RequestError::McpUndeliverable
+            | RequestError::McpSourceUnsupported
+            | RequestError::HookSetsUnsupported,
+        ) => (pending(RemovalPending::HostNeedsUpdate), false, false),
         Err(RequestError::Busy) => (pending(RemovalPending::NoReply), false, false),
         Err(RequestError::DeliveryUnknown) => (pending(RemovalPending::NoReply), true, false),
         // The id is not one the agent writes (decision 8): no retry

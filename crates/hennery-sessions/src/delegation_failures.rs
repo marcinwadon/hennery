@@ -9,6 +9,7 @@ fn terminal(code: &str, operation: &str, now: i64, failures: &mut BTreeMap<Strin
     match code {
         "auth_required"
         | crate::mcp_source::UNSUPPORTED
+        | crate::api::HOOK_SETS_UNSUPPORTED
         | "runtime_unavailable"
         | "configuration_unavailable"
         | "cwd_unavailable"
@@ -628,9 +629,92 @@ mod tests {
             .unwrap();
         hub.mark_ready("host", registration.conn_id);
         assert!(hub.is_ready("host"));
-        assert!(store.delegated_attach_candidate("child", &hub).unwrap().is_some());
+        assert!(
+            store
+                .delegated_attach_candidate("child", &hub, false)
+                .unwrap()
+                .is_some()
+        );
         hub.unregister("host", registration.conn_id);
         assert!(!hub.is_ready("host"));
-        assert!(store.delegated_attach_candidate("child", &hub).unwrap().is_none());
+        assert!(
+            store
+                .delegated_attach_candidate("child", &hub, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Skills spec §8: a ready host without `hook_sets`, with hook sets
+    /// assigned, refuses the delegated attach for good: the worker fails the
+    /// operation and the fresh child with `hook_sets_unsupported`, and sends
+    /// nothing.
+    #[tokio::test]
+    async fn a_host_without_hook_sets_fails_the_delegated_attach() {
+        use hennery_proto::frames::{AgentIsolation, Capabilities, Capability, CollectorFrame, McpIsolation};
+        let (dir, store, _operation) = queued();
+        let db = dir.path().join("hennery.db");
+        let state = crate::AppState::new(
+            store,
+            hennery_kernel::hosts::Hosts::open(&db).unwrap(),
+            hennery_kernel::operator::Operator::open(&db).unwrap(),
+        );
+        let hooks: hennery_proto::hooks::HookSetConfig = serde_json::from_value(serde_json::json!({
+            "PreToolUse": [{ "hooks": [{ "type": "command", "command": "/usr/local/bin/guard" }] }]
+        }))
+        .unwrap();
+        let set = state.hosts.create_hook_set("guard", &hooks, 1).unwrap().unwrap();
+        state
+            .hosts
+            .set_hook_set_hosts(&set.id, &["host".to_string()], 1)
+            .unwrap()
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let registration = state
+            .hub
+            .register(
+                "host",
+                sender,
+                Capabilities(vec![
+                    Capability::ResolvePath,
+                    Capability::CatalogProbe,
+                    Capability::DelegationConfig,
+                    Capability::McpServers,
+                ]),
+                AgentIsolation([("claude".into(), McpIsolation::ClaudeStrict)].into_iter().collect()),
+            )
+            .unwrap();
+        state.hub.mark_ready("host", registration.conn_id);
+        assert_eq!(
+            state
+                .store
+                .delegated_attach_candidate("child", &state.hub, true)
+                .unwrap()
+                .unwrap()
+                .refusal,
+            Some(crate::api::HOOK_SETS_UNSUPPORTED)
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::delegation_worker::drain(&state),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            operation_state(&state.store),
+            ("failed".into(), Some("hook_sets_unsupported".into()))
+        );
+        let child = state.store.find_session("child").unwrap().unwrap();
+        assert_eq!(
+            (child.lifecycle.as_str(), child.failure_reason.as_deref()),
+            ("failed", Some("hook_sets_unsupported"))
+        );
+        while let Ok(frame) = receiver.try_recv() {
+            assert!(
+                !matches!(frame, CollectorFrame::DelegatedAttach { .. }),
+                "an attach went out: {frame:?}"
+            );
+        }
     }
 }
