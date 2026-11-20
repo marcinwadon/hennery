@@ -129,6 +129,16 @@ impl Store {
         prompt: &Checked,
         key: Option<&crate::prompt_receipts::PromptRequestKey>,
     ) -> Result<crate::prompt_receipts::PromptReceipt> {
+        self.admit_operator_followup(session, prompt, key, None)
+    }
+
+    pub(crate) fn admit_operator_followup(
+        &self,
+        session: &str,
+        prompt: &Checked,
+        key: Option<&crate::prompt_receipts::PromptRequestKey>,
+        steering: Option<&Hub>,
+    ) -> Result<crate::prompt_receipts::PromptReceipt> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(receipt) = crate::prompt_receipts::lookup_in(&tx, self.owner_id(), session, key)? {
@@ -188,9 +198,24 @@ impl Store {
             "UPDATE sessions SET prompt_queue_held=CASE WHEN lifecycle='active' AND prompt_queue_held<>0 THEN 2 ELSE 0 END WHERE owner_id = ?1 AND id=?2",
             params![self.owner_id(), session],
         )?;
+        // Only the initial admission can steer. A replay after promptRequired
+        // keeps its original queue receipt even if another turn has since begun.
+        let handoff = if let Some(hub) = steering {
+            self.prepare_steering_in(&tx, session, &id, hub, crate::steering::SteeringMode::WhenAvailable)?
+                .map(|attempt| (attempt, hub))
+        } else {
+            None
+        };
         let receipt = crate::prompt_receipts::PromptReceipt::Queued { queue_id: id };
         crate::prompt_receipts::record_in(&tx, self.owner_id(), session, key, &receipt)?;
         tx.commit()?;
+        if let Some((attempt, hub)) = handoff
+            && let Err(err) = attempt.deliver(self, &mut conn, session, hub)
+        {
+            // Acceptance is durable. The steering deadline retains an unresolved
+            // attempt for operator recovery if recording the unsent result failed.
+            tracing::warn!(session_id = session, error = %err, "steering settlement deferred");
+        }
         Ok(receipt)
     }
 

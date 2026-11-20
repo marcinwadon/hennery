@@ -1,4 +1,4 @@
-//! Explicit delivery of one operator queue item into the current turn.
+//! Durable delivery of operator input into the current turn.
 //! The operation owns a distinct request id. It never owns the running turn.
 use crate::{hub::Hub, store::Store};
 use anyhow::{Context, Result, ensure};
@@ -6,13 +6,77 @@ use hennery_proto::{
     frames::{Capability, CollectorFrame, SteeringOutcome},
     rest::{EventDto, StoredBlock},
 };
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+pub(super) enum SteeringMode {
+    WhenAvailable,
+    Required,
+}
+
+impl SteeringMode {
+    fn unavailable(&self, reason: &'static str) -> Result<Option<SteeringHandoff>> {
+        match self {
+            Self::WhenAvailable => Ok(None),
+            Self::Required => anyhow::bail!(reason),
+        }
+    }
+}
+
+pub(super) struct SteeringHandoff {
+    attempt: EventDto,
+    host: String,
+    turn: String,
+    request_id: String,
+    content: Vec<serde_json::Value>,
+}
+
+impl SteeringHandoff {
+    /// The attempt is committed before handoff. The caller still holds the
+    /// store guard, ordering delivery with session closure and host revocation.
+    pub(super) fn deliver(self, store: &Store, conn: &mut Connection, session: &str, hub: &Hub) -> Result<()> {
+        hub.publish(self.attempt);
+        let frame = CollectorFrame::Steer {
+            request_id: self.request_id.clone(),
+            session_id: session.into(),
+            turn_id: self.turn,
+            content: self.content,
+        };
+        if !hub.notify(&self.host, frame) {
+            let tx = conn.transaction()?;
+            // The frame never entered a host mailbox, so an ordinary send can
+            // safely stay in the FIFO. Once notify succeeds only host facts settle it.
+            let outcome = SteeringOutcome::Rejected {
+                reason: "The host could not receive this steering message.".into(),
+                steering_unavailable: true,
+            };
+            store.settle_steering_in(&tx, session, &self.request_id, &outcome)?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+}
 
 impl Store {
     pub(crate) fn steer_operator_prompt(&self, session: &str, id: &str, hub: &Hub) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (host, turn, supported, revoked): (String, Option<String>, bool, bool) = tx
+        let handoff = self.prepare_steering_in(&tx, session, id, hub, SteeringMode::Required)?;
+        tx.commit()?;
+        if let Some(handoff) = handoff {
+            handoff.deliver(self, &mut conn, session, hub)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_steering_in(
+        &self,
+        tx: &Transaction<'_>,
+        session: &str,
+        id: &str,
+        hub: &Hub,
+        mode: SteeringMode,
+    ) -> Result<Option<SteeringHandoff>> {
+        let target: Option<(String, Option<String>, bool, bool)> = tx
             .query_row(
                 "SELECT s.host_id,s.open_turn_id,s.steering_supported,h.revoked_at IS NOT NULL
              FROM sessions s JOIN hosts h ON h.owner_id=s.owner_id AND h.id=s.host_id
@@ -22,14 +86,20 @@ impl Store {
                 params![self.owner_id(), session],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
-            .optional()?
-            .context("steering_unavailable")?;
+            .optional()?;
+        let Some((host, turn, supported, revoked)) = target else {
+            return mode.unavailable("steering_unavailable");
+        };
         ensure!(!revoked, "host_revoked");
-        let turn = turn.context("steering_unavailable")?;
-        let host_supports = hub
-            .ready_capability(&host, Capability::Steering)
-            .context("host_offline")?;
-        ensure!(supported && host_supports, "steering_unsupported");
+        let Some(turn) = turn else {
+            return mode.unavailable("steering_unavailable");
+        };
+        let Some(capabilities) = hub.ready_capabilities(&host) else {
+            return mode.unavailable("host_offline");
+        };
+        if !supported || !capabilities.has(Capability::Steering) {
+            return mode.unavailable("steering_unsupported");
+        }
         let payload: String = tx
             .query_row(
                 "SELECT payload FROM session_dispatch_queue WHERE owner_id = ?1 AND target_id=?2 AND operation_id=?3
@@ -40,28 +110,32 @@ impl Store {
             .optional()?
             .context("queue_item_unavailable")?;
         let stored: Vec<StoredBlock> = serde_json::from_str(&payload)?;
-        let Some(content) = self.queued_content(
-            &stored,
-            hub.has_capability(&host, Capability::Images),
-            hub.has_capability(&host, Capability::Files),
-        )?
-        else {
-            self.fail_operator_item_in(&tx, id, "image_unavailable")?;
-            tx.commit()?;
-            return Ok(());
+        let Some(content) = self.queued_content(&stored, true, true)? else {
+            self.fail_operator_item_in(tx, id, "image_unavailable")?;
+            return Ok(None);
         };
+        if !crate::hub::supports_steering_content(&capabilities, &content) {
+            if matches!(mode, SteeringMode::Required) {
+                self.fail_operator_item_in(tx, id, "image_unavailable")?;
+            }
+            return Ok(None);
+        }
         let request_id = uuid::Uuid::now_v7().to_string();
         // A dispatched attempt belongs to the session history even if its
         // recovery row is dismissed before the host can report admission.
+        let mut body = serde_json::json!({"request_id":request_id,"turn_id":turn,"content":stored});
+        if matches!(mode, SteeringMode::WhenAvailable) {
+            body["automatic"] = true.into();
+        }
         let attempt = crate::store::collector_event(
-            &tx,
+            tx,
             self.owner_id(),
             session,
             "steering_attempt",
-            serde_json::json!({"request_id":request_id,"turn_id":turn,"content":stored}),
+            body,
             &crate::store::now(),
         )?;
-        crate::store::link_attachments(&tx, self.owner_id(), attempt.event_id, &attempt.body["content"])?;
+        crate::store::link_attachments(tx, self.owner_id(), attempt.event_id, &attempt.body["content"])?;
         tx.execute(
             "UPDATE session_operations SET state='steering',request_id=?3,turn_id=NULL,code=NULL
              WHERE owner_id = ?1 AND operation_id=?2",
@@ -72,29 +146,13 @@ impl Store {
              WHERE owner_id = ?1 AND operation_id=?2",
             params![self.owner_id(), id],
         )?;
-        // Commit before handoff so a collector crash can only leave an uncertain
-        // delivery. Holding the store guard through notify orders it with close/revoke.
-        tx.commit()?;
-        hub.publish(attempt);
-        let frame = CollectorFrame::Steer {
-            request_id: request_id.clone(),
-            session_id: session.into(),
-            turn_id: turn,
+        Ok(Some(SteeringHandoff {
+            attempt,
+            host,
+            turn,
+            request_id,
             content,
-        };
-        if !hub.notify(&host, frame) {
-            let tx = conn.transaction()?;
-            self.settle_steering_in(
-                &tx,
-                session,
-                &request_id,
-                &SteeringOutcome::Rejected {
-                    reason: "The host disconnected before the message was sent.".into(),
-                },
-            )?;
-            tx.commit()?;
-        }
-        Ok(())
+        }))
     }
 
     pub(crate) fn settle_steering_in(
@@ -124,11 +182,29 @@ impl Store {
             // history, while an idle reply must leave the item dismissed.
             return Ok(admitted);
         };
+        // Older attempts were explicit, and older rejections carry no proof
+        // that ordinary delivery is safe. Only retry a positively identified miss.
+        let outcome = if matches!(
+            outcome,
+            SteeringOutcome::Rejected {
+                steering_unavailable: true,
+                ..
+            }
+        ) && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE owner_id = ?1 AND session_id=?2 AND kind='steering_attempt'
+                 AND json_extract(body,'$.request_id')=?3 AND json_extract(body,'$.automatic')=1)",
+            params![self.owner_id(), session, request],
+            |r| r.get::<_, bool>(0),
+        )? {
+            &SteeringOutcome::PromptRequired
+        } else {
+            outcome
+        };
         let (queue_state, op_state, code) = match outcome {
             SteeringOutcome::Injected => ("settled", "delivered", None),
             SteeringOutcome::PromptRequired if prior_failure.is_some() => ("failed", "failed", prior_failure),
             SteeringOutcome::PromptRequired => ("queued", "queued", None),
-            SteeringOutcome::Rejected { reason } => {
+            SteeringOutcome::Rejected { reason, .. } => {
                 let reason = crate::store::one_line(reason, 512, 2048)
                     .unwrap_or_else(|| "The adapter refused this message.".into());
                 ("failed", "failed", Some(format!("steering_rejected:{reason}")))
@@ -167,6 +243,9 @@ impl Store {
             |r| r.get(0),
         )?;
         let mut body: serde_json::Value = serde_json::from_str(&payload)?;
+        body.as_object_mut()
+            .context("invalid steering attempt")?
+            .remove("automatic");
         body["origin"] = serde_json::json!({"kind":"operator"});
         if late {
             body["display_at"] = anchor.into();
@@ -201,6 +280,7 @@ impl Store {
         let outcome = if code == "not_attached" {
             SteeringOutcome::Rejected {
                 reason: "The session is no longer attached to the host.".into(),
+                steering_unavailable: true,
             }
         } else {
             SteeringOutcome::Uncertain

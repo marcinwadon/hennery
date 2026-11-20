@@ -378,9 +378,10 @@ describe('Composer: sending', () => {
 })
 
 describe('Composer: a turn in flight', () => {
-  it.each(['running', 'blocked'])('queues with Send beside Cancel while the session is %s', async (activity) => {
-    const c = mount(accepted, { session: { lifecycle: 'active', activity } })
-    type('queued')
+  it.each(['running', 'blocked'])('sends to the current turn when possible while the session is %s', async (activity) => {
+    const c = mount(accepted, { session: { lifecycle: 'active', activity }, capabilities: ['steering'], initialCatalog: { ...catalogOf(), steering_supported: true } })
+    type('follow-up')
+    expect(sendButton()).toHaveAttribute('title', 'Send to the current turn if it is still running')
     expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument()
     fireEvent.keyDown(textarea(), { key: 'Enter', ctrlKey: true })
@@ -1239,15 +1240,22 @@ describe('steering a queued message from the composer', () => {
   const queued = [{ id: 'q1', state: 'queued', reason: null, content: [{ type: 'text' as const, text: 'Adjust direction' }] }]
   it.each(['running', 'blocked'] as const)('offers steering for a supported active %s session', async activity => {
     const onQueueChange = vi.fn(async () => {})
-    const c = mount(() => json([]), { session: { lifecycle: 'active', activity }, initialCatalog: { ...catalogOf(), steering_supported: true } as SessionCatalog, queue: queued, onQueueChange })
+    const c = mount(() => json([]), { session: { lifecycle: 'active', activity }, capabilities: ['steering'], initialCatalog: { ...catalogOf(), steering_supported: true } as SessionCatalog, queue: queued, onQueueChange })
     fireEvent.click(screen.getByRole('button', { name: 'Send queued message 1 as steering' }))
     await waitFor(() => expect(onQueueChange).toHaveBeenCalledOnce())
     expect(c.posts).toEqual([{ path: '/api/sessions/s1/queue/q1/steer', body: undefined }])
   })
+  it.each([{ capabilities: ['images' as const] }, { capabilities: null }])('keeps Send available without offering steering when host capabilities are $capabilities', ({ capabilities }) => {
+    mount(accepted, { session: { lifecycle: 'active', activity: 'running' }, capabilities, initialCatalog: { ...catalogOf(), steering_supported: true }, queue: queued })
+    type('follow-up')
+    expect(sendButton()).toBeEnabled()
+    expect(sendButton()).toHaveAttribute('title', 'Send')
+    expect(screen.queryByRole('button', { name: /as steering/ })).toBeNull()
+  })
   it.each([
     ['active', 'idle', true], ['parked', undefined, true], ['active', 'running', false], ['active', 'running', undefined],
   ] as const)('hides steering for lifecycle=%s activity=%s support=%s', (lifecycle, activity, supported) => {
-    mount(accepted, { session: { lifecycle, activity }, initialCatalog: { ...catalogOf(), steering_supported: supported } as SessionCatalog, queue: queued })
+    mount(accepted, { session: { lifecycle, activity }, capabilities: ['steering'], initialCatalog: { ...catalogOf(), steering_supported: supported } as SessionCatalog, queue: queued })
     expect(screen.queryByRole('button', { name: /as steering/ })).toBeNull()
   })
 })

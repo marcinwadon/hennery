@@ -11,6 +11,9 @@
   and shown in session details. A start fails closed when the hooks cannot be
   applied.
 
+- Send operator follow-ups into the current turn automatically when the host
+  and adapter support steering. Queued messages still offer manual steering.
+
 ## 0.6.0
 
 - Send selected queued messages as steering input to running Claude Code and

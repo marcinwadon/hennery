@@ -532,7 +532,13 @@ pub enum TurnOutcome {
 pub enum SteeringOutcome {
     Injected,
     PromptRequired,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+        /// The host proved it could not route this steering request or the adapter lacks the extension.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[ts(as = "Option<bool>", optional)]
+        steering_unavailable: bool,
+    },
     Uncertain,
 }
 

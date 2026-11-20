@@ -1363,7 +1363,7 @@ fn accept_queued_prompt(
     checked: &content::Checked,
     key: Option<&PromptRequestKey>,
 ) -> Response {
-    match state.store.enqueue_operator_prompt_with_key(id, checked, key) {
+    match state.store.admit_operator_followup(id, checked, key, Some(&state.hub)) {
         Ok(receipt) => {
             if let Err(err) = state.store.flush_prompt_queue_changes(&state.hub) {
                 // Acceptance already committed. The durable dirty flag lets

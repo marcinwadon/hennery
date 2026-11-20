@@ -6136,7 +6136,7 @@
       "type": "object"
     },
     "QueuedPromptResponse": {
-      "description": "An accepted durable prompt, delivered after earlier turns finish.",
+      "description": "Receipt for a durable operator prompt accepted for steering or queued delivery.",
       "properties": {
         "queue_id": {
           "type": "string"
@@ -7994,6 +7994,10 @@
             },
             "reason": {
               "type": "string"
+            },
+            "steering_unavailable": {
+              "description": "The host proved it could not route this steering request or the adapter lacks the extension.",
+              "type": "boolean"
             }
           },
           "required": [

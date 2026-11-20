@@ -377,7 +377,11 @@ export type TurnOutcome = "completed" | "cancelled" | "failed" | "interrupted";
 /**
  * Admission reported by the steering extension, independent of turn completion.
  */
-export type SteeringOutcome = { "kind": "injected" } | { "kind": "prompt_required" } | { "kind": "rejected", reason: string, } | { "kind": "uncertain" };
+export type SteeringOutcome = { "kind": "injected" } | { "kind": "prompt_required" } | { "kind": "rejected", reason: string,
+/**
+ * The host proved it could not route this steering request or the adapter lacks the extension.
+ */
+steering_unavailable?: boolean, } | { "kind": "uncertain" };
 
 /**
  * Why a session was parked (ACP core §3.2).
@@ -850,7 +854,7 @@ request_key?: string | undefined, };
 export type PromptResponse = { turn_id: string, };
 
 /**
- * An accepted durable prompt, delivered after earlier turns finish.
+ * Receipt for a durable operator prompt accepted for steering or queued delivery.
  */
 export type QueuedPromptResponse = { queue_id: string, };
 
