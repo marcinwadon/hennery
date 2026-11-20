@@ -197,7 +197,8 @@ store, the host reports `conflict` and leaves it. Hennery never replaces,
 renames or removes a path it did not create. On revocation the host removes
 only symlinks that resolve into its store, then the store directory. Updates
 extract into a new directory and switch the symlink; a session that already
-loaded the old copy keeps working until it restarts.
+loaded the old copy keeps working until it restarts. The old directory is
+removed at the host's next `skill_sync`, not by the update itself.
 
 Codex also reads `~/.agents/skills`; hennery does not write there, so a skill
 the operator installed with `npx skills` and a hennery skill of the same name
@@ -330,3 +331,26 @@ browser allows it, packed client-side.
 1. Catalogue, transfer, skills on hosts, UI without hook sets.
 2. Hook sets, session delivery, Codex trust, start-card reporting.
 3. Later: install from a GitHub path, behind the egress policy.
+
+### Phase 1 built (2026-11-17)
+
+Phase 1 is implemented. Code uses `skills` rather than "catalog", because
+`catalog` already means the runtime configuration catalogue.
+
+- Kernel migration 17 adds `skill_items`, `skill_assignments`,
+  `skill_host_states` and `skill_revisions`.
+- Frames: `SkillSync`, `SkillArchive`, `SkillFetch`, `SkillState`; capability
+  `Capability::Skills`; feature flag `skills`.
+- Routes under `/api/skills`: `GET /`, `POST /`, `GET /{id}`,
+  `PUT /{id}/archive`, `DELETE /{id}`, `GET|PUT /{id}/hosts`,
+  `GET /hat-hosts/{hat_id}`.
+- Host store: `<data_dir>/skills/<id>.<hash12>/<name>/`, registry `skills.db`.
+- Web: route `/skills`, label "Skills".
+
+Deviations from this design:
+
+- The archive is stored as a BLOB in `skill_items`, not as a file beside
+  `attachments/`.
+- One frame carries one archive (base64, no chunking).
+
+Hook sets (§8) are phase 2 and are not built.

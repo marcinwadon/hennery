@@ -252,6 +252,11 @@ const SOURCES: &[(&str, &str, usize)] = &[
         3,
     ),
     (
+        "hennery-kernel/src/skills.rs",
+        include_str!("../../hennery-kernel/src/skills.rs"),
+        21,
+    ),
+    (
         "hennery-sessions/src/store.rs",
         include_str!("../../hennery-sessions/src/store.rs"),
         158,
@@ -325,6 +330,10 @@ const EXEMPT: &[(&str, &str)] = &[
     (
         "hennery-host/src/agent_home.rs",
         "the host's own registry of agent homes (plan 9d B1), on the host's machine, not `hennery.db`",
+    ),
+    (
+        "hennery-host/src/skills.rs",
+        "the host's own registry of linked skills (`skills.db`), on the host's machine, not `hennery.db`; a host belongs to one owner, so it has no owner column",
     ),
 ];
 

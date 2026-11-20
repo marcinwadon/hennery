@@ -172,6 +172,13 @@ it('More contains every configured destination and sign out', async () => {
   expect(within(nav).getAllByRole('link').map(link => link.getAttribute('href'))).toEqual(['/mcp', '/hats', '/defaults', '/settings'])
   expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument()
 })
+it('More lists Skills when the collector serves them', async () => {
+  at('/more')
+  const server = stubServer({ 'GET /api/capabilities': json(200, { ...FULL, features: ['session_defaults', 'skills'] }) })
+  render(<App fetchImpl={server.fetch} />)
+  const nav = await screen.findByRole('navigation', { name: 'More navigation' })
+  expect(within(nav).getAllByRole('link').map(link => link.getAttribute('href'))).toEqual(['/mcp', '/skills', '/hats', '/defaults', '/settings'])
+})
 
 it('disables the command entry until this deployment has an enabled provider', async () => {
   at('/more')

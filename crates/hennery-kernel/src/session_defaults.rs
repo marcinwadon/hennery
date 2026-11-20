@@ -161,7 +161,10 @@ mod tests {
             db::migrate_component(
                 &mut conn,
                 schema::COMPONENT,
-                &schema::MIGRATIONS[..schema::MIGRATIONS.len() - 1],
+                &schema::MIGRATIONS[..schema::MIGRATIONS
+                    .iter()
+                    .position(|m| m.contains("mcp_source_overrides"))
+                    .unwrap()],
             )
             .unwrap();
             drop(conn);

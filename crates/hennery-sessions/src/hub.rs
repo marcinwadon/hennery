@@ -185,6 +185,13 @@ impl HostConn {
         }
         if matches!(
             frame,
+            CollectorFrame::SkillSync { .. } | CollectorFrame::SkillArchive { .. }
+        ) && !self.capabilities.has(Capability::Skills)
+        {
+            return false;
+        }
+        if matches!(
+            frame,
             CollectorFrame::DelegatedAttach { .. } | CollectorFrame::DelegatedPrompt { .. }
         ) && !self.capabilities.has(Capability::DelegationConfig)
         {

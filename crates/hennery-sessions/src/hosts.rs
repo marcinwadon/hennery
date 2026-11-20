@@ -139,6 +139,12 @@ async fn revoke_host(State(state): State<AppState>, Path(host_id): Path<String>)
     if !state.hub.disconnect_and_wait(&host_id, REVOKE_DISCONNECT_BOUND).await {
         tracing::warn!(%host_id, "the revoked host's connection did not close in time");
     }
+    // The revoke dropped the host's skill assignments and bumped the skills
+    // revision: the other hosts get the new revision, or their states would
+    // read `pending` until the next skills write.
+    if let Err(err) = crate::skills_sync::broadcast_skills(&state.hosts, &state.hub) {
+        tracing::warn!(%host_id, error = %format!("{err:#}"), "cannot send the hosts their skills after a revoke");
+    }
     if let Err(err) = state.on_host_revoked(&host_id) {
         return internal(err);
     }

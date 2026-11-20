@@ -281,7 +281,7 @@ export type SessionConfig = { cache_retention?: CacheRetention, model?: string |
  * collector never sends a frame that needs a capability to a host that
  * lacks it.
  */
-export type Capability = "plugin_context" | "projects" | "images" | "files" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering";
+export type Capability = "plugin_context" | "projects" | "images" | "files" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering" | "skills";
 
 /**
  * `hello.capabilities`. Deserialized leniently: a capability this build
@@ -593,6 +593,29 @@ export type ForgetRemaining = { what: ForgetWhat, reason: ForgetReason, retry: b
 export type ForgetOutcome = "complete" | "partial";
 
 /**
+ * One skill in a `skill_sync` manifest (skills spec §6).
+ */
+export type SkillSyncItem = { id: string,
+/**
+ * The skill's directory name on the host.
+ */
+name: string, content_hash: string, };
+
+/**
+ * Why a host could not apply a skill (skills spec §6).
+ */
+export type SkillFailure = "conflict" | "agent_dir_missing" | "io" | "invalid";
+
+/**
+ * One skill a host could not apply, in `skill_state`.
+ */
+export type SkillFailed = { id: string, reason: SkillFailure,
+/**
+ * `claude` or `codex` when the failure is per agent directory.
+ */
+agent?: string | undefined, };
+
+/**
  * Host -> collector.
  */
 export type HostFrame = { "type": "authenticate", protocol_version: string, host_id: string, proof: string, } | { "type": "catalog", request_id: string, catalog: HostCatalog, } | { "type": "hello", protocol_version: string, host_version: string, host_id: string,
@@ -623,7 +646,7 @@ runtime_profiles: { [key in string]: RuntimeProfile },
  * The workspace roots from the host's config (ACP core §7), as
  * configured. Absent means none (an older host).
  */
-workspace_roots: Array<string>, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resolved_path", request_id: string, canonical: string, exists: boolean, is_dir: boolean, } | { "type": "resend_complete" } | { "type": "projects", request_id: string, items: Array<Project>,
+workspace_roots: Array<string>, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resolved_path", request_id: string, canonical: string, exists: boolean, is_dir: boolean, } | { "type": "resend_complete" } | { "type": "skill_fetch", id: string, content_hash: string, } | { "type": "skill_state", revision: number, applied: Array<string>, failed: Array<SkillFailed>, } | { "type": "projects", request_id: string, items: Array<Project>,
 /**
  * A bound cut the enumeration short: there may be more.
  */
@@ -736,7 +759,7 @@ content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id:
  * downgrade of this session's own removal; other agents ignore it.
  * Absent when false.
  */
-fallback?: boolean, };
+fallback?: boolean, } | { "type": "skill_sync", revision: number, items: Array<SkillSyncItem>, } | { "type": "skill_archive", id: string, content_hash: string, data: string, };
 
 /**
  * `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
@@ -1422,6 +1445,71 @@ mcp_source_overrides?: { [key in string]: McpSourcePolicy | null }, mcp_source_p
  * `HatItem`, a frozen hat's too, or 404.
  */
 export type SetHatLogoRequest = { data: string, };
+
+/**
+ * One skill in `GET /api/skills` (skills spec §5): its identity, the
+ * frontmatter description, its content hash and the hosts it is assigned to.
+ */
+export type SkillItem = { id: string, name: string, description: string, content_hash: string, host_ids: Array<string>, created_at: number, updated_at: number, };
+
+/**
+ * `GET /api/skills/{id}`: the item and its `SKILL.md` text. 404 `not_found`.
+ */
+export type SkillDetail = { item: SkillItem, skill_md: string, };
+
+/**
+ * `POST /api/skills` (skills spec §5): a skill directory as a tar.gz, as
+ * standard base64 with its padding. Step-up. 200 with the `SkillItem`.
+ *
+ * Its own codes: 400 `invalid_body`; 400 `invalid_skill` (not a readable
+ * archive, or a `SKILL.md` or name that breaks the skill rules); 413
+ * `skill_too_large`; 409 `skill_exists` (the name is taken); 409
+ * `too_many_skills`.
+ */
+export type CreateSkillRequest = { data: string, };
+
+/**
+ * `PUT /api/skills/{id}/archive`: replaces a skill's content with a new
+ * tar.gz (base64, as `CreateSkillRequest`). Step-up. The same codes as
+ * `POST /api/skills`, and 404 `not_found`.
+ */
+export type ReplaceSkillArchiveRequest = { data: string, };
+
+/**
+ * `PUT /api/skills/{id}/hosts`: the hosts a skill is assigned to, replacing
+ * the set. Step-up. 200 with the `SkillHostsResponse`; 404 `not_found`.
+ */
+export type SetSkillHostsRequest = { host_ids: Array<string>, };
+
+/**
+ * A skill's delivery state on one host.
+ */
+export type SkillHostStatus = "applied" | "pending" | "failed" | "unsupported" | "offline" | "unknown";
+
+/**
+ * One host's state for a skill in a `SkillHostsResponse`.
+ */
+export type SkillHostState = { host_id: string, status: SkillHostStatus,
+/**
+ * Set when `status` is `failed`.
+ */
+failure?: SkillFailed | undefined,
+/**
+ * When the host last reported, in Unix milliseconds.
+ */
+reported_at?: number | undefined, };
+
+/**
+ * `GET /api/skills/{id}/hosts`: per-host delivery state of one skill.
+ * 404 `not_found`.
+ */
+export type SkillHostsResponse = { skill_id: string, hosts: Array<SkillHostState>, };
+
+/**
+ * `GET /api/skills/hat-hosts/{hat_id}`: the hosts that have sessions of the
+ * hat, the candidates for assigning a skill. 404 `not_found`.
+ */
+export type HatHostsResponse = { host_ids: Array<string>, };
 
 /**
  * One path rule of a host (kernel spec §5.1, §5.2): sessions whose

@@ -845,6 +845,7 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
             Capability::PromptMailboxSnapshot,
             Capability::Steering,
             Capability::PluginContext,
+            Capability::Skills,
         ])
     );
 }

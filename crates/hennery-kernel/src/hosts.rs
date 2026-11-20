@@ -252,9 +252,9 @@ pub fn verify_proof(public_key: &str, nonce: &[u8], host_id: &str, protocol_vers
 }
 
 pub struct Hosts {
-    conn: crate::db::CoordinatedConnection,
+    pub(crate) conn: crate::db::CoordinatedConnection,
     /// The database's owner (`db::kernel_owner`), whom every query names.
-    owner: String,
+    pub(crate) owner: String,
 }
 
 impl Hosts {
@@ -650,11 +650,19 @@ fn insert_host(
 /// without going through `revoke`'s own read first, which is the only way
 /// to exercise this guard: a second, freshly-called `revoke` would simply
 /// see the row already revoked and never reach this write at all.
+///
+/// The host's skill assignments go in the same transaction, so a revoked
+/// host never holds one.
 fn try_revoke(conn: &Connection, owner: &str, host_id: &str, now: i64) -> Result<bool> {
-    let changed = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
         "UPDATE hosts SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL AND owner_id = ?3",
         params![host_id, now, owner],
     )?;
+    if changed > 0 {
+        crate::skills::drop_host_assignments(&tx, owner, host_id)?;
+    }
+    tx.commit()?;
     Ok(changed > 0)
 }
 

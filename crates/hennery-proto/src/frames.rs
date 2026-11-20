@@ -66,6 +66,8 @@ pub enum Capability {
     PromptMailboxSnapshot,
     /// Routes explicit queue steering to a supporting attached adapter.
     Steering,
+    /// Skill delivery: `SkillSync`/`SkillArchive` in, `SkillFetch`/`SkillState` out (skills spec §6).
+    Skills,
 }
 
 /// The longest agent data root a host may report (plan 9d, O12's shape
@@ -865,6 +867,39 @@ pub struct DirEntry {
     pub git: bool,
 }
 
+/// One skill in a `skill_sync` manifest (skills spec §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SkillSyncItem {
+    pub id: String,
+    /// The skill's directory name on the host.
+    pub name: String,
+    pub content_hash: String,
+}
+
+/// Why a host could not apply a skill (skills spec §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillFailure {
+    /// A directory of that name exists that the host does not manage.
+    Conflict,
+    /// The agent's skills parent directory is missing.
+    AgentDirMissing,
+    Io,
+    /// The archive did not pass the host's checks.
+    Invalid,
+}
+
+/// One skill a host could not apply, in `skill_state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SkillFailed {
+    pub id: String,
+    pub reason: SkillFailure,
+    /// `claude` or `codex` when the failure is per agent directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub agent: Option<String>,
+}
+
 /// Host -> collector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -938,6 +973,19 @@ pub enum HostFrame {
     /// frame, so a resent `turn_ended` is never duplicated by a synthesised
     /// one (ACP core §5.2).
     ResendComplete,
+    /// Ask for the archive of a skill listed in `skill_sync`; answered by
+    /// `skill_archive`. Only from a host with the `skills` capability.
+    SkillFetch {
+        id: String,
+        content_hash: String,
+    },
+    /// What the host applied of a `skill_sync` revision (skills spec §6).
+    SkillState {
+        #[ts(type = "number")]
+        revision: u64,
+        applied: Vec<String>,
+        failed: Vec<SkillFailed>,
+    },
     /// The answer to `list_projects` (ACP core §3.3, §7): the git
     /// repositories under the workspace roots. A probe reply: not outboxed,
     /// it answers only the connection it was asked on.
@@ -1021,6 +1069,8 @@ impl CollectorFrame {
             | Self::Ack { .. }
             | Self::ParkSession { .. }
             | Self::CloseSession { .. }
+            | Self::SkillSync { .. }
+            | Self::SkillArchive { .. }
             | Self::ForgetHat { .. } => Err(NotAProbe),
         }
     }
@@ -1055,6 +1105,8 @@ impl CollectorFrame {
             | Self::BrowseDirectory { .. }
             | Self::ReadFile { .. }
             | Self::ForgetFiles { .. }
+            | Self::SkillSync { .. }
+            | Self::SkillArchive { .. }
             | Self::ForgetHat { .. }
             | Self::ForgetSession { .. } => None,
         }
@@ -1088,6 +1140,8 @@ impl HostFrame {
             | Self::Hello { .. }
             | Self::Session { .. }
             | Self::Error { .. }
+            | Self::SkillFetch { .. }
+            | Self::SkillState { .. }
             | Self::ResendComplete => None,
         }
     }
@@ -1341,5 +1395,19 @@ pub enum CollectorFrame {
         /// Absent when false.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fallback: bool,
+    },
+    /// The collector's full skill manifest, a new `revision` each change
+    /// (skills spec §6): only to a host with the `skills` capability. The
+    /// host answers with `skill_fetch` for what it lacks, then `skill_state`.
+    SkillSync {
+        #[ts(type = "number")]
+        revision: u64,
+        items: Vec<SkillSyncItem>,
+    },
+    /// The answer to `skill_fetch`: `data` is standard base64 of the tar.gz.
+    SkillArchive {
+        id: String,
+        content_hash: String,
+        data: String,
     },
 }

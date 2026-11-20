@@ -13,6 +13,7 @@ pub mod mcp_source;
 pub mod paths;
 pub mod plugin;
 pub mod rest;
+pub mod skills;
 pub mod usage;
 
 /// Version of the host<->collector protocol, `MAJOR.MINOR`. Sent only in

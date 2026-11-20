@@ -1036,3 +1036,40 @@ fn an_agent_home_is_well_formed_only_absolute_bounded_and_without_nul() {
     assert!(!home(&format!("/{}", "a".repeat(AGENT_HOME_MAX_BYTES)), None).is_well_formed());
     assert!(home(&format!("/{}", "a".repeat(AGENT_HOME_MAX_BYTES - 1)), None).is_well_formed());
 }
+
+#[test]
+fn skill_frames_round_trip_and_are_not_probes() {
+    use hennery_proto::frames::{Capabilities, Capability, NotAProbe, SkillFailed, SkillFailure, SkillSyncItem};
+    let sync = CollectorFrame::SkillSync {
+        revision: 3,
+        items: vec![SkillSyncItem {
+            id: "s1".into(),
+            name: "pdf".into(),
+            content_hash: "ab".into(),
+        }],
+    };
+    let json = serde_json::to_string(&sync).unwrap();
+    assert!(json.contains("\"type\":\"skill_sync\""));
+    assert_eq!(serde_json::from_str::<CollectorFrame>(&json).unwrap(), sync);
+    assert!(matches!(sync.probe_capability(), Err(NotAProbe)));
+    let state = HostFrame::SkillState {
+        revision: 3,
+        applied: vec!["s1".into()],
+        failed: vec![SkillFailed {
+            id: "s2".into(),
+            reason: SkillFailure::Conflict,
+            agent: Some("claude".into()),
+        }],
+    };
+    assert!(
+        serde_json::to_string(&state)
+            .unwrap()
+            .contains("\"reason\":\"conflict\"")
+    );
+    assert_eq!(state.probe_request_id(), None);
+    assert!(
+        serde_json::from_str::<Capabilities>("[\"skills\",\"nope\"]")
+            .unwrap()
+            .has(Capability::Skills)
+    );
+}

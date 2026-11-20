@@ -30,6 +30,8 @@ pub mod redact;
 mod schema;
 pub mod secret;
 pub mod server;
+pub mod skill_archive;
+pub mod skills;
 pub mod web;
 
 pub mod session_defaults;

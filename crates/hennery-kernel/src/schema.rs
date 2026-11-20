@@ -281,6 +281,26 @@ pub(crate) const MIGRATIONS: &[&str] = &[
      ALTER TABLE hats ADD COLUMN mcp_policy_revision INTEGER NOT NULL DEFAULT 0 CHECK(mcp_policy_revision >= 0);",
     // Sparse per actual ACP ID; no backfill changes an existing hat's policy.
     "ALTER TABLE hats ADD COLUMN mcp_source_overrides TEXT NOT NULL DEFAULT '{}';",
+    // Skills catalogue, phase 1 (skills spec §5): new tables only (`hats` and
+    // `hosts` cannot be rebuilt).
+    "CREATE TABLE skill_items (
+        id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id),
+        name TEXT NOT NULL, description TEXT NOT NULL, skill_md TEXT NOT NULL,
+        content_hash TEXT NOT NULL, archive BLOB NOT NULL,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        UNIQUE (owner_id, name));
+    CREATE TABLE skill_assignments (
+        owner_id TEXT NOT NULL, skill_id TEXT NOT NULL, host_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_id, skill_id, host_id),
+        FOREIGN KEY (skill_id) REFERENCES skill_items(id) ON DELETE CASCADE,
+        FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id));
+    CREATE TABLE skill_host_states (
+        owner_id TEXT NOT NULL, host_id TEXT NOT NULL, revision INTEGER NOT NULL,
+        applied TEXT NOT NULL, failed TEXT NOT NULL, reported_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_id, host_id),
+        FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id));
+    CREATE TABLE skill_revisions (owner_id TEXT PRIMARY KEY REFERENCES owners(id), revision INTEGER NOT NULL);",
 ];
 
 #[cfg(test)]

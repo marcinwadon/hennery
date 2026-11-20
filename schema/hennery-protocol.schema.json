@@ -495,6 +495,11 @@
           "const": "steering",
           "description": "Routes explicit queue steering to a supporting attached adapter.",
           "type": "string"
+        },
+        {
+          "const": "skills",
+          "description": "Skill delivery: `SkillSync`/`SkillArchive` in, `SkillFetch`/`SkillState` out (skills spec §6).",
+          "type": "string"
         }
       ]
     },
@@ -1568,6 +1573,57 @@
             "agent_home"
           ],
           "type": "object"
+        },
+        {
+          "description": "The collector's full skill manifest, a new `revision` each change\n(skills spec §6): only to a host with the `skills` capability. The\nhost answers with `skill_fetch` for what it lacks, then `skill_state`.",
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/$defs/SkillSyncItem"
+              },
+              "type": "array"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "skill_sync",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "items"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The answer to `skill_fetch`: `data` is standard base64 of the tar.gz.",
+          "properties": {
+            "content_hash": {
+              "type": "string"
+            },
+            "data": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "skill_archive",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "content_hash",
+            "data"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1813,6 +1869,19 @@
         "url",
         "hat_id",
         "cred_kind"
+      ],
+      "type": "object"
+    },
+    "CreateSkillRequest": {
+      "additionalProperties": false,
+      "description": "`POST /api/skills` (skills spec §5): a skill directory as a tar.gz, as\nstandard base64 with its padding. Step-up. 200 with the `SkillItem`.\n\nIts own codes: 400 `invalid_body`; 400 `invalid_skill` (not a readable\narchive, or a `SKILL.md` or name that breaks the skill rules); 413\n`skill_too_large`; 409 `skill_exists` (the name is taken); 409\n`too_many_skills`.",
+      "properties": {
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data"
       ],
       "type": "object"
     },
@@ -2305,6 +2374,21 @@
       ],
       "type": "object"
     },
+    "HatHostsResponse": {
+      "description": "`GET /api/skills/hat-hosts/{hat_id}`: the hosts that have sessions of the\nhat, the candidates for assigning a skill. 404 `not_found`.",
+      "properties": {
+        "host_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "host_ids"
+      ],
+      "type": "object"
+    },
     "HatItem": {
       "description": "One hat (kernel spec §5.1): an entry of `GET /api/hats`, and the answer\nto its creation and its changes.",
       "properties": {
@@ -2699,6 +2783,60 @@
           },
           "required": [
             "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Ask for the archive of a skill listed in `skill_sync`; answered by\n`skill_archive`. Only from a host with the `skills` capability.",
+          "properties": {
+            "content_hash": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "skill_fetch",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "content_hash"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "What the host applied of a `skill_sync` revision (skills spec §6).",
+          "properties": {
+            "applied": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "failed": {
+              "items": {
+                "$ref": "#/$defs/SkillFailed"
+              },
+              "type": "array"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "skill_state",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "applied",
+            "failed"
           ],
           "type": "object"
         },
@@ -5808,6 +5946,19 @@
         }
       ]
     },
+    "ReplaceSkillArchiveRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/skills/{id}/archive`: replaces a skill's content with a new\ntar.gz (base64, as `CreateSkillRequest`). Step-up. The same codes as\n`POST /api/skills`, and 404 `not_found`.",
+      "properties": {
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "type": "object"
+    },
     "ReportedCost": {
       "properties": {
         "amount": {
@@ -6900,6 +7051,22 @@
       ],
       "type": "object"
     },
+    "SetSkillHostsRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/skills/{id}/hosts`: the hosts a skill is assigned to, replacing\nthe set. Step-up. 200 with the `SkillHostsResponse`; 404 `not_found`.",
+      "properties": {
+        "host_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "host_ids"
+      ],
+      "type": "object"
+    },
     "SettingsResponse": {
       "description": "`GET /api/settings` (kernel spec §8).",
       "properties": {
@@ -7003,6 +7170,223 @@
       },
       "required": [
         "public_url"
+      ],
+      "type": "object"
+    },
+    "SkillDetail": {
+      "description": "`GET /api/skills/{id}`: the item and its `SKILL.md` text. 404 `not_found`.",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/SkillItem"
+        },
+        "skill_md": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "item",
+        "skill_md"
+      ],
+      "type": "object"
+    },
+    "SkillFailed": {
+      "description": "One skill a host could not apply, in `skill_state`.",
+      "properties": {
+        "agent": {
+          "description": "`claude` or `codex` when the failure is per agent directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/SkillFailure"
+        }
+      },
+      "required": [
+        "id",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "SkillFailure": {
+      "description": "Why a host could not apply a skill (skills spec §6).",
+      "oneOf": [
+        {
+          "enum": [
+            "io"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "A directory of that name exists that the host does not manage.",
+          "type": "string"
+        },
+        {
+          "const": "agent_dir_missing",
+          "description": "The agent's skills parent directory is missing.",
+          "type": "string"
+        },
+        {
+          "const": "invalid",
+          "description": "The archive did not pass the host's checks.",
+          "type": "string"
+        }
+      ]
+    },
+    "SkillHostState": {
+      "description": "One host's state for a skill in a `SkillHostsResponse`.",
+      "properties": {
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillFailed"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Set when `status` is `failed`."
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "reported_at": {
+          "description": "When the host last reported, in Unix milliseconds.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/SkillHostStatus"
+        }
+      },
+      "required": [
+        "host_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "SkillHostStatus": {
+      "description": "A skill's delivery state on one host.",
+      "oneOf": [
+        {
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "applied",
+          "description": "The host's report for the current revision lists the skill.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "The host has not yet reported the current revision, or its report\ndoes not list the skill.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The host's report for the current revision lists it as failed.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "The host lacks the `skills` capability.",
+          "type": "string"
+        },
+        {
+          "const": "offline",
+          "description": "The host has no ready connection to the collector.",
+          "type": "string"
+        }
+      ]
+    },
+    "SkillHostsResponse": {
+      "description": "`GET /api/skills/{id}/hosts`: per-host delivery state of one skill.\n404 `not_found`.",
+      "properties": {
+        "hosts": {
+          "items": {
+            "$ref": "#/$defs/SkillHostState"
+          },
+          "type": "array"
+        },
+        "skill_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_id",
+        "hosts"
+      ],
+      "type": "object"
+    },
+    "SkillItem": {
+      "description": "One skill in `GET /api/skills` (skills spec §5): its identity, the\nfrontmatter description, its content hash and the hosts it is assigned to.",
+      "properties": {
+        "content_hash": {
+          "type": "string"
+        },
+        "created_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "description": {
+          "type": "string"
+        },
+        "host_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "description",
+        "content_hash",
+        "host_ids",
+        "created_at",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "SkillSyncItem": {
+      "description": "One skill in a `skill_sync` manifest (skills spec §6).",
+      "properties": {
+        "content_hash": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "description": "The skill's directory name on the host.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "content_hash"
       ],
       "type": "object"
     },

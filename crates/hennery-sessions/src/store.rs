@@ -4121,6 +4121,23 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Hosts of the owner, not revoked, whose default hat is `hat_id` or that
+    /// have a kept session in it (skills spec §7).
+    pub fn hosts_of_hat(&self, hat_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT h.id FROM hosts h
+             WHERE h.owner_id = ?1 AND h.revoked_at IS NULL
+               AND (h.default_hat_id = ?2
+                    OR EXISTS (SELECT 1 FROM sessions s
+                               WHERE s.owner_id = h.owner_id AND s.host_id = h.id
+                                 AND s.hat_id = ?2 AND s.lifecycle <> 'deleted'))
+             ORDER BY h.id",
+        )?;
+        let rows = stmt.query_map(params![&self.owner, hat_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Highest committed host seq for a session (0 if none).
     pub fn committed_seq(&self, session_id: &str) -> Result<u64> {
         let v: Option<i64> = self.conn().query_row(
@@ -5521,6 +5538,47 @@ mod tests {
     use super::*;
     use hennery_kernel::hosts::{EnrollOutcome, Enrollment, Hosts};
     use hennery_kernel::operator::{Operator, SetupOutcome};
+
+    #[test]
+    fn hosts_of_hat_unions_default_hat_and_sessions() {
+        use hennery_kernel::hats::HatChange;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let store = Store::open(&db).unwrap();
+        let hosts = Hosts::open(&db).unwrap();
+        let keys = [
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+            "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+        ];
+        for (id, key) in ["host-a", "host-b", "host-c"].into_iter().zip(keys) {
+            hosts
+                .register(
+                    id,
+                    &Enrollment {
+                        public_key: key.into(),
+                        name: id.into(),
+                        host_version: "0".into(),
+                        platform: "linux".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+        }
+        let HatChange::Done(hat) = hosts.create_hat("Skills", None, 1).unwrap() else {
+            panic!("hat not created");
+        };
+        hosts.update_host("host-a", None, Some(&hat.id)).unwrap();
+        assert!(
+            store
+                .create_session("s-b", "host-b", "fake", "/p", &hat.id, None)
+                .unwrap()
+        );
+        assert_eq!(store.hosts_of_hat(&hat.id).unwrap(), ["host-a", "host-b"]);
+        assert!(store.hosts_of_hat("no-such-hat").unwrap().is_empty());
+        hosts.revoke("host-a", 2).unwrap();
+        assert_eq!(store.hosts_of_hat(&hat.id).unwrap(), ["host-b"]);
+    }
 
     #[test]
     fn question_snapshot_retains_state_and_version_when_answer_commits_between_reads() {

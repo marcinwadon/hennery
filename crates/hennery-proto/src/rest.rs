@@ -815,6 +815,106 @@ pub struct SetHatLogoRequest {
     pub data: String,
 }
 
+/// One skill in `GET /api/skills` (skills spec §5): its identity, the
+/// frontmatter description, its content hash and the hosts it is assigned to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SkillItem {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub content_hash: String,
+    pub host_ids: Vec<String>,
+    #[ts(type = "number")]
+    pub created_at: i64,
+    #[ts(type = "number")]
+    pub updated_at: i64,
+}
+
+/// `GET /api/skills/{id}`: the item and its `SKILL.md` text. 404 `not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SkillDetail {
+    pub item: SkillItem,
+    pub skill_md: String,
+}
+
+/// `POST /api/skills` (skills spec §5): a skill directory as a tar.gz, as
+/// standard base64 with its padding. Step-up. 200 with the `SkillItem`.
+///
+/// Its own codes: 400 `invalid_body`; 400 `invalid_skill` (not a readable
+/// archive, or a `SKILL.md` or name that breaks the skill rules); 413
+/// `skill_too_large`; 409 `skill_exists` (the name is taken); 409
+/// `too_many_skills`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSkillRequest {
+    pub data: String,
+}
+
+/// `PUT /api/skills/{id}/archive`: replaces a skill's content with a new
+/// tar.gz (base64, as `CreateSkillRequest`). Step-up. The same codes as
+/// `POST /api/skills`, and 404 `not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceSkillArchiveRequest {
+    pub data: String,
+}
+
+/// `PUT /api/skills/{id}/hosts`: the hosts a skill is assigned to, replacing
+/// the set. Step-up. 200 with the `SkillHostsResponse`; 404 `not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct SetSkillHostsRequest {
+    pub host_ids: Vec<String>,
+}
+
+/// A skill's delivery state on one host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillHostStatus {
+    /// The host's report for the current revision lists the skill.
+    Applied,
+    /// The host has not yet reported the current revision, or its report
+    /// does not list the skill.
+    Pending,
+    /// The host's report for the current revision lists it as failed.
+    Failed,
+    /// The host lacks the `skills` capability.
+    Unsupported,
+    /// The host has no ready connection to the collector.
+    Offline,
+    Unknown,
+}
+
+/// One host's state for a skill in a `SkillHostsResponse`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SkillHostState {
+    pub host_id: String,
+    pub status: SkillHostStatus,
+    /// Set when `status` is `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "SkillFailed | undefined", optional)]
+    pub failure: Option<crate::frames::SkillFailed>,
+    /// When the host last reported, in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | undefined", optional)]
+    pub reported_at: Option<i64>,
+}
+
+/// `GET /api/skills/{id}/hosts`: per-host delivery state of one skill.
+/// 404 `not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SkillHostsResponse {
+    pub skill_id: String,
+    pub hosts: Vec<SkillHostState>,
+}
+
+/// `GET /api/skills/hat-hosts/{hat_id}`: the hosts that have sessions of the
+/// hat, the candidates for assigning a skill. 404 `not_found`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HatHostsResponse {
+    pub host_ids: Vec<String>,
+}
+
 /// `GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):
 /// what a purge of the hat would delete, read only. Tombstones are not
 /// counted.

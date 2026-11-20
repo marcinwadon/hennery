@@ -44,6 +44,9 @@ hennery-sessions = { workspace = true, features = ["test-hooks"] }
 hennery-view.workspace = true
 # Hat logos (plan 4d-B2): test images are made by the encoder, never stored.
 png.workspace = true
+# Skill archives in the skills API tests (skills spec §5).
+tar.workspace = true
+flate2.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
 tokio-tungstenite.workspace = true

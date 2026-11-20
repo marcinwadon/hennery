@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add the Skills catalogue (phase 1): upload Agent Skills directories once on
+  the **Skills** screen, choose the hosts that receive each skill, and the host
+  links it into `~/.claude/skills` and `~/.codex/skills`. Behind the `skills`
+  feature flag; hook sets are not built yet.
+
 ## 0.6.0
 
 - Send selected queued messages as steering input to running Claude Code and

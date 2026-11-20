@@ -10,6 +10,7 @@ import Hats from '../screens/Hats'
 import Hosts from '../screens/Hosts'
 import Mcp from '../screens/Mcp'
 import Placeholder from '../screens/Placeholder'
+import Skills from '../screens/Skills'
 import Sessions from '../screens/Sessions'
 import NeedsYou from '../screens/NeedsYou'
 import More from '../screens/More'
@@ -41,7 +42,7 @@ function NavigationAction({ view, enabled }: { view: View; enabled: boolean }) {
 function Frame({ caps, route }: { caps: CapabilitiesResponse; route: Route }) {
   const [collapsed, setCollapsed] = usePersistentToggle('hennery.railCollapsed', false)
   const views = viewsOf(caps.mode)
-  const advertised = views.filter(view => view !== 'defaults' || caps.features.includes('session_defaults'))
+  const advertised = views.filter(view => (view !== 'defaults' || caps.features.includes('session_defaults')) && (view !== 'skills' || caps.features.includes('skills')))
   const current = viewOf(route.name)
   const shown = current !== null && views.includes(current)
   const scope = useSessionScope()
@@ -54,7 +55,7 @@ function Frame({ caps, route }: { caps: CapabilitiesResponse; route: Route }) {
     requestAnimationFrame(() => document.querySelector<HTMLInputElement>('[aria-label="Search sessions"]')?.focus())
   } }, -1)
   return <div className={'app' + (collapsed ? ' app-collapsed' : '') + (route.name === 'session' ? ' app-session' : '')}>
-    {(['needs-you', 'sessions', 'new', 'hosts', 'mcp', 'hats', 'defaults', 'settings'] as const).map(view => <NavigationAction key={view} view={view} enabled={views.includes(view) && (view !== 'mcp' || caps.features.includes('mcp_connections')) && (view !== 'defaults' || caps.features.includes('session_defaults'))} />)}
+    {(['needs-you', 'sessions', 'new', 'hosts', 'mcp', 'skills', 'hats', 'defaults', 'settings'] as const).map(view => <NavigationAction key={view} view={view} enabled={views.includes(view) && (view !== 'mcp' || caps.features.includes('mcp_connections')) && (view !== 'skills' || caps.features.includes('skills')) && (view !== 'defaults' || caps.features.includes('session_defaults'))} />)}
     {caps.features.includes('web_push') && <PushForeground />}
     <NavigationRail views={advertised} current={current} collapsed={collapsed} toggle={() => setCollapsed(!collapsed)} />
     <div className="shell">{!['sessions', 'needs-you', 'session', 'more'].includes(route.name) && <header className="mtopbar"><span className="mtb-title">{current ? LABEL[current] : 'hennery'}</span><McpBadge link /></header>}{route.name === 'session' && (scope?.list.counts.waiting ?? 0) > 0 && <div className="session-scope-status"><Link to="/needs-you">Needs you <WaitingBadge /></Link></div>}<main className="main">
@@ -70,6 +71,7 @@ function Frame({ caps, route }: { caps: CapabilitiesResponse; route: Route }) {
       : route.name === 'settings' ? <Settings push={caps.features.includes('web_push')} sessions={caps.mode === 'full'} />
       : route.name === 'new' ? <NewSessionFrame><NewSession /></NewSessionFrame>
       : route.name === 'mcp' ? caps.features.includes('mcp_connections') ? <Mcp stdio={caps.features.includes('mcp_stdio')} oauth={caps.features.includes('mcp_oauth')} /> : <Placeholder title="MCP" text="The MCP gateway is not part of this deployment." />
+      : route.name === 'skills' ? caps.features.includes('skills') ? <Skills /> : <Placeholder title="Skills" text="Skills are not part of this deployment." />
       : route.name === 'session' ? <SessionRoute key={route.id} id={route.id ?? ''} /> : null}
       </Suspense>
     </main><BottomNavigation mode={caps.mode} current={current} /></div>

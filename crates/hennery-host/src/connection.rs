@@ -13,6 +13,7 @@ use crate::projects::Probes;
 use crate::session::{
     self, AgentCommand, Answer, Attach, HomeRecorder, Launch, SessionCmd, SessionHandle, SessionOptions,
 };
+use crate::skills_sync::SkillSync;
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
@@ -77,6 +78,9 @@ pub struct HostConfig {
     pub git: Option<PathBuf>,
     /// Shared repository identities, cached across session actors and reconnects.
     pub project_roots: Arc<crate::git::ProjectRoots>,
+    /// The environment the agents' directories are found in (skills spec §6):
+    /// the process's, unless a test sets its own.
+    pub agent_env: Vec<(String, String)>,
 }
 
 impl HostConfig {
@@ -101,6 +105,7 @@ impl HostConfig {
             home: None,
             git: crate::git::find_git(),
             project_roots: Arc::default(),
+            agent_env: std::env::vars().collect(),
         }
     }
 
@@ -183,6 +188,12 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
     let homes = Arc::new(crate::agent_home::Registry::open(
         &cfg.data_dir.join(crate::agent_home::FILE),
     )?);
+    // Skill delivery: the store, and the environment the agents' skill
+    // directories are found in at each sync.
+    let skills = Arc::new(crate::skills_sync::SkillSync::new(
+        crate::skills::Store::open(&cfg.data_dir)?,
+        cfg.agent_env.clone(),
+    ));
     let sessions: Sessions = Arc::new(Mutex::new(SessionMap::default()));
     // Outlives each connection, so its bounds hold across reconnects.
     let probes = Probes::default();
@@ -197,6 +208,7 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
                 &sessions,
                 &probes,
                 &homes,
+                &skills,
                 &mut replies,
                 &mut backoff,
             )
@@ -415,6 +427,7 @@ async fn handshake(
                 Capability::PromptMailboxSnapshot,
                 Capability::Steering,
                 Capability::PluginContext,
+                Capability::Skills,
             ]),
             mcp_isolation: announce.mcp_isolation,
             runtime_profiles: announce.runtime_profiles,
@@ -452,12 +465,14 @@ async fn shut_down(sessions: &Sessions, bound: Duration) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_once(
     configured: (&HostConfig, &crate::transport::CollectorTransport),
     uplink: &Uplink,
     sessions: &Sessions,
     probes: &Probes,
     homes: &Arc<Registry>,
+    skills: &Arc<SkillSync>,
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
@@ -492,6 +507,7 @@ async fn connect_once(
             for (session_id, seq) in committed {
                 uplink.fast_forward(&session_id, seq)?;
             }
+            skills.reset();
         }
         CollectorFrame::HelloError { code, message } => return Err(HelloRejected { code, message }.into()),
         _ => bail!("unexpected collector hello response"),
@@ -550,7 +566,7 @@ async fn connect_once(
                                 // accumulated from earlier failed attempts.
                                 *backoff = cfg.reconnect_min;
                             }
-                            handle(cfg, uplink, sessions, probes, homes, frame)?
+                            handle(cfg, uplink, sessions, probes, homes, skills, frame)?
                         }
                         // By the error's kind and place only: its text can
                         // quote a string of the frame, a header value say.
@@ -821,6 +837,7 @@ fn handle(
     sessions: &Sessions,
     probes: &Probes,
     homes: &Arc<Registry>,
+    skills: &Arc<SkillSync>,
     frame: CollectorFrame,
 ) -> Result<()> {
     match frame {
@@ -1171,6 +1188,17 @@ fn handle(
                 fallback,
             },
         ),
+        // Blocking work (extraction, symlinks, sqlite): off the read loop.
+        // The generation is read here, in frame order, so a thread that
+        // runs after a reconnect cannot act for the old connection.
+        CollectorFrame::SkillSync { revision, items } => {
+            let (skills, uplink, generation) = (skills.clone(), uplink.clone(), skills.generation());
+            std::thread::spawn(move || skills.on_sync(&uplink, generation, revision, items));
+        }
+        CollectorFrame::SkillArchive { id, content_hash, data } => {
+            let (skills, uplink, generation) = (skills.clone(), uplink.clone(), skills.generation());
+            std::thread::spawn(move || skills.on_archive(&uplink, generation, &id, &content_hash, &data));
+        }
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())

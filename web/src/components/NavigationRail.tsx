@@ -13,7 +13,7 @@ import { recentStatus } from '../lib/recentStatus'
 import { DEFAULT_ACCENT, HEX } from '../lib/accent'
 import { isMac } from '../lib/commands'
 import { useMediaQuery } from '../hooks/useMediaQuery'
-export const NAV_ICON: Record<View, IconName> = { 'needs-you': 'hand-raised', sessions: 'rectangle-stack', new: 'plus', defaults: 'adjustments-horizontal', hosts: 'server-stack', mcp: 'puzzle-piece', hats: 'rectangle-stack', settings: 'adjustments-horizontal', more: 'ellipsis-horizontal' }
+export const NAV_ICON: Record<View, IconName> = { 'needs-you': 'hand-raised', sessions: 'rectangle-stack', new: 'plus', defaults: 'adjustments-horizontal', hosts: 'server-stack', mcp: 'puzzle-piece', skills: 'puzzle-piece', hats: 'rectangle-stack', settings: 'adjustments-horizontal', more: 'ellipsis-horizontal' }
 export default function NavigationRail({ views, current, collapsed, toggle }: { views: readonly View[]; current: View | null; collapsed: boolean; toggle: () => void }) {
   const scope = useSessionScope()
   const narrowRail = useMediaQuery('(min-width: 768px) and (max-width: 1023px)')

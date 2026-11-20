@@ -4,6 +4,7 @@
 //! normalised, sizes bounded.
 
 use anyhow::{Context, Result, bail};
+use hennery_proto::skills::{entry_key, entry_path};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -63,6 +64,111 @@ pub fn package(tgz: &Path, dest: &Path, max_bytes: u64) -> Result<()> {
         sync_dir(&dir)?;
     }
     Ok(())
+}
+
+/// Bounds for [`tree`]: total file bytes, entries, and bytes in one file.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_bytes: u64,
+    pub max_entries: usize,
+    pub max_file: u64,
+}
+
+/// Extract a gzip tarball held in memory into `dest`, which must not exist
+/// yet (skills spec §5): the same refusals as [`package`], but no first
+/// component is stripped and a file is executable only below `scripts/`;
+/// every other file is 0644, every directory 0755.
+pub fn tree(tgz: &[u8], dest: &Path, limits: Limits) -> Result<()> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
+    if std::fs::symlink_metadata(dest).is_ok() {
+        bail!("{} exists already", dest.display());
+    }
+    create_dirs(dest)?;
+    std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
+    let mut written = 0u64;
+    let mut dirs = vec![dest.to_path_buf()];
+    // Counted and checked as the collector's inspector does (`skill_archive`):
+    // a pax global header is not an entry; paths go through `entry_path`.
+    let mut count = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for entry in archive.entries()? {
+        let mut entry = entry.context("read the archive")?;
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() {
+            continue;
+        }
+        count += 1;
+        if count > limits.max_entries {
+            bail!("more than {} entries", limits.max_entries);
+        }
+        let raw = entry.path_bytes().into_owned();
+        let name = std::str::from_utf8(&raw).map_err(|_| anyhow::anyhow!("an entry name is not UTF-8"))?;
+        if !kind.is_dir() && !kind.is_file() {
+            bail!("{name:?} is not a regular file or a directory ({kind:?}); links and special files are refused");
+        }
+        let relative = match entry_path(name) {
+            Ok(Some(relative)) => relative,
+            Ok(None) if kind.is_dir() => continue,
+            Ok(None) => bail!("entry {name:?}: the root is not a directory"),
+            Err(why) => bail!("entry {name:?}: {why}"),
+        };
+        if !seen.insert(entry_key(relative)) {
+            bail!("entry {name:?} appears twice");
+        }
+        let target = dest.join(relative);
+        if kind.is_dir() {
+            create_dirs_below(dest, &target)?;
+            dirs.push(target);
+        } else {
+            let parent = target.parent().expect("a joined path has a parent");
+            create_dirs_below(dest, parent)?;
+            let executable = relative.starts_with("scripts/") && entry.header().mode()? & 0o111 != 0;
+            let budget = limits.max_bytes.saturating_sub(written).min(limits.max_file);
+            written +=
+                write_file(&mut entry, &target, executable, budget).with_context(|| format!("extract {relative}"))?;
+        }
+    }
+    for dir in dirs {
+        sync_dir(&dir)?;
+    }
+    Ok(())
+}
+
+/// Point `link` at `target`, atomically: a new link beside it, renamed over
+/// it. Replaces a link or a file, never a directory.
+pub(crate) fn replace_symlink(link: &Path, target: &Path) -> std::io::Result<()> {
+    let name = link
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a link name"))?;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // A name nobody else holds: `AlreadyExists` means another path is
+    // there, which is never removed, so try the next suffix.
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(
+            ".{:08x}.tmp",
+            nanos ^ (std::process::id() << 16) ^ (n as u32).wrapping_mul(0x9e37_79b9)
+        ));
+        let tmp = link.with_file_name(tmp_name);
+        match std::os::unix::fs::symlink(target, &tmp) {
+            Ok(()) => {
+                return std::fs::rename(&tmp, link).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temporary link name",
+    ))
 }
 
 /// Extract only `node-v<version>-<platform>/bin/node` from a Node archive
@@ -432,6 +538,102 @@ mod tests {
         );
         assert_eq!(std::fs::read(root.join("from-pax.js")).unwrap(), b"pax");
         assert!(!root.join("short.js").exists() && !root.join("pax_global_header").exists());
+    }
+
+    /// One raw entry for `tarball`: name, kind, mode, body, link target.
+    type RawEntry<'a> = (&'a str, tar::EntryType, u32, &'a [u8], &'a str);
+
+    const SKILL_LIMITS: Limits = Limits {
+        max_bytes: 8 << 20,
+        max_entries: 512,
+        max_file: 2 << 20,
+    };
+
+    /// Every archive shape the collector's inspector accepts extracts here
+    /// too (the final review's finding 1): `tar -C dir .` style, plain, with
+    /// `scripts/` and with directory entries.
+    #[test]
+    fn every_shape_the_collector_accepts_extracts() {
+        let md: &[u8] = b"---\nname: a\ndescription: d\n---\n";
+        let shapes: [&[RawEntry]; 4] = [
+            &[
+                ("./", Directory, 0o755, b"", ""),
+                ("./SKILL.md", Regular, 0o644, md, ""),
+                ("./scripts/", Directory, 0o755, b"", ""),
+                ("./scripts/x.py", Regular, 0o755, b"print()", ""),
+            ],
+            &[("SKILL.md", Regular, 0o644, md, "")],
+            &[
+                ("SKILL.md", Regular, 0o644, md, ""),
+                ("scripts/x.py", Regular, 0o755, b"print()", ""),
+            ],
+            &[
+                ("SKILL.md", Regular, 0o644, md, ""),
+                ("docs/", Directory, 0o755, b"", ""),
+                ("docs/a.md", Regular, 0o644, b"a", ""),
+            ],
+        ];
+        for (i, entries) in shapes.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("skill");
+            tree(&tarball(entries), &dest, SKILL_LIMITS).unwrap_or_else(|err| panic!("shape {i}: {err:#}"));
+            assert_eq!(std::fs::read(dest.join("SKILL.md")).unwrap(), md, "shape {i}");
+        }
+    }
+
+    #[test]
+    fn a_skill_path_twice_or_unplain_is_refused() {
+        for entries in [
+            &[("a", Regular, 0o644, &b"x"[..], ""), ("./a", Regular, 0o644, b"y", "")][..],
+            &[("A", Regular, 0o644, b"x", ""), ("a", Regular, 0o644, b"y", "")],
+            &[("d/", Directory, 0o755, b"", ""), ("D/", Directory, 0o755, b"", "")],
+            &[("a//b", Regular, 0o644, b"x", "")],
+            &[("a/./b", Regular, 0o644, b"x", "")],
+            &[("../b", Regular, 0o644, b"x", "")],
+            &[(".", Regular, 0o644, b"x", "")],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(
+                tree(&tarball(entries), &dir.path().join("skill"), SKILL_LIMITS).is_err(),
+                "{:?}",
+                entries.iter().map(|e| e.0).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A pax global header is not an entry, as in the collector's count.
+    #[test]
+    fn a_pax_global_header_does_not_count_as_a_skill_entry() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut global = tar::Header::new_ustar();
+        let record = b"18 comment=hello\n";
+        global.set_entry_type(tar::EntryType::XGlobalHeader);
+        global.set_size(record.len() as u64);
+        global.set_path("pax_global_header").unwrap();
+        global.set_cksum();
+        builder.append(&global, &record[..]).unwrap();
+        for name in ["a", "b"] {
+            let mut header = tar::Header::new_ustar();
+            header.set_path(name).unwrap();
+            header.set_mode(0o644);
+            header.set_size(1);
+            header.set_cksum();
+            builder.append(&header, &b"x"[..]).unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&builder.into_inner().unwrap()).unwrap();
+        let bytes = gz.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_entries: 2,
+            ..SKILL_LIMITS
+        };
+        tree(&bytes, &dir.path().join("skill"), limits).unwrap();
+        let limits = Limits {
+            max_entries: 1,
+            ..SKILL_LIMITS
+        };
+        assert!(tree(&bytes, &dir.path().join("again"), limits).is_err());
     }
 
     #[test]

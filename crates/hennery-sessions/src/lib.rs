@@ -59,6 +59,8 @@ pub mod review;
 mod session_defaults_api;
 pub mod session_tools;
 mod shared_files;
+mod skills_api;
+mod skills_sync;
 pub mod startup;
 pub mod store;
 pub mod sweep;
@@ -220,6 +222,7 @@ pub fn router(state: AppState) -> Router {
         .merge(hosts::router(state.clone()))
         .merge(hats::router(state.clone()))
         .merge(session_defaults_api::router(state.clone()))
+        .merge(skills_api::router(state.clone()))
         .merge(idle_parking::router(state.clone()))
         .merge(projects::router(state.clone()))
         .merge(files::router(state.clone()))
