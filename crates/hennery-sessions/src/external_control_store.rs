@@ -33,7 +33,7 @@ impl std::error::Error for LimitRefusal {}
 pub(crate) fn live_sessions_in(conn: &Connection, owner: &str, client_id: &str) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM external_client_sessions x JOIN sessions s ON s.owner_id=x.owner_id AND s.id=x.session_id
-         WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','deleted','failed') AND s.close_requested = 0",
+         WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','archived','deleted','failed') AND s.close_requested = 0",
         params![owner, client_id],
         |r| r.get(0),
     )?)
@@ -204,7 +204,7 @@ fn current_client(conn: &Connection, owner: &str, id: &str, revision: i64) -> Re
     );
     Ok(client)
 }
-fn command_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Command> {
+pub(super) fn command_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Command> {
     Ok(Command {
         operation_id: row.get(0)?,
         client_id: row.get(1)?,
@@ -212,6 +212,7 @@ fn command_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Command> {
         tool: row.get(3)?,
         session_id: row.get(4)?,
         turn_id: row.get(5)?,
+        resolved_prompt: None,
     })
 }
 impl Store {
@@ -239,6 +240,9 @@ impl Store {
     /// Recheck the exact transition, not just the session's current authority.
     pub(crate) fn external_handoff_in(&self, conn: &Connection, command: &Command, transition: &str) -> Result<()> {
         self.external_guard_in(conn, command, None)?;
+        if transition == "prompt" {
+            self.check_attached_source_in(conn, &command.session_id)?;
+        }
         let valid:bool = match transition {
             "start" | "resume" => conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE owner_id = ?1 AND id=?2 AND lifecycle='starting' AND external_attach_operation=?3)",params![self.owner_id(),command.session_id,command.operation_id],|r|r.get(0))?,
             "prompt" | "cancel" => conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE owner_id = ?1 AND id=?2 AND lifecycle='active' AND open_turn_id=?3)",params![self.owner_id(),command.session_id,command.turn_id],|r|r.get(0))?,
@@ -308,6 +312,9 @@ impl Store {
             ensure_capacity_in(conn, self.owner_id(), &client)?;
             placement(conn, self.owner_id(), &client, host, cwd, hat)
         } else {
+            if command.tool == "session_prompt" {
+                self.check_external_prompt_placement_in(conn, command, &client)?;
+            }
             if matches!(command.tool.as_str(), "session_create" | "session_clone") {
                 let hat: String = conn.query_row(
                     "SELECT hat_id FROM sessions WHERE owner_id = ?1 AND id=?2",
@@ -420,17 +427,16 @@ impl Store {
             "operation_limit"
         );
         let id = uuid::Uuid::now_v7().to_string();
-        let turn = if tool == "session_prompt" {
-            Some(uuid::Uuid::now_v7().to_string())
-        } else {
-            args["turn_id"].as_str().map(str::to_owned)
-        };
+        let turn = args["turn_id"].as_str();
         tx.execute("INSERT INTO external_operations(owner_id,id,client_id,revision,request_key_hash,digest,tool,session_id,turn_id,state,args,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued',?10,?11)",params![self.owner_id(),id,client.client_id,client.revision,key_hash,digest,tool,session,turn,raw,unix_now()])?;
         tx.execute(
             "UPDATE external_operations SET source_session_id=?3,target_hat_id=?4 WHERE owner_id = ?1 AND id=?2",
             params![self.owner_id(), id, source, target_hat],
         )?;
         if tool == "session_prompt" {
+            tx.execute("UPDATE external_operations SET target_hat_id=(SELECT hat_id FROM sessions WHERE owner_id = ?1 AND id=?3),
+                steering_turn=(SELECT open_turn_id FROM sessions WHERE owner_id = ?1 AND id=?3 AND lifecycle='active' AND steering_supported=1 AND ?4='auto')
+                WHERE owner_id = ?1 AND id=?2",params![self.owner_id(),id,session,args["delivery"].as_str().unwrap_or("auto")])?;
             crate::external_attachments::bind_in(&tx, self.owner_id(), client, &session, &id, args)?;
         }
         let receipt = self.external_receipt_in(&tx, identity, &id)?;
@@ -457,6 +463,17 @@ impl Store {
             params![self.owner_id(), id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        if tool == "session_prompt" && receipt.result.as_ref().is_some_and(|v| v["delivery"] == "steering") {
+            (receipt.turn_id, receipt.state, receipt.outcome) = conn.query_row(
+                "SELECT turn_id,state,outcome FROM external_steering_receipts WHERE owner_id = ?1 AND id=?2",
+                params![self.owner_id(), id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if receipt.state == "not_delivered" {
+                receipt.code = Some("not_delivered".into());
+            }
+            return Ok(receipt);
+        }
         if !matches!(receipt.state.as_str(), "failed" | "cancelled") {
             if tool == "session_prompt" || tool == "session_cancel" {
                 if let Some(turn) = receipt.turn_id.as_deref() {
@@ -467,6 +484,15 @@ impl Store {
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
                         .optional()?;
+                    if tool == "session_prompt"
+                        && row.is_some()
+                        && receipt.result.as_ref().is_none_or(|r| r.get("delivery").is_none())
+                    {
+                        // Include route metadata on ordinary receipts retained from older collectors.
+                        let result = receipt.result.get_or_insert_with(|| json!({}));
+                        result["delivery"] = json!("turn");
+                        result["turn_id"] = json!(turn);
+                    }
                     match row {
                         Some((state, outcome)) if state == "ended" => {
                             receipt.state = "completed".into();
@@ -531,14 +557,40 @@ impl Store {
         };
         self.external_receipt_in(&conn, identity, &id)
     }
+    pub(crate) fn external_wait_snapshot(&self, identity: &ExternalIdentity, id: &str) -> Result<(Receipt, bool)> {
+        let conn = self.conn();
+        let receipt = self.external_receipt_in(&conn, identity, id)?;
+        let steering = receipt
+            .result
+            .as_ref()
+            .is_some_and(|result| result["delivery"] == "steering");
+        if steering
+            && matches!(
+                receipt.state.as_str(),
+                "completed" | "failed" | "cancelled" | "not_delivered"
+            )
+        {
+            return Ok((receipt, false));
+        }
+        let target = if steering { receipt.turn_id.as_deref() } else { None };
+        let waiting = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.owner_id = ?1 AND s.id=?2
+                AND (?3 IS NULL OR s.open_turn_id=?3)
+                AND (s.activity='blocked' OR EXISTS(SELECT 1 FROM pending p WHERE p.owner_id=s.owner_id
+                     AND p.session_id=s.id AND p.state='open' AND (?3 IS NULL OR p.turn_id=?3))))",
+            params![self.owner_id(), receipt.session_id, target],
+            |r| r.get(0),
+        )?;
+        Ok((receipt, waiting))
+    }
     pub(crate) fn external_pending(&self) -> Result<Vec<(Command, Value)>> {
         let conn = self.conn();
         let mut stmt=conn.prepare("SELECT id,client_id,revision,tool,session_id,turn_id,args FROM external_operations o WHERE o.owner_id = ?1 AND o.state='queued'
             AND (o.tool<>'session_prompt' OR (
-                NOT EXISTS(SELECT 1 FROM external_operations p WHERE p.owner_id = ?1 AND p.session_id=o.session_id AND p.tool='session_prompt' AND p.position<o.position AND p.state IN ('queued','running','uncertain'))
-                AND EXISTS(SELECT 1 FROM sessions s WHERE s.owner_id = ?1 AND s.id=o.session_id AND s.lifecycle IN ('active','parked') AND s.open_turn_id IS NULL AND COALESCE(s.activity,'')<>'blocked'
+                EXISTS(SELECT 1 FROM external_prompt_heads head WHERE head.owner_id = ?1 AND head.id=o.id)
+                AND EXISTS(SELECT 1 FROM sessions s WHERE s.owner_id = ?1 AND s.id=o.session_id AND s.lifecycle IN ('active','parked') AND ((s.lifecycle='active' AND s.open_turn_id=o.steering_turn AND s.activity IN ('running','blocked')) OR (s.open_turn_id IS NULL AND COALESCE(s.activity,'')<>'blocked'
                     AND NOT EXISTS(SELECT 1 FROM pending p WHERE p.owner_id = ?1 AND p.session_id=s.id AND p.state='open')
-                    AND NOT EXISTS(SELECT 1 FROM session_dispatch_queue q WHERE q.owner_id = ?1 AND q.target_id=s.id AND q.state IN ('queued','waiting_config','awaiting_reconciliation'))))) ORDER BY position LIMIT 32")?;
+                    AND NOT EXISTS(SELECT 1 FROM session_dispatch_queue q WHERE q.owner_id = ?1 AND q.target_id=s.id AND q.state IN ('queued','waiting_config','awaiting_reconciliation','steering'))))))) ORDER BY position LIMIT 32")?;
         stmt.query_map([self.owner_id()], |r| Ok((command_row(r)?, r.get::<_, String>(6)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
@@ -560,7 +612,9 @@ impl Store {
         result: Option<&Value>,
     ) -> Result<()> {
         let conn = self.conn();
-        conn.execute("UPDATE external_operations SET state=?3,code=?4,result=COALESCE(?5,result),args=CASE WHEN ?3='queued' THEN args ELSE json_object() END WHERE owner_id = ?1 AND id=?2 AND state IN ('queued','running','uncertain')",params![self.owner_id(),command.operation_id,state,code,result.map(serde_json::to_string).transpose()?])?;
+        conn.execute("UPDATE external_operations SET state=?3,code=?4,result=CASE
+            WHEN ?5 IS NOT NULL AND tool='session_prompt' AND json_extract(result,'$.delivery')='turn'
+            THEN json_patch(?5,json_object('delivery','turn','turn_id',turn_id)) ELSE COALESCE(?5,result) END,args=CASE WHEN ?3='queued' THEN args ELSE json_object() END WHERE owner_id = ?1 AND id=?2 AND state IN ('queued','running','uncertain')",params![self.owner_id(),command.operation_id,state,code,result.map(serde_json::to_string).transpose()?])?;
         Ok(())
     }
     pub(crate) fn external_recover_operations(&self) -> Result<()> {
@@ -583,7 +637,7 @@ impl Store {
             if !pending {
                 return Ok(());
             }
-            conn.execute("UPDATE external_operations SET state='uncertain',args=json_object(),code='delivery_unknown' WHERE owner_id = ?1 AND state='running'",[self.owner_id()])?;
+            conn.execute("UPDATE external_operations SET state='uncertain',args=CASE WHEN json_extract(result,'$.admission')='pending' THEN args ELSE json_object() END,steering_deadline=NULL,code='delivery_unknown' WHERE owner_id = ?1 AND state='running' AND COALESCE(json_extract(result,'$.admission'),'')<>'confirmed'",[self.owner_id()])?;
         }
         let unsent = {
             let conn = self.conn();
@@ -621,7 +675,7 @@ impl Store {
         conn.execute("UPDATE external_operations SET state='failed',code='not_delivered',args=json_object() WHERE owner_id = ?1 AND state='uncertain' AND request_id IS NULL AND NOT (tool='session_answer' AND EXISTS(SELECT 1 FROM answer_queue q WHERE q.owner_id = ?1 AND q.session_id=external_operations.session_id AND json_extract(q.input_origin,'$.operation_id')=external_operations.id)) AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.owner_id = ?1 AND t.session_id=external_operations.session_id AND t.turn_id=external_operations.turn_id)", [self.owner_id()])?;
         conn.execute("UPDATE external_operations SET state='completed',code=NULL,args=json_object() WHERE owner_id = ?1 AND tool='session_config' AND state IN ('running','uncertain') AND EXISTS(SELECT 1 FROM events e WHERE e.owner_id = ?1 AND e.session_id=external_operations.session_id AND e.kind='config_applied' AND e.applied=1 AND json_extract(e.body,'$.request_id')=external_operations.request_id)",[self.owner_id()])?;
         conn.execute("UPDATE external_operations SET state='completed',args=json_object() WHERE owner_id = ?1 AND state IN ('running','uncertain') AND
-            ((tool='session_prompt' AND EXISTS(SELECT 1 FROM turns t WHERE t.owner_id = ?1 AND t.session_id=external_operations.session_id AND t.turn_id=external_operations.turn_id AND t.state='ended'))
+            ((tool='session_prompt' AND EXISTS(SELECT 1 FROM turns t WHERE t.owner_id = ?1 AND t.session_id=external_operations.session_id AND (t.turn_id=external_operations.turn_id OR (json_extract(result,'$.admission')='confirmed' AND t.turn_id=external_operations.steering_turn)) AND t.state='ended'))
             OR (tool IN ('session_create','session_clone','session_resume') AND EXISTS(SELECT 1 FROM events e WHERE e.owner_id = ?1 AND e.session_id=external_operations.session_id AND e.kind='session_started' AND e.applied=1 AND json_extract(e.body,'$.request_id')=external_operations.request_id)))",[self.owner_id()])?;
         Ok(())
     }

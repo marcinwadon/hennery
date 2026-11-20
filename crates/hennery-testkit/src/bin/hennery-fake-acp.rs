@@ -606,6 +606,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                         }
                     }
                     match script.steering_outcome.as_deref() {
+                        Some("method_not_found") => {
+                            responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                        }
                         Some("internal_error") => {
                             responder.respond_with_error(agent_client_protocol::Error::internal_error())
                         }

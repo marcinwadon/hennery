@@ -2,6 +2,7 @@ import { expect, test, type APIRequestContext, type Page } from '@playwright/tes
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { startCollector, type Collector } from './collector'
+import { spawnHennery } from './spawn'
 import { defaultHostDir, fakeAgent, testHost, type TestHost } from './host'
 
 const select = (id: string, value: string, choices: string[]) => ({ id, name: id, category: id === 'effort' ? 'thought_level' : id, type: 'select', currentValue: value, options: choices.map(value => ({ value, name: value })) })
@@ -30,6 +31,19 @@ async function pair(request: APIRequestContext, collector: Collector, host: Test
   return id
 }
 
+// Keep Git under the same isolated environment as every browser-test process.
+async function git(home: string, cwd: string, args: string[]): Promise<string> {
+  const child = spawnHennery(['-C', cwd, ...args], home, {}, ['ignore', 'pipe', 'pipe'], 'git')
+  let output = '', errors = ''
+  child.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString() })
+  child.stderr?.on('data', (chunk: Buffer) => { errors += chunk.toString() })
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', code => code === 0 ? resolve() : reject(new Error(`scratch Git failed: ${errors}`)))
+  })
+  return output.trim()
+}
+
 for (const [width, appearance] of [[390, 'light'], [1280, 'dark']] as const) {
   test(`New like this copies current settings from header and list at ${width}px ${appearance}`, async ({ browser }) => {
     test.setTimeout(120_000)
@@ -47,6 +61,12 @@ for (const [width, appearance] of [[390, 'light'], [1280, 'dark']] as const) {
       await setup(page, collector)
       const hostId = await pair(context.request, collector, host)
       const cwd = join(realpathSync(host.dir), 'synthetic-project'); mkdirSync(cwd)
+      await git(host.dir, cwd, ['init', '-q'])
+      writeFileSync(join(cwd, 'base.txt'), 'COMMITTED')
+      await git(host.dir, cwd, ['add', 'base.txt'])
+      await git(host.dir, cwd, ['-c', 'user.name=Browser test', '-c', 'user.email=browser@example.invalid', 'commit', '-qm', 'base'])
+      const base = await git(host.dir, cwd, ['rev-parse', 'HEAD'])
+      writeFileSync(join(cwd, 'base.txt'), 'SOURCE_LOCAL_CHANGES')
       const headers = { origin: collector.origin }
       const started = await context.request.post('/api/sessions', { headers, data: { host_id: hostId, agent: 'claude', cwd } })
       expect(started.ok()).toBe(true)
@@ -76,8 +96,30 @@ for (const [width, appearance] of [[390, 'light'], [1280, 'dark']] as const) {
         await expect(action).toBeInViewport({ ratio: 1 })
         const artifact = join(process.cwd(), '../.superpowers/sdd/new-like-this/screenshots'); mkdirSync(artifact, { recursive: true })
         await page.screenshot({ path: join(artifact, `${entry}-menu-${width}-${appearance}.png`), animations: 'disabled' })
-        const response = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/new-like-this'))
+        const before = clones.length
         await action.click()
+        const workspace = page.getByRole('dialog', { name: 'New like this', exact: true })
+        await expect(workspace).toBeVisible()
+        expect(clones).toHaveLength(before)
+        const createWorktree = workspace.getByRole('checkbox', { name: 'Create a new worktree' })
+        const isolated = entry === 'list'
+        // Header: override the initial isolated default to share cwd. List:
+        // verify the saved shared default and explicitly request isolation.
+        await expect(createWorktree).toBeChecked({ checked: entry === 'header' })
+        await createWorktree.setChecked(isolated)
+        if (isolated) {
+          await expect(workspace.getByLabel('Base branch or commit', { exact: true })).toHaveValue(base)
+          await expect(workspace.getByText(`Resolved base commit: ${base}`, { exact: true })).toBeVisible()
+        } else {
+          await expect(workspace.getByText('Uses the existing directory, including its uncommitted changes.', { exact: true })).toBeVisible()
+        }
+        const submit = workspace.getByRole('button', { name: 'Start session', exact: true })
+        await expect(submit).toBeEnabled()
+        await expect(submit).toBeInViewport({ ratio: 1 })
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+        await page.screenshot({ path: join(artifact, `${entry}-workspace-${width}-${appearance}.png`), animations: 'disabled' })
+        const response = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/new-like-this'))
+        await submit.click()
         const created = await response
         expect(created.ok(), await created.text()).toBe(true)
         const id = (await created.json()).session_id
@@ -86,7 +128,17 @@ for (const [width, appearance] of [[390, 'light'], [1280, 'dark']] as const) {
         const prompt = page.getByRole('textbox', { name: 'Prompt', exact: true })
         await expect(prompt).toBeFocused(); await expect(prompt).toHaveValue('')
         const detail = await (await context.request.get(`/api/sessions/${id}`)).json()
-        expect(detail).toMatchObject({ host_id: hostId, agent: 'claude', cwd, hat_id: sourceDetail.hat_id, lifecycle: 'active', model: 'sonnet', mode: 'bypass' })
+        expect(detail).toMatchObject({ host_id: hostId, agent: 'claude', hat_id: sourceDetail.hat_id, lifecycle: 'active', model: 'sonnet', mode: 'bypass' })
+        if (isolated) {
+          expect(detail.cwd).not.toBe(cwd)
+          expect(readFileSync(join(detail.cwd, 'base.txt'), 'utf8')).toBe('COMMITTED')
+          const managed = await (await context.request.get(`/api/sessions/${id}/workspace`)).json()
+          expect(managed).toMatchObject({ root: detail.cwd, base_commit: base, users: 1, state: 'ready' })
+        } else {
+          expect(detail.cwd).toBe(cwd)
+          expect(readFileSync(join(detail.cwd, 'base.txt'), 'utf8')).toBe('SOURCE_LOCAL_CHANGES')
+        }
+        expect(readFileSync(join(cwd, 'base.txt'), 'utf8')).toBe('SOURCE_LOCAL_CHANGES')
         expect(detail.title).not.toBe('Source session')
         expect(detail.family?.parent).toBeFalsy()
         const catalog = await (await context.request.get(`/api/sessions/${id}/catalog`)).json()

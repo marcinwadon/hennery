@@ -4,6 +4,34 @@ use hennery_proto::frames::{
 use serde_json::json;
 
 #[test]
+fn steering_rejection_hints_are_compatible_with_older_hosts_and_collectors() {
+    use hennery_proto::frames::SteeringOutcome;
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyOutcome {
+        Rejected { reason: String },
+    }
+    let original = json!({"kind":"rejected","reason":"method missing"});
+    let decoded: SteeringOutcome = serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(
+        decoded,
+        SteeringOutcome::Rejected {
+            reason: "method missing".into(),
+            steering_unavailable: false
+        }
+    );
+    assert_eq!(serde_json::to_value(decoded).unwrap(), original);
+    let hinted = SteeringOutcome::Rejected {
+        reason: "method missing".into(),
+        steering_unavailable: true,
+    };
+    let wire = serde_json::to_value(&hinted).unwrap();
+    assert_eq!(serde_json::from_value::<SteeringOutcome>(wire.clone()).unwrap(), hinted);
+    let LegacyOutcome::Rejected { reason } = serde_json::from_value(wire).unwrap();
+    assert_eq!(reason, "method missing");
+}
+
+#[test]
 fn attached_session_ending_is_optional_and_round_trips_when_reported() {
     for ending in [None, Some(false), Some(true)] {
         let mut wire = json!({"session_id":"s1", "last_seq":0});

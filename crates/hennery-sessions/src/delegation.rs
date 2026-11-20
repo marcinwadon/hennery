@@ -207,7 +207,7 @@ impl Store {
             JOIN sessions r ON r.id = f.root_id AND r.owner_id = ?1
             WHERE f.owner_id = ?1 AND f.parent_id = ?2 AND f.child_id = ?3 AND f.hat_id = ?4 AND f.detached = 0
               AND c.hat_id = ?4 AND r.hat_id = ?4 AND c.close_requested = 0 AND r.close_requested = 0
-              AND c.lifecycle NOT IN ('closed', 'deleted') AND r.lifecycle NOT IN ('closed', 'deleted')",
+              AND c.lifecycle NOT IN ('closed', 'archived', 'deleted') AND r.lifecycle NOT IN ('closed', 'archived', 'deleted')",
                 params![self.owner_id(), caller.session_id(), child, caller.hat_id()],
                 |r| {
                     Ok(SessionFamily {

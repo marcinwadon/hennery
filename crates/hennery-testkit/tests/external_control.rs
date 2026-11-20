@@ -173,6 +173,19 @@ impl Harness {
     fn create_args(&self, key: &str) -> Value {
         json!({"request_key":key,"host_id":"host","cwd":self.root,"agent":"fake"})
     }
+    async fn dispatched(&self, op: &Value) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let receipt = self
+                .rpc("operation_get", json!({"operation_id":op["operation_id"]}))
+                .await;
+            if receipt["turn_id"].is_string() {
+                return receipt;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{receipt}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
     async fn done(&self, id: &str) -> Value {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -251,6 +264,7 @@ async fn collector_restart_recovers_the_same_running_operation_without_resending
             json!({"request_key":"survive","session_id":session,"text":"Continue through reconnect"}),
         )
         .await;
+    let op = h.dispatched(&op).await;
     h.until(|| {
         h.state
             .store
@@ -303,6 +317,7 @@ async fn revoking_a_client_cancels_queued_work_and_erases_undelivered_payloads()
             json!({"request_key":"first","session_id":session,"text":"Already accepted"}),
         )
         .await;
+    let first = h.dispatched(&first).await;
     h.until(|| {
         h.state
             .store
@@ -353,13 +368,7 @@ async fn revoking_a_client_cancels_queued_work_and_erases_undelivered_payloads()
     assert_eq!(state, "cancelled");
     assert_eq!(payload, "{}");
     assert_eq!(h.log("session/prompt"), 1);
-    assert!(
-        h.state
-            .store
-            .turn_state(second["turn_id"].as_str().unwrap())
-            .unwrap()
-            .is_none()
-    );
+    assert!(second["turn_id"].is_null());
     h.finish().await;
 }
 
@@ -576,6 +585,7 @@ async fn busy_prompts_queue_and_cancel_never_hits_a_newer_turn() {
             json!({"request_key":"first","session_id":session,"text":"First"}),
         )
         .await;
+    let first = h.dispatched(&first).await;
     h.until(|| {
         h.state
             .store
@@ -601,6 +611,7 @@ async fn busy_prompts_queue_and_cancel_never_hits_a_newer_turn() {
         .await;
     let cancelled = h.done(cancel["operation_id"].as_str().unwrap()).await;
     assert_eq!(cancelled["outcome"], "cancelled");
+    let second = h.dispatched(&second).await;
     h.until(|| {
         h.state
             .store
@@ -853,6 +864,7 @@ async fn queued_prompts_can_be_edited_and_withdrawn_without_replaying_original_k
             json!({"request_key":"first","session_id":session,"text":"first"}),
         )
         .await;
+    let first = h.dispatched(&first).await;
     h.until(|| {
         h.state
             .store
@@ -1439,5 +1451,418 @@ async fn create_applies_hat_defaults_under_explicit_config_like_the_launcher() {
     assert_eq!(detail["detail"]["catalog"]["model"], "large", "{detail}");
     h.action("session_close", "close-defaulted", session).await;
     h.action("session_close", "close-explicit", other).await;
+    h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_steers_two_followups_into_the_blocked_external_turn() {
+    let h = Harness::new(FakeScript {
+        asks: vec![FakeAsk::Permission],
+        steering_outcome: Some("injected".into()),
+        ..Default::default()
+    })
+    .await;
+    let session = h.create("create").await["session_id"].as_str().unwrap().to_owned();
+    h.rpc(
+        "session_prompt",
+        json!({"request_key":"start","session_id":session,"text":"first"}),
+    )
+    .await;
+    h.until(|| !h.state.store.open_pending(&session).unwrap().is_empty())
+        .await;
+    let turn = h
+        .state
+        .store
+        .find_session(&session)
+        .unwrap()
+        .unwrap()
+        .open_turn_id
+        .unwrap();
+    let client = h.rpc("hennery_capabilities", json!({})).await["client_id"].clone();
+    for text in ["second", "third"] {
+        let args = json!({"request_key":text,"session_id":session,"text":text});
+        let op = h.rpc("session_prompt", args.clone()).await;
+        h.until(|| {
+            h.state
+                .store
+                .events(&session, 0, 256)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "user_steering" && e.body["origin"]["operation_id"] == op["operation_id"])
+        })
+        .await;
+        let repeat = h.rpc("session_prompt", args).await;
+        assert_eq!(repeat["operation_id"], op["operation_id"]);
+        assert_eq!(repeat["turn_id"], turn);
+        assert_eq!(
+            repeat["result"],
+            json!({"delivery":"steering","turn_id":turn,"admission":"confirmed"})
+        );
+        assert_eq!(repeat["state"], "running");
+        let wait = h
+            .rpc(
+                "session_wait",
+                json!({"operation_id":op["operation_id"],"timeout_ms":0}),
+            )
+            .await;
+        assert_eq!(wait["operation"], repeat);
+        assert_eq!(wait["waiting_on_operator"], true);
+        let event = h
+            .state
+            .store
+            .events(&session, 0, 256)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "user_steering" && e.body["origin"]["operation_id"] == op["operation_id"])
+            .unwrap();
+        assert_eq!(event.body["origin"]["client_id"], client);
+        assert_eq!(event.body["content"][0]["text"], text);
+    }
+    let q = h
+        .rpc(
+            "session_prompt",
+            json!({"session_id":session,"request_key":"explicit","text":"later","delivery":"queue"}),
+        )
+        .await;
+    h.rpc(
+        "session_prompt",
+        json!({"session_id":session,"request_key":"tail","text":"even later"}),
+    )
+    .await;
+    assert!(q["turn_id"].is_null());
+    let cancel = h
+        .rpc(
+            "session_cancel",
+            json!({"session_id":session,"request_key":"end","turn_id":turn}),
+        )
+        .await;
+    h.done(cancel["operation_id"].as_str().unwrap()).await;
+    let done = h.rpc("operation_get", json!({"request_key":"third"})).await;
+    assert_eq!(done["state"], "completed");
+    assert_eq!(done["outcome"], "cancelled");
+    h.until(|| h.log("session/prompt") == 2).await;
+    assert_eq!(h.log("_session/steering"), 2);
+    h.finish().await;
+}
+
+async fn external_steering_adapter_response(outcome: &str, expected: &str) {
+    let h = Harness::new(FakeScript {
+        steering_outcome: Some(outcome.into()),
+        asks: vec![FakeAsk::Permission],
+        ..Default::default()
+    })
+    .await;
+    let session = h.create("create").await["session_id"].as_str().unwrap().to_owned();
+    h.rpc(
+        "session_prompt",
+        json!({"request_key":"start","session_id":session,"text":"first"}),
+    )
+    .await;
+    h.until(|| !h.state.store.open_pending(&session).unwrap().is_empty())
+        .await;
+    let args = json!({"session_id":session,"request_key":"hint","text":"second"});
+    let op = h.rpc("session_prompt", args.clone()).await;
+    h.until(|| h.log("_session/steering") == 1).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let op = h.rpc("operation_get", json!({"operation_id":op["operation_id"]})).await;
+        if op["state"] == expected {
+            if expected == "failed" {
+                assert_eq!(op["code"], "steering_rejected");
+                assert!(op["result"]["reason"].as_str().is_some_and(|s| !s.is_empty()));
+            }
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{op}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(h.rpc("session_prompt", args).await["operation_id"], op["operation_id"]);
+    if expected == "queued" {
+        let target = h
+            .state
+            .store
+            .find_session(&session)
+            .unwrap()
+            .unwrap()
+            .open_turn_id
+            .unwrap();
+        h.rpc(
+            "session_cancel",
+            json!({"request_key":"end","session_id":session,"turn_id":target}),
+        )
+        .await;
+        h.until(|| h.log("session/prompt") == 2).await;
+        let receipt = h.rpc("operation_get", json!({"request_key":"hint"})).await;
+        assert_eq!(receipt["result"]["delivery"], "turn");
+        assert_ne!(receipt["turn_id"], target);
+    }
+    assert_eq!(h.log("_session/steering"), 1);
+    h.finish().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_missing_method_restores_original_prompt_once() {
+    external_steering_adapter_response("method_not_found", "queued").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_invalid_steering_request_fails_without_retry() {
+    external_steering_adapter_response("invalid_params", "failed").await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_ambiguous_steering_request_stays_unknown() {
+    external_steering_adapter_response("internal_error", "delivery_unknown").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_external_steering_ack_after_restart_preserves_image_origin_and_target() {
+    let gate_dir = tempfile::tempdir().unwrap();
+    let gate = gate_dir.path().join("ack");
+    let mut h = Harness::new(FakeScript {
+        asks: vec![FakeAsk::Permission],
+        steering_outcome: Some("injected".into()),
+        steering_gate: Some(gate.display().to_string()),
+        ..Default::default()
+    })
+    .await;
+    let session = h.create("create").await["session_id"].as_str().unwrap().to_owned();
+    let other = h.create("other").await["session_id"].as_str().unwrap().to_owned();
+    let hash = hennery_kernel::secret::sha256_hex(b"\x89PNG\r\n\x1a\n");
+    let begin = h
+        .rpc(
+            "attachment_upload_begin",
+            json!({"request_key":"upload","session_id":session,"mime_type":"image/png","size":8,"sha256":hash}),
+        )
+        .await;
+    let upload = h.done(begin["operation_id"].as_str().unwrap()).await["result"]["upload_id"].clone();
+    h.rpc(
+        "attachment_upload_chunk",
+        json!({"session_id":session,"upload_id":upload,"offset":0,"data_base64":"iVBORw0KGgo="}),
+    )
+    .await;
+    let finish = h
+        .rpc(
+            "attachment_upload_finish",
+            json!({"request_key":"seal","session_id":session,"upload_id":upload}),
+        )
+        .await;
+    h.done(finish["operation_id"].as_str().unwrap()).await;
+
+    let start = h
+        .rpc(
+            "session_prompt",
+            json!({"request_key":"start","session_id":session,"text":"first"}),
+        )
+        .await;
+    let first = h.dispatched(&start).await["turn_id"].clone();
+    h.until(|| !h.state.store.open_pending(&session).unwrap().is_empty())
+        .await;
+    let pending = h.state.store.open_pending(&session).unwrap().remove(0).pending_id;
+    let args = json!({"request_key":"hint","session_id":session,"text":"look","attachments":[upload]});
+    let hint = h.rpc("session_prompt", args.clone()).await;
+    h.until(|| h.log("_session/steering") == 1).await;
+    let client = h.rpc("hennery_capabilities", json!({})).await["client_id"].clone();
+    let target = h.rpc("session_queue", json!({"session_id":session})).await["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["operation_id"] == hint["operation_id"])
+        .unwrap()
+        .clone();
+    assert_eq!(target["turn_id"], first);
+    assert_eq!(target["withdrawable"], false);
+    assert_eq!(target["delivery"], "steering");
+    let cancel = h
+        .rpc(
+            "operation_cancel",
+            json!({"request_key":"withdraw","session_id":session,"operation_id":hint["operation_id"]}),
+        )
+        .await;
+    assert_eq!(h.terminal(&cancel["operation_id"]).await["code"], "not_queued");
+    let refused: Value = h
+        .raw(&h.token, "attachment_get", json!({"session_id":session,"sha256":hash}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refused["result"]["isError"], true);
+
+    h.restart_collector().await;
+    let recovered = h.rpc("session_prompt", args.clone()).await;
+    assert_eq!(recovered["operation_id"], hint["operation_id"]);
+    assert_eq!(recovered["turn_id"], first);
+    assert_eq!(recovered["state"], "delivery_unknown");
+    // Another client's eligible hint waits behind the unresolved request.
+    let token = h.grant(true, true, true);
+    let tail = h
+        .rpc_as(
+            &token,
+            "session_prompt",
+            json!({"request_key":"tail","session_id":session,"text":"wait"}),
+        )
+        .await;
+    let op = hennery_testkit::operator_client(&h.state.operator);
+    let response = op
+        .post(format!("{}/api/sessions/{session}/pending/{pending}/answer", h.url))
+        .json(&json!({"option_id":"allow"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    h.until(|| h.state.store.turn_state(first.as_str().unwrap()).unwrap().as_deref() == Some("ended"))
+        .await;
+    let held = h
+        .rpc_as(&token, "operation_get", json!({"operation_id":tail["operation_id"]}))
+        .await;
+    assert_eq!(held["state"], "queued");
+    assert_eq!(h.log("session/prompt"), 1);
+    let response = op
+        .post(format!("{}/api/sessions/{session}/prompt", h.url))
+        .json(&json!({"content":[{"type":"text","text":"operator starts a later turn"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let newer: Value = response.json().await.unwrap();
+    h.until(|| !h.state.store.open_pending(&session).unwrap().is_empty())
+        .await;
+    let before = h.state.store.max_event_id().unwrap();
+    let unresolved = h
+        .rpc(
+            "session_wait",
+            json!({"operation_id":hint["operation_id"],"timeout_ms":0}),
+        )
+        .await;
+    assert_eq!(unresolved["operation"]["state"], "delivery_unknown");
+    assert_eq!(unresolved["waiting_on_operator"], false);
+    std::fs::write(gate, "").unwrap();
+    h.until(|| {
+        h.state
+            .store
+            .events(&session, before, 256)
+            .unwrap()
+            .iter()
+            .any(|event| event.kind == "user_steering")
+    })
+    .await;
+    let confirmed = h.done(hint["operation_id"].as_str().unwrap()).await;
+    assert_eq!(confirmed["turn_id"], first);
+    assert_eq!(confirmed["outcome"], "completed");
+    assert_eq!(confirmed["result"]["admission"], "confirmed");
+    let settled_wait = h
+        .rpc(
+            "session_wait",
+            json!({"operation_id":hint["operation_id"],"timeout_ms":0}),
+        )
+        .await;
+    assert_eq!(settled_wait["waiting_on_operator"], false);
+    assert_eq!(h.rpc("session_prompt", args).await, confirmed);
+    let raw = h.state.store.events(&session, before, 256).unwrap();
+    let event = raw.iter().find(|e| e.kind == "user_steering").unwrap();
+    assert_eq!(
+        event.body["origin"],
+        json!({"kind":"external_client","client_id":client,"operation_id":hint["operation_id"]})
+    );
+    assert_eq!(event.body["turn_id"], first);
+    assert!(event.body["display_at"].as_i64().unwrap() < before);
+    assert_eq!(event.body["content"][1]["sha256"], hash);
+    let history = h
+        .rpc(
+            "session_read",
+            json!({"session_id":session,"before_turn":newer["turn_id"]}),
+        )
+        .await
+        .to_string();
+    assert!(history.contains("look") && history.contains(&hash), "{history}");
+    assert_eq!(h.log("_session/steering"), 1);
+    let abort = h
+        .rpc(
+            "attachment_upload_abort",
+            json!({"request_key":"abort","session_id":session,"upload_id":upload}),
+        )
+        .await;
+    h.done(abort["operation_id"].as_str().unwrap()).await;
+    assert_eq!(
+        h.rpc("attachment_get", json!({"session_id":session,"sha256":hash}))
+            .await["data_base64"],
+        "iVBORw0KGgo="
+    );
+    let refused: Value = h
+        .raw(&h.token, "attachment_get", json!({"session_id":other,"sha256":hash}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refused["result"]["isError"], true);
+    h.state
+        .store
+        .delete_session(
+            &session,
+            Some(&hennery_sessions::store::Unattached {
+                lifecycle: "active".into(),
+                presumed_parked: false,
+            }),
+        )
+        .unwrap();
+    assert!(h.state.store.attachment(&hash).unwrap().is_none());
+    let gone = h.rpc("operation_get", json!({"request_key":"hint"})).await;
+    assert_eq!(gone["code"], "gone");
+    assert!(gone["result"].is_null());
+    assert!(gone["turn_id"].is_null());
+    h.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoked_external_grant_prevents_late_confirmed_miss_from_requeuing() {
+    let gates = tempfile::tempdir().unwrap();
+    let gate = gates.path().join("ack");
+    let h = Harness::new(FakeScript {
+        asks: vec![FakeAsk::Permission],
+        steering_outcome: Some("promptRequired".into()),
+        steering_gate: Some(gate.display().to_string()),
+        ..Default::default()
+    })
+    .await;
+    let session = h.create("create").await["session_id"].as_str().unwrap().to_owned();
+    h.rpc(
+        "session_prompt",
+        json!({"request_key":"start","session_id":session,"text":"first"}),
+    )
+    .await;
+    h.until(|| !h.state.store.open_pending(&session).unwrap().is_empty())
+        .await;
+    let hint = h
+        .rpc(
+            "session_prompt",
+            json!({"request_key":"hint","session_id":session,"text":"later"}),
+        )
+        .await;
+    h.until(|| h.log("_session/steering") == 1).await;
+    h.state
+        .store
+        .revoke_external_client(
+            h.rpc("hennery_capabilities", json!({})).await["client_id"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    std::fs::write(gate, "").unwrap();
+    h.until(|| {
+        h.state
+            .store
+            .events(&session, 0, 128)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "steering_result")
+    })
+    .await;
+    let conn = rusqlite::Connection::open(h.dir.path().join("collector.db")).unwrap();
+    let row: (String, String, Option<String>) = conn
+        .query_row(
+            "SELECT state,args,turn_id FROM external_operations WHERE id=?1",
+            [hint["operation_id"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("cancelled".into(), "{}".into(), None));
+    assert_eq!(h.log("session/prompt"), 1);
     h.finish().await;
 }

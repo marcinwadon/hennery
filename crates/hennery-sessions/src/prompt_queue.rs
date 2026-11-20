@@ -116,6 +116,24 @@ impl Store {
         )?)
     }
 
+    /// Materialize a validated attachment under the same lock and transaction as its queue or event link.
+    pub(super) fn store_queued_attachment_in(&self, tx: &Transaction<'_>, image: &crate::content::Image) -> Result<()> {
+        tx.execute(
+            "INSERT INTO attachments(owner_id,sha256,mime,size,created_at) VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(owner_id,sha256) DO NOTHING",
+            params![
+                self.owner_id(),
+                image.sha256,
+                image.mime,
+                image.bytes.len() as i64,
+                now()
+            ],
+        )?;
+        let dir = self.attachments.as_deref().context("attachment storage unavailable")?;
+        crate::attachments::write(dir, &image.sha256, &image.bytes)?;
+        Ok(())
+    }
+
     pub fn enqueue_operator_prompt(&self, session: &str, prompt: &Checked) -> Result<String> {
         match self.enqueue_operator_prompt_with_key(session, prompt, None)? {
             crate::prompt_receipts::PromptReceipt::Queued { queue_id } => Ok(queue_id),
@@ -128,6 +146,16 @@ impl Store {
         session: &str,
         prompt: &Checked,
         key: Option<&crate::prompt_receipts::PromptRequestKey>,
+    ) -> Result<crate::prompt_receipts::PromptReceipt> {
+        self.admit_operator_followup(session, prompt, key, None)
+    }
+
+    pub(crate) fn admit_operator_followup(
+        &self,
+        session: &str,
+        prompt: &Checked,
+        key: Option<&crate::prompt_receipts::PromptRequestKey>,
+        steering: Option<&Hub>,
     ) -> Result<crate::prompt_receipts::PromptReceipt> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -166,19 +194,7 @@ impl Store {
              VALUES (?1,?2,?3,?3,0,?4,?5,'operator',?6)", params![self.owner_id(),id,session,payload,config,image_bytes],
         )?;
         for (position, image) in prompt.images.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO attachments(owner_id,sha256,mime,size,created_at) VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(owner_id,sha256) DO NOTHING",
-                params![
-                    self.owner_id(),
-                    image.sha256,
-                    image.mime,
-                    image.bytes.len() as i64,
-                    now()
-                ],
-            )?;
-            let dir = self.attachments.as_deref().context("attachment storage unavailable")?;
-            crate::attachments::write(dir, &image.sha256, &image.bytes)?;
+            self.store_queued_attachment_in(&tx, image)?;
             tx.execute(
                 "INSERT INTO prompt_queue_attachments(owner_id,operation_id,sha256,position) VALUES (?1,?2,?3,?4)",
                 params![self.owner_id(), id, image.sha256, position as i64],
@@ -188,9 +204,24 @@ impl Store {
             "UPDATE sessions SET prompt_queue_held=CASE WHEN lifecycle='active' AND prompt_queue_held<>0 THEN 2 ELSE 0 END WHERE owner_id = ?1 AND id=?2",
             params![self.owner_id(), session],
         )?;
+        // Only the initial admission can steer. A replay after promptRequired
+        // keeps its original queue receipt even if another turn has since begun.
+        let handoff = if let Some(hub) = steering {
+            self.prepare_steering_in(&tx, session, &id, hub, crate::steering::SteeringMode::WhenAvailable)?
+                .map(|attempt| (attempt, hub))
+        } else {
+            None
+        };
         let receipt = crate::prompt_receipts::PromptReceipt::Queued { queue_id: id };
         crate::prompt_receipts::record_in(&tx, self.owner_id(), session, key, &receipt)?;
         tx.commit()?;
+        if let Some((attempt, hub)) = handoff
+            && let Err(err) = attempt.deliver(self, &mut conn, session, hub)
+        {
+            // Acceptance is durable. The steering deadline retains an unresolved
+            // attempt for operator recovery if recording the unsent result failed.
+            tracing::warn!(session_id = session, error = %err, "steering settlement deferred");
+        }
         Ok(receipt)
     }
 

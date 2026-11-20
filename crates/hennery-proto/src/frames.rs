@@ -23,6 +23,7 @@ pub struct AttachedSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
+    Workspaces,
     /// Optional typed context in the same ACP prompt as user input.
     PluginContext,
     /// Project enumeration and browsing.
@@ -532,7 +533,13 @@ pub enum TurnOutcome {
 pub enum SteeringOutcome {
     Injected,
     PromptRequired,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+        /// The host proved it could not route this steering request or the adapter lacks the extension.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[ts(as = "Option<bool>", optional)]
+        steering_unavailable: bool,
+    },
     Uncertain,
 }
 
@@ -935,6 +942,11 @@ pub struct SkillFailed {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostFrame {
+    WorkspaceResult {
+        request_id: String,
+        #[ts(type = "unknown")]
+        result: Value,
+    },
     /// Negotiated by HELLO_AUTH_HEADER=1; followed by the ordinary full Hello.
     Authenticate {
         protocol_version: String,
@@ -1078,6 +1090,7 @@ impl CollectorFrame {
             Self::ListProjects { .. } | Self::BrowseDirectory { .. } => Ok(Some(Capability::Projects)),
             Self::ReadFile { .. } => Ok(Some(Capability::Files)),
             Self::ForgetFiles { .. } => Ok(Some(Capability::Files)),
+            Self::Workspace { .. } => Ok(Some(Capability::Workspaces)),
             Self::ResolvePath { .. } => Ok(Some(Capability::ResolvePath)),
             Self::ProbeCatalog { .. } => Ok(Some(Capability::CatalogProbe)),
             // Not a probe of state, but carried as one (`session_forgotten`).
@@ -1129,6 +1142,7 @@ impl CollectorFrame {
             | Self::AnswerPermission { .. }
             | Self::AnswerElicitation { .. }
             | Self::Ack { .. }
+            | Self::Workspace { .. }
             | Self::ResolvePath { .. }
             | Self::ParkSession { .. }
             | Self::CloseSession { .. }
@@ -1165,6 +1179,7 @@ impl CollectorFrame {
             | Self::AnswerPermission { .. }
             | Self::AnswerElicitation { .. }
             | Self::Ack { .. }
+            | Self::Workspace { .. }
             | Self::ResolvePath { .. }
             | Self::ParkSession { .. }
             | Self::CloseSession { .. }
@@ -1196,7 +1211,8 @@ impl HostFrame {
     /// or this does not compile (umbrella §5.4).
     pub fn probe_request_id(&self) -> Option<&str> {
         match self {
-            Self::Catalog { request_id, .. }
+            Self::WorkspaceResult { request_id, .. }
+            | Self::Catalog { request_id, .. }
             | Self::Projects { request_id, .. }
             | Self::Directory { request_id, .. }
             | Self::File { request_id, .. }
@@ -1218,6 +1234,11 @@ impl HostFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CollectorFrame {
+    Workspace {
+        request_id: String,
+        #[ts(type = "unknown")]
+        operation: Value,
+    },
     CancelCatalogProbe {
         request_id: String,
     },

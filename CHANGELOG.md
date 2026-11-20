@@ -11,6 +11,12 @@
   and shown in session details. A start fails closed when the hooks cannot be
   applied.
 
+- External MCP prompts can steer the current turn. Set delivery to queue to wait
+  for a new turn. Operation receipts report the route and actual target turn.
+
+- Send operator follow-ups into the current turn automatically when the host
+  and adapter support steering. Queued messages still offer manual steering.
+
 ## 0.6.0
 
 - Send selected queued messages as steering input to running Claude Code and

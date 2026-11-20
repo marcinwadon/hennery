@@ -40,6 +40,8 @@ export function statusOf(s: StatusInput): Marker {
   switch (s.lifecycle) {
     case 'failed':
       return { tone: 'fail', label: 'Failed', resume: false }
+    case 'archived':
+      return { tone: 'idle', label: 'Archived', resume: false }
     case 'closed':
       return { tone: 'idle', label: 'Closed', resume: false }
     case 'parked':

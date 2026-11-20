@@ -4,6 +4,10 @@ use hennery_proto::frames::{AgentIsolation, Capabilities};
 use serde_json::{Value, json};
 
 fn fixture() -> (tempfile::TempDir, AppState) {
+    fixture_with_adapter(false)
+}
+
+fn fixture_with_adapter(steering_supported: bool) -> (tempfile::TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hennery.db");
     let state = AppState::new(
@@ -15,10 +19,11 @@ fn fixture() -> (tempfile::TempDir, AppState) {
         .store
         .create_session("s", "h", "fake", "/project", "hat", None)
         .unwrap();
-    state
-        .store
-        .ingest("s", 1, &SessionBody::session_started("start", "agent"))
-        .unwrap();
+    let mut started = SessionBody::session_started("start", "agent");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut started {
+        indexed.steering_supported = steering_supported;
+    }
+    state.store.ingest("s", 1, &started).unwrap();
     (dir, state)
 }
 
@@ -48,6 +53,219 @@ fn busy(state: &AppState) {
             )
             .unwrap()
     );
+}
+
+/// Reach the admission phase directly to model a second HTTP request that
+/// already checked for a receipt before the first request committed.
+#[tokio::test]
+async fn a_racing_submit_cannot_steer_again_after_prompt_required() {
+    let (_dir, state) = fixture_with_adapter(true);
+    let mut frames = running_with_steering_adapter(&state, vec![Capability::Steering]);
+    let accepted = send(&state, "same-key", "follow-up").await;
+    assert_eq!(accepted.0, StatusCode::ACCEPTED);
+    let CollectorFrame::Steer {
+        request_id, turn_id, ..
+    } = frames.try_recv().unwrap()
+    else {
+        panic!("the running turn should receive steering")
+    };
+    assert_eq!(turn_id, "busy");
+    state
+        .store
+        .ingest(
+            "s",
+            3,
+            &SessionBody::SteeringResult {
+                request_id,
+                outcome: hennery_proto::frames::SteeringOutcome::PromptRequired,
+            },
+        )
+        .unwrap();
+    let followup = content::check(vec![json!({"type":"text","text":"follow-up"})]).unwrap();
+    let key = PromptRequestKey::new("same-key", &followup).unwrap();
+    assert_eq!(
+        answer(accept_queued_prompt(&state, "s", &followup, Some(&key))).await,
+        accepted
+    );
+    assert_eq!(state.store.operator_prompt_queue("s").unwrap()[0].state, "queued");
+    assert!(frames.try_recv().is_err());
+}
+
+#[test]
+fn disconnected_before_handoff_keeps_automatic_input_queued() {
+    use crate::steering::SteeringMode;
+
+    for (mode, expected) in [
+        (SteeringMode::WhenAvailable, "queued"),
+        (SteeringMode::Required, "failed"),
+    ] {
+        let (_dir, state) = fixture_with_adapter(true);
+        let frames = running_with_steering_adapter(&state, vec![Capability::Steering]);
+        let checked = content::check(vec![json!({"type":"text","text":"follow-up"})]).unwrap();
+        let id = state.store.enqueue_operator_prompt("s", &checked).unwrap();
+        let mut conn = state.store.conn();
+        let tx = conn.transaction().unwrap();
+        let attempt = state
+            .store
+            .prepare_steering_in(&tx, "s", &id, &state.hub, mode)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+        drop(frames);
+        attempt.deliver(&state.store, &mut conn, "s", &state.hub).unwrap();
+        drop(conn);
+        let queue = state.store.operator_prompt_queue("s").unwrap();
+        assert_eq!(queue[0].id, id);
+        assert_eq!(queue[0].state, expected);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_followup_queues_when_only_the_adapter_supports_steering() {
+    let (_dir, state) = fixture_with_adapter(true);
+    let mut frames = running_with_steering_adapter(&state, vec![]);
+    let (status, receipt) = send(&state, "older-host", "follow-up").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let queue = state.store.operator_prompt_queue("s").unwrap();
+    assert_eq!(queue[0].id, receipt["queue_id"]);
+    assert_eq!(queue[0].state, "queued");
+    assert!(frames.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn attachments_that_lose_host_support_after_preflight_keep_their_fifo_position() {
+    for block in [
+        json!({"type":"file","name":"note.txt","mimeType":"text/plain","data":"aGk="}),
+        json!({"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}),
+    ] {
+        let (_dir, state) = fixture_with_adapter(true);
+        let mut frames = running_with_steering_adapter(&state, vec![Capability::Steering]);
+        let first = content::check(vec![json!({"type":"text","text":"earlier"})]).unwrap();
+        let head = state.store.enqueue_operator_prompt("s", &first).unwrap();
+        let checked = content::check(vec![block]).unwrap();
+        let key = PromptRequestKey::new("attachment", &checked).unwrap();
+        // The HTTP preflight saw the previous host's attachment capabilities.
+        let accepted = answer(accept_queued_prompt(&state, "s", &checked, Some(&key))).await;
+        assert_eq!(accepted.0, StatusCode::ACCEPTED);
+        assert_eq!(
+            answer(accept_queued_prompt(&state, "s", &checked, Some(&key))).await,
+            accepted
+        );
+        let queue = state.store.operator_prompt_queue("s").unwrap();
+        assert_eq!(queue[0].id, head);
+        assert_eq!(queue[1].id, accepted.1["queue_id"]);
+        assert_eq!(queue[1].state, "queued");
+        assert_eq!(queue[1].content, checked.stored);
+        assert!(frames.try_recv().is_err());
+    }
+}
+
+#[test]
+fn a_replacement_host_must_support_all_attachments_at_handoff() {
+    for (block, needed) in [
+        (
+            json!({"type":"file","name":"note.txt","mimeType":"text/plain","data":"aGk="}),
+            Capability::Files,
+        ),
+        (
+            json!({"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}),
+            Capability::Images,
+        ),
+    ] {
+        let (_dir, state) = fixture_with_adapter(true);
+        let _old = running_with_steering_adapter(&state, vec![Capability::Steering, needed]);
+        let checked = content::check(vec![block]).unwrap();
+        let id = state.store.enqueue_operator_prompt("s", &checked).unwrap();
+        let mut conn = state.store.conn();
+        let tx = conn.transaction().unwrap();
+        let handoff = state
+            .store
+            .prepare_steering_in(&tx, "s", &id, &state.hub, crate::steering::SteeringMode::WhenAvailable)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
+        state.hub.unregister("h", state.hub.routable_conn("h").unwrap());
+        let (sender, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let replacement = state
+            .hub
+            .register(
+                "h",
+                sender,
+                Capabilities(vec![Capability::Steering]),
+                AgentIsolation::default(),
+            )
+            .unwrap();
+        state.hub.mark_ready("h", replacement.conn_id);
+        handoff.deliver(&state.store, &mut conn, "s", &state.hub).unwrap();
+        drop(conn);
+        assert!(frames.try_recv().is_err());
+        assert_eq!(state.store.operator_prompt_queue("s").unwrap()[0].state, "queued");
+    }
+}
+
+#[tokio::test]
+async fn a_missing_host_actor_restores_only_automatic_input_to_the_queue() {
+    for (automatic, closed, expected) in [
+        (true, false, "queued"),
+        (false, false, "failed"),
+        (true, true, "failed"),
+    ] {
+        let (_dir, state) = fixture_with_adapter(true);
+        let mut frames = running_with_steering_adapter(&state, vec![Capability::Steering]);
+        if automatic {
+            assert_eq!(send(&state, "missing-actor", "follow-up").await.0, StatusCode::ACCEPTED);
+        } else {
+            let checked = content::check(vec![json!({"type":"text","text":"follow-up"})]).unwrap();
+            let id = state.store.enqueue_operator_prompt("s", &checked).unwrap();
+            state.store.steer_operator_prompt("s", &id, &state.hub).unwrap();
+        }
+        let CollectorFrame::Steer { request_id, .. } = frames.try_recv().unwrap() else {
+            panic!("expected steering")
+        };
+        if closed {
+            state.store.close_now("s").unwrap();
+        }
+        assert!(state.store.reject_steering("h", &request_id, "not_attached").unwrap());
+        assert_eq!(state.store.operator_prompt_queue("s").unwrap()[0].state, expected);
+    }
+}
+
+fn running_with_steering_adapter(
+    state: &AppState,
+    capabilities: Vec<Capability>,
+) -> tokio::sync::mpsc::UnboundedReceiver<CollectorFrame> {
+    state
+        .hosts
+        .register(
+            "h",
+            &hennery_kernel::hosts::Enrollment {
+                public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+                name: "fixture".into(),
+                host_version: "fixture".into(),
+                platform: "fixture".into(),
+            },
+            0,
+        )
+        .unwrap();
+    let (tx, frames) = tokio::sync::mpsc::unbounded_channel();
+    let host = state
+        .hub
+        .register("h", tx, Capabilities(capabilities), AgentIsolation::default())
+        .unwrap();
+    state.hub.mark_ready("h", host.conn_id);
+    busy(state);
+    state
+        .store
+        .ingest(
+            "s",
+            2,
+            &SessionBody::TurnStarted {
+                request_id: "initial".into(),
+                turn_id: "busy".into(),
+            },
+        )
+        .unwrap();
+    frames
 }
 
 #[tokio::test]

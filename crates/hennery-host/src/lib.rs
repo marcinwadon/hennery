@@ -26,6 +26,7 @@ pub mod transport;
 pub mod uplink;
 pub mod usage;
 pub mod walk;
+pub mod workspace;
 
 pub use adapter::AgentCommand;
 pub use connection::{HostConfig, run, run_until};

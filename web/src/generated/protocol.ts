@@ -193,7 +193,7 @@ export type CapabilitiesArgs = { agent: string | null, cwd: string | null, };
 /**
  * Start one independently configured direct child, without provider fallback.
  */
-export type SpawnArgs = { operation_key: string, cwd: string, brief: string, name: string | null, agent: string | null, config: SessionConfig, };
+export type SpawnArgs = { worktree_base?: string | null, operation_key: string, cwd: string, brief: string, name: string | null, agent: string | null, config: SessionConfig, };
 
 /**
  * Queue an ordinary follow-up for an owned direct child.
@@ -281,7 +281,7 @@ export type SessionConfig = { cache_retention?: CacheRetention, model?: string |
  * collector never sends a frame that needs a capability to a host that
  * lacks it.
  */
-export type Capability = "plugin_context" | "projects" | "images" | "files" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering" | "skills" | "hook_sets";
+export type Capability = "workspaces" | "plugin_context" | "projects" | "images" | "files" | "park" | "idle_hold" | "cache_retention" | "idle_timeout" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot" | "steering" | "skills" | "hook_sets";
 
 /**
  * `hello.capabilities`. Deserialized leniently: a capability this build
@@ -377,7 +377,11 @@ export type TurnOutcome = "completed" | "cancelled" | "failed" | "interrupted";
 /**
  * Admission reported by the steering extension, independent of turn completion.
  */
-export type SteeringOutcome = { "kind": "injected" } | { "kind": "prompt_required" } | { "kind": "rejected", reason: string, } | { "kind": "uncertain" };
+export type SteeringOutcome = { "kind": "injected" } | { "kind": "prompt_required" } | { "kind": "rejected", reason: string,
+/**
+ * The host proved it could not route this steering request or the adapter lacks the extension.
+ */
+steering_unavailable?: boolean, } | { "kind": "uncertain" };
 
 /**
  * Why a session was parked (ACP core §3.2).
@@ -670,7 +674,7 @@ export type HookSetApplied = { id: string, name: string, content_hash: string, }
 /**
  * Host -> collector.
  */
-export type HostFrame = { "type": "authenticate", protocol_version: string, host_id: string, proof: string, } | { "type": "catalog", request_id: string, catalog: HostCatalog, } | { "type": "hello", protocol_version: string, host_version: string, host_id: string,
+export type HostFrame = { "type": "workspace_result", request_id: string, result: unknown, } | { "type": "authenticate", protocol_version: string, host_id: string, proof: string, } | { "type": "catalog", request_id: string, catalog: HostCatalog, } | { "type": "hello", protocol_version: string, host_version: string, host_id: string,
 /**
  * Proof of possession of the host's key (ACP core §3.5): its
  * Ed25519 signature, hex, over `hello_proof_message(nonce, host_id,
@@ -724,7 +728,7 @@ truncated: boolean, } | { "type": "file", request_id: string, name: string, data
 /**
  * Collector -> host.
  */
-export type CollectorFrame = { "type": "cancel_catalog_probe", request_id: string, } | { "type": "probe_catalog", request_id: string, agent: string, cwd: string,
+export type CollectorFrame = { "type": "workspace", request_id: string, operation: unknown, } | { "type": "cancel_catalog_probe", request_id: string, } | { "type": "probe_catalog", request_id: string, agent: string, cwd: string,
 /**
  * Operator previews use ordinary session path rules. Delegated probes
  * retain the host workspace boundary. Set only by the collector.
@@ -850,7 +854,7 @@ request_key?: string | undefined, };
 export type PromptResponse = { turn_id: string, };
 
 /**
- * An accepted durable prompt, delivered after earlier turns finish.
+ * Receipt for a durable operator prompt accepted for steering or queued delivery.
  */
 export type QueuedPromptResponse = { queue_id: string, };
 

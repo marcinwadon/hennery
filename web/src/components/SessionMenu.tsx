@@ -1,3 +1,4 @@
+import WorkspaceOptionsEditor, { type WorkspaceOptions } from './WorkspaceOptions'
 import SessionName from './SessionNames'
 // Shared session actions (frontend spec §6.6): inline in the header,
 // or portalled beside a list row. Both use the same guards and requests.
@@ -74,6 +75,10 @@ export default function SessionMenu({ id, lifecycle, family, queuedCount = 0, ca
   const setOpen = row?.setOpen ?? setLocalOpen
   const [confirming, setConfirming] = useState(false)
   const [actionBusy, setBusy] = useState(false)
+  const [workspaceDialog, setWorkspaceDialog] = useState(false)
+  const [workspace, setWorkspace] = useState<WorkspaceOptions | null>(() => {
+    try { return localStorage.getItem('hennery.new-like-worktree') === 'false' ? null : { base: 'HEAD', files: [] } } catch { return { base: 'HEAD', files: [] } }
+  })
   const like = useNewLikeThis(id, row ? () => row.anchor.isConnected : undefined)
   const busy = actionBusy || like.busy
   const [error, setError] = useState<string | null>(null)
@@ -124,7 +129,7 @@ export default function SessionMenu({ id, lifecycle, family, queuedCount = 0, ca
   }, [open, anchor, row])
 
   const showPark = lifecycle === 'active' && canPark
-  const showClose = lifecycle !== undefined && lifecycle !== 'closed'
+  const showClose = lifecycle !== undefined && lifecycle !== 'closed' && lifecycle !== 'archived'
   const holdNote = !hold ? null : supportsIdleHold === false ? 'Parking hold saved; update the host to enforce it.' : hostConnected === false ? 'Parking hold saved; it applies after the host reconnects.' : supportsIdleHold === undefined || hostConnected === undefined ? 'Host enforcement of parking holds is unconfirmed.' : !hold.held ? null : hold.pinned ? 'You requested a parking hold.' : hold.family_active ? 'Family work requests a parking hold.' : 'Pending updates request a parking hold.'
 
   useEffect(() => {
@@ -232,7 +237,7 @@ export default function SessionMenu({ id, lifecycle, family, queuedCount = 0, ca
   const entries = open && (
     <div ref={menu} className={row ? 'session-menu-list session-row-menu' : 'session-menu-list'} style={row ? place : undefined} id={menuId} onKeyDown={onKeyDown}>
       {onRename && <button type="button" onClick={() => { setOpen(false); onRename() }}>Rename</button>}
-      <button type="button" disabled={busy || lifecycle === undefined || hostConnected === false} title={hostConnected === false ? 'The host is offline' : undefined} onClick={() => { dismiss(); setError(null); void like.start() }}>New like this</button>
+      <button type="button" disabled={busy || lifecycle === undefined || hostConnected === false} title={hostConnected === false ? 'The host is offline' : undefined} onClick={() => { dismiss(); setError(null); setWorkspaceDialog(true) }}>New like this</button>
       {sidebarPinned !== undefined && <PinSessionAction key={id} id={id} pinned={sidebarPinned} disabled={busy} />}
       <button type="button" role="switch" aria-label="Do not park" aria-checked={hold?.pinned ?? false} disabled={busy || pinBusy || hold === null} onClick={() => void togglePin()}><span>Do not park</span><span className="session-toggle-state" aria-hidden="true">{hold ? hold.pinned ? '✓ On' : 'Off' : '…'}</span></button>
       {holdNote && <p className="idle-hold-note" role="status">{holdNote}</p>}
@@ -246,6 +251,7 @@ export default function SessionMenu({ id, lifecycle, family, queuedCount = 0, ca
           Close
         </button>
       )}
+      {lifecycle === 'closed' && <button type="button" disabled={busy} onClick={() => void act(async () => { await client.request('POST', `/api/sessions/${encodeURIComponent(id)}/archive`) }, () => 'Could not archive session')}>Archive</button>}
       <hr />
       <button
         type="button"
@@ -309,6 +315,10 @@ export default function SessionMenu({ id, lifecycle, family, queuedCount = 0, ca
           <bdi>{error || like.error}</bdi>
         </p>
       )}
+      {workspaceDialog && createPortal(<ConfirmDialog title="New like this" confirm="Start session" disabled={workspace !== null && !/^[0-9a-f]{40,64}$/i.test(workspace.base)} action={async () => {
+        try { localStorage.setItem('hennery.new-like-worktree', String(workspace !== null)) } catch { /* preference is optional */ }
+        await like.start(workspace)
+      }} onClose={() => setWorkspaceDialog(false)}><WorkspaceOptionsEditor source={{ session_id: id }} value={workspace} onChange={setWorkspace} /></ConfirmDialog>, document.body)}
       {row ? confirmation && createPortal(confirmation, document.body) : confirmation}
     </div>
   )

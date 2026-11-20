@@ -17,7 +17,7 @@ export function useNewLikeThis(id: string, sourceIsCurrent?: () => boolean) {
   const [error, setError] = useState<string | null>(null)
   useEffect(() => { live.current = true; return () => { live.current = false } }, [id])
 
-  async function start() {
+  async function start(workspace?: { base: string; files: string[] } | null) {
     if (pending.current) return
     pending.current = true
     setBusy(true); setError(null)
@@ -36,7 +36,7 @@ export function useNewLikeThis(id: string, sourceIsCurrent?: () => boolean) {
     }
     const open = (href: string) => navigate(`${href}${href.includes('?') ? '&' : '?'}focus=prompt`)
     try {
-      const created = await client.request<NewLikeThisResponse>('POST', `/api/sessions/${encodeURIComponent(id)}/new-like-this`)
+      const created = await client.request<NewLikeThisResponse>('POST', `/api/sessions/${encodeURIComponent(id)}/new-like-this`, workspace ?? undefined)
       if (!current()) return
       let actual: import('../generated/protocol').SessionCatalog | null = null
       const confirmed = await confirmStart(client, created.session_id, created.hat_id, created.config, 30_000, true, catalog => { actual = catalog })

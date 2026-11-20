@@ -78,7 +78,8 @@ describe('SessionView: the header menu', () => {
     ['parked', ['Close', 'Delete session']],
     ['starting', ['Close', 'Delete session']],
     ['failed', ['Close', 'Delete session']],
-    ['closed', ['Delete session']],
+    ['closed', ['Archive', 'Delete session']],
+    ['archived', ['Delete session']],
   ])('a %s session offers no Park; a closed one no Close', async (lifecycle, offered) => {
     await show({ lifecycle })
     openMenu()

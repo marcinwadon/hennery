@@ -34,10 +34,10 @@ pub(crate) fn child_needs_human(conn: &Connection, owner: &str, child: &str) -> 
 pub(crate) fn reconcile_closed_attention(conn: &Connection, owner: &str) -> Result<()> {
     let rows = {
         let mut stmt=conn.prepare("SELECT DISTINCT a.child_id,
-            c.close_requested=1 OR c.lifecycle IN ('closed','deleted'),
+            c.close_requested=1 OR c.lifecycle IN ('closed','archived','deleted'),
             c.delegated_child=1 AND (NOT EXISTS(SELECT 1 FROM session_families f WHERE f.owner_id = ?1 AND f.child_id=c.id)
               OR EXISTS(SELECT 1 FROM session_families f JOIN sessions p ON p.owner_id = ?1 AND p.id=f.parent_id
-                WHERE f.owner_id = ?1 AND f.child_id=c.id AND (p.close_requested=1 OR p.lifecycle IN ('closed','deleted'))))
+                WHERE f.owner_id = ?1 AND f.child_id=c.id AND (p.close_requested=1 OR p.lifecycle IN ('closed','archived','deleted'))))
             FROM delegation_attention a JOIN sessions c ON c.owner_id = ?1 AND c.id=a.child_id
             WHERE a.owner_id = ?1 AND a.state IN ('open','standby')")?;
         stmt.query_map([owner], |r| {

@@ -1,3 +1,4 @@
+import WorkspaceOptionsEditor, { type WorkspaceOptions } from '../components/WorkspaceOptions'
 import '../styles/launch.css'
 import LaunchConfig, { requestFor } from '../components/LaunchConfig'
 import { SourcePolicyPrediction } from '../components/McpSourcePolicy'
@@ -90,6 +91,9 @@ export default function NewSession() {
    *  differs from the one they came for. */
   const [recentsFor, setRecentsFor] = useState<string | null>(null)
   const [cwd, setCwd] = useState('')
+  const [workspace, setWorkspace] = useState<WorkspaceOptions | null>(() => {
+    try { return localStorage.getItem('hennery.new-session-worktree') === 'true' ? { base: 'HEAD', files: [] } : null } catch { return null }
+  })
   const [initialText, setInitialText] = useState('')
 
   const [hats, setHats] = useState<HatItem[]>([])
@@ -297,7 +301,7 @@ export default function NewSession() {
     try { sessionStorage.setItem(LAUNCH_DRAFT, JSON.stringify({ owner: draftOwner, host: hostId, cwd, prompt, agent, otherName, picks })) } catch { /* Current form remains usable. */ }
   }, [hostId, cwd, prompt, agent, otherName, picks, draftOwner, sameLogin])
   function chooseAgent(next: string) { if (next !== agent) { setAgent(next); setPicks({}); setNotice('Agent changed. Session setting choices were reset.') } }
-  const canStart = !busy && host?.connected === true && agentName !== '' && current?.exists === true && current.is_dir
+  const canStart = (workspace === null || /^[0-9a-f]{40,64}$/i.test(workspace.base)) && !busy && host?.connected === true && agentName !== '' && current?.exists === true && current.is_dir
   const canRequestStart = canStart || pendingStart !== null || (!busy && host?.connected === true && agentName !== '' && browsePath !== null)
   const form = useRef<HTMLFormElement>(null)
   function retainClosedStart(sessionId: string) {
@@ -345,8 +349,9 @@ export default function NewSession() {
       if (requested === null) throw new Error('Choose an available session setting before starting.')
       launchConfig = requested
       if (!sameLogin()) return
+      try { localStorage.setItem('hennery.new-session-worktree', String(workspace !== null)) } catch { /* optional preference */ }
       const request: StartSessionRequest = { host_id: hostId, agent: agentName, cwd: current!.canonical, ...launchConfig }
-      sessionId = (await client.request<StartSessionResponse>('POST', '/api/sessions', request)).session_id
+      sessionId = (await client.request<StartSessionResponse>('POST', '/api/sessions', { ...request, ...(workspace ? { workspace } : {}) })).session_id
     } catch (err) {
       if (!sameLogin()) return
       if (err instanceof ApiFailure && err.code === 'delivery_unknown' && err.sessionId) {
@@ -599,6 +604,7 @@ export default function NewSession() {
               {current && <SourcePolicyPrediction policy={sourcePolicyFor(hats.find(h => h.id === current.hat_id), agentName).policy} host={host} agent={agentName} />}
             </div>
 
+            <WorkspaceOptionsEditor source={{ host_id: hostId, cwd: current?.canonical }} value={workspace} onChange={setWorkspace} />
             {current && <LaunchConfig context={context} picks={picks} onPicks={setPicks} expanded={expanded} onExpanded={setExpanded} />}
 
           </>

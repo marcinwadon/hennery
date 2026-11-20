@@ -163,6 +163,14 @@ struct HostConn {
     runtime_profiles: std::collections::BTreeMap<String, hennery_proto::delegation_host::RuntimeProfile>,
 }
 
+pub(super) fn supports_steering_content(capabilities: &Capabilities, content: &[serde_json::Value]) -> bool {
+    content.iter().all(|block| match block["type"].as_str() {
+        Some("image") => capabilities.has(Capability::Images),
+        Some("file") => capabilities.has(Capability::Files),
+        _ => true,
+    })
+}
+
 impl HostConn {
     /// The frame carries hook sets this connection cannot apply.
     fn refuses_hooks(&self, frame: &CollectorFrame) -> bool {
@@ -182,7 +190,9 @@ impl HostConn {
     /// lock, against the very connection the frame goes out on, so a host
     /// that reconnects on an older build cannot slip in between.
     fn takes(&self, frame: &CollectorFrame) -> bool {
-        if matches!(frame, CollectorFrame::Steer { .. }) && !self.capabilities.has(Capability::Steering) {
+        if let CollectorFrame::Steer { content, .. } = frame
+            && !(self.capabilities.has(Capability::Steering) && supports_steering_content(&self.capabilities, content))
+        {
             return false;
         }
         if matches!(frame, CollectorFrame::SetIdleTimeout { .. }) && !self.capabilities.has(Capability::IdleTimeout) {
@@ -484,6 +494,15 @@ impl Hub {
             .expect("hosts lock")
             .get(host_id)
             .is_some_and(|h| h.capabilities.has(capability))
+    }
+
+    pub(super) fn ready_capabilities(&self, host_id: &str) -> Option<Capabilities> {
+        self.hosts
+            .lock()
+            .expect("hosts lock")
+            .get(host_id)
+            .filter(|host| host.routable())
+            .map(|host| host.capabilities.clone())
     }
 
     /// A readiness/capability snapshot of the same current connection. An

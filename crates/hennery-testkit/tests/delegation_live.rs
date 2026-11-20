@@ -2099,3 +2099,116 @@ async fn pinned_parent_child_provider_matrix() -> Result<()> {
     let cleanup = h.finish().await;
     result.and(cleanup)
 }
+
+/// Real ACP acceptance for the managed-workspace product flow. Credentials,
+/// repositories, agent homes and all model-written files are disposable.
+#[tokio::test]
+#[ignore = "requires pinned adapter and copied credentials; performs two provider turns"]
+async fn pinned_runtime_workspace_lifecycle() -> Result<()> {
+    let runtime = runtime("HENNERY_D4_PARENT")?;
+    let h = Harness::new_with_worker(&runtime, None, false).await?;
+    let result = async {
+        let source = h.dir.path().join("workspace-source");
+        std::fs::create_dir(&source)?;
+        let git = |args: &[&str]| -> Result<String> {
+            let output = std::process::Command::new("git").arg("-C").arg(&source).args(args).output()?;
+            ensure!(output.status.success(), "scratch Git operation failed");
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        git(&["init", "-q"])?;
+        std::fs::write(source.join("source.txt"), "COMMITTED")?;
+        git(&["add", "source.txt"])?;
+        git(&["-c", "user.name=Acceptance", "-c", "user.email=acceptance@example.invalid", "commit", "-qm", "base"])?;
+        let base = git(&["rev-parse", "HEAD"])?;
+        std::fs::write(source.join("source.txt"), "SOURCE_LOCAL_CHANGES")?;
+        std::fs::write(source.join("AGENTS.md"), "This is a disposable acceptance repository. Work only in the current working directory. Do not delegate.")?;
+        let saved = h.client.put(format!("{}/api/workspace-profile", h.url))
+            .query(&[("host_id", HOST), ("cwd", source.to_str().context("source encoding")?)])
+            .json(&json!({"files":["AGENTS.md"],"command":"printf HENNERY_PREPARED > prepared.txt"})).send().await?;
+        ensure!(saved.status().is_success(), "preparation profile HTTP {}", saved.status());
+        let preview = h.client.post(format!("{}/api/workspace-preview", h.url))
+            .json(&json!({"host_id":HOST,"cwd":source,"base":"HEAD"})).send().await?;
+        ensure!(preview.status().is_success(), "workspace preview HTTP {}", preview.status());
+        ensure!(preview.json::<Value>().await?["base_commit"] == base, "base preview differed from Git");
+        let catalog = h.catalog(&runtime).await?;
+        let mut config = parent_configuration(&catalog, None)?;
+        config.mode = Some(if runtime == "claude" { "bypassPermissions" } else { "agent-full-access" }.into());
+        ensure!(hennery_sessions::delegation_runtime::config_offered(&catalog, &config), "scratch write mode absent from pinned catalog");
+        let mut request = serde_json::to_value(&config)?;
+        request["host_id"] = json!(HOST);
+        request["agent"] = json!(runtime);
+        request["cwd"] = json!(source);
+        request["workspace"] = json!({"base":base,"files":[]});
+        let response = h.client.post(format!("{}/api/sessions", h.url)).json(&request).send().await?;
+        ensure!(response.status() == reqwest::StatusCode::ACCEPTED, "workspace start HTTP {}", response.status());
+        let session = response.json::<Value>().await?["session_id"].as_str().context("workspace session id")?.to_owned();
+        h.wait("workspace adapter attached", || h.state.store.find_session(&session).ok().flatten().filter(|s| s.lifecycle == "active")).await?;
+        let row = h.state.store.find_session(&session)?.context("workspace row")?;
+        let root = PathBuf::from(&row.cwd);
+        ensure!(root != source && root.is_dir(), "session did not use a separate worktree");
+        ensure!(std::fs::read_to_string(root.join("source.txt"))? == "COMMITTED", "source changes leaked into checkout");
+        ensure!(root.join("AGENTS.md").is_file() && std::fs::read_to_string(root.join("prepared.txt"))? == "HENNERY_PREPARED", "saved preparation profile did not run before attach");
+        let turn = h.prompt(&session,"Use your actual native file/shell tools, only in your current working directory. Read source.txt and verify it contains COMMITTED. Create live-result.txt containing exactly HENNERY_LIVE_WORKTREE_OK and cwd.txt containing your actual current working directory. Do not change source.txt, Git configuration or any file outside the current working directory. Do not delegate. After success reply HENNERY_WORKTREE_WRITTEN.").await?;
+        let outcome = h.wait("workspace provider write", || h.state.store.ended_turn_outcome(&turn).ok().flatten()).await?;
+        ensure!(outcome == hennery_proto::frames::TurnOutcome::Completed, "workspace provider write failed: {outcome:?}");
+        ensure!(std::fs::read_to_string(root.join("live-result.txt"))?.trim() == "HENNERY_LIVE_WORKTREE_OK", "native tool did not write the worktree marker");
+        ensure!(std::fs::read_to_string(root.join("cwd.txt"))?.trim() == root.to_str().context("root encoding")?, "native tool used a different working directory");
+        ensure!(std::fs::read_to_string(source.join("source.txt"))? == "SOURCE_LOCAL_CHANGES" && !source.join("live-result.txt").exists(), "native tool changed the source checkout");
+        h.action(&session,"park").await?;
+        ensure!(root.is_dir(), "park removed the workspace");
+        h.action(&session,"resume").await?;
+        h.wait("workspace park/load",||h.state.store.find_session(&session).ok().flatten().filter(|s|s.lifecycle=="active")).await?;
+        let history_after=h.state.store.max_event_id()?;
+        let history = h.prompt(&session,"Without calling tools, what exact marker value did you write to live-result.txt in the previous turn? Reply with only that value.").await?;
+        let outcome=h.wait("workspace resumed history turn",||h.state.store.ended_turn_outcome(&history).ok().flatten()).await?;
+        ensure!(outcome==hennery_proto::frames::TurnOutcome::Completed,"resumed history turn failed");
+        let events=h.state.store.events(&session,history_after,1000)?;
+        let answer=assistant_text(&events);
+        ensure!(answer.lines().any(|line|line.trim()=="HENNERY_LIVE_WORKTREE_OK"),"resumed transcript did not preserve the marker; assembled reply: {answer:?}");
+        let usage=h.state.store.session_usage(&session)?.context("provider usage")?;
+        ensure!(usage.session.reported_turns==2 && usage.last_turn.as_ref().and_then(|turn|turn.usage.as_ref()).is_some_and(|usage|usage.tokens.total_tokens>0),"provider did not report both genuine inference turns");
+        h.action(&session,"close").await?;
+        ensure!(root.is_dir(),"close removed the workspace");
+        h.action(&session,"resume").await?;
+        h.wait("workspace close/load",||h.state.store.find_session(&session).ok().flatten().filter(|s|s.lifecycle=="active")).await?;
+        let loaded=h.state.store.find_session(&session)?.context("loaded session")?;
+        ensure!(loaded.cwd==row.cwd && loaded.agent_session_id==row.agent_session_id,"close/load changed session identity or cwd");
+        let isolated=h.client.post(format!("{}/api/sessions/{session}/new-like-this",h.url)).json(&json!({"base":base,"files":[]})).send().await?;
+        ensure!(isolated.status()==reqwest::StatusCode::ACCEPTED,"isolated clone HTTP {}",isolated.status());
+        let isolated=isolated.json::<Value>().await?["session_id"].as_str().context("isolated clone id")?.to_owned();
+        h.wait("isolated clone attach",||h.state.store.find_session(&isolated).ok().flatten().filter(|s|s.lifecycle=="active")).await?;
+        let isolated_root=PathBuf::from(h.state.store.find_session(&isolated)?.context("isolated clone")?.cwd);
+        ensure!(isolated_root!=root && isolated_root.join("AGENTS.md").is_file() && isolated_root.join("prepared.txt").is_file(),"isolated clone did not inherit source preparation profile");
+        let shared=h.client.post(format!("{}/api/sessions/{session}/new-like-this",h.url)).send().await?;
+        ensure!(shared.status()==reqwest::StatusCode::ACCEPTED,"shared clone HTTP {}",shared.status());
+        let shared=shared.json::<Value>().await?["session_id"].as_str().context("shared clone id")?.to_owned();
+        h.wait("shared clone attach",||h.state.store.find_session(&shared).ok().flatten().filter(|s|s.lifecycle=="active")).await?;
+        ensure!(h.state.store.find_session(&shared)?.context("shared clone")?.cwd==row.cwd,"shared clone changed cwd");
+        h.action(&session,"close").await?;h.action(&session,"archive").await?;
+        hennery_sessions::workspaces::cleanup_page(&h.state).await?;
+        ensure!(root.is_dir(),"archive removed a shared workspace");
+        let detail=h.client.get(format!("{}/api/sessions/{session}/workspace",h.url)).send().await?.json::<Value>().await?;
+        ensure!(detail["users"]==1,"shared clone did not retain workspace membership");
+        h.action(&shared,"close").await?;h.action(&shared,"archive").await?;
+        h.action(&isolated,"close").await?;h.action(&isolated,"archive").await?;
+        hennery_sessions::workspaces::cleanup_page(&h.state).await?;
+        let inventory=h.client.get(format!("{}/api/workspaces",h.url)).send().await?.json::<Value>().await?;
+        let workspaces=inventory.as_array().context("workspace inventory")?;
+        ensure!(workspaces.len()==2 && workspaces.iter().all(|w|w["state"]=="blocked"),"dirty workspaces were not retained for explicit approval");
+        for workspace in workspaces {
+            let id=workspace["id"].as_str().context("workspace id")?;
+            let removed=h.client.post(format!("{}/api/workspaces/{id}/discard",h.url)).send().await?;
+            ensure!(removed.status().is_success(),"approved scratch discard HTTP {}",removed.status());
+            ensure!(!Path::new(workspace["root"].as_str().context("workspace root")?).exists(),"discard did not remove owned scratch tree");
+            ensure!(!git(&["rev-parse", &format!("refs/heads/{}",workspace["branch"].as_str().context("retained branch")?)])?.is_empty(),"cleanup removed the branch");
+        }
+        ensure!(source.join("AGENTS.md").is_file() && std::fs::read_to_string(source.join("source.txt"))?=="SOURCE_LOCAL_CHANGES","cleanup damaged source files");
+        println!("{}",json!({"case":"workspace_lifecycle","runtime":runtime,"provider_turns":2,"native_write_cwd":true,"source_unchanged":true,"park_load_history":true,"close_load":true,"isolated_clone_profile":true,"shared_clone_retention":true,"dirty_cleanup_blocked":true,"approved_discard":true,"branches_retained":true}));
+        Ok(())
+    }.await;
+    if result.is_err() {
+        h.diagnostics("workspace lifecycle failed")?;
+    }
+    let cleanup = h.finish().await;
+    result.and(cleanup)
+}

@@ -295,7 +295,12 @@ fn find_git_in(path: Option<OsString>) -> Option<PathBuf> {
 
 /// `git <args>` in `cwd`, kept from the host's own git environment (`vars`,
 /// the host's variables): see the module's doc.
-fn command(git: &Path, cwd: &Path, args: &[&str], vars: impl Iterator<Item = (OsString, OsString)>) -> Command {
+pub(crate) fn command(
+    git: &Path,
+    cwd: &Path,
+    args: &[&str],
+    vars: impl Iterator<Item = (OsString, OsString)>,
+) -> Command {
     let mut cmd = Command::new(git);
     cmd.current_dir(cwd)
         .args(["-c", "core.fsmonitor=false"])

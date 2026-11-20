@@ -279,6 +279,7 @@ pub struct Launch {
 /// The connection task's handle on a session actor.
 #[derive(Clone)]
 pub struct SessionHandle {
+    pub(crate) cwd: PathBuf,
     mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     /// The `content_hash` of each hook set the actor was launched with, in
     /// delivery order: a live actor keeps its adapter's hooks.
@@ -576,12 +577,14 @@ fn launch_inner(
     };
     let done = CancellationToken::new();
     let mcp_source_policy = launch.mcp_source_policy.clone();
+    let cwd = launch.cwd.clone();
     let finished = done.clone().drop_guard();
     tokio::spawn(async move {
         let _finished = finished;
         actor.run(launch, rx).await;
     });
     SessionHandle {
+        cwd,
         mcp_source_policy,
         hook_set_hashes,
         attach_generation,
@@ -1056,7 +1059,10 @@ impl Actor {
             Err(reason) => {
                 return self.emit(SessionBody::SteeringResult {
                     request_id,
-                    outcome: SteeringOutcome::Rejected { reason },
+                    outcome: SteeringOutcome::Rejected {
+                        reason,
+                        steering_unavailable: false,
+                    },
                 });
             }
         };
@@ -1087,6 +1093,7 @@ impl Actor {
                     {
                         SteeringOutcome::Rejected {
                             reason: error.message.to_string(),
+                            steering_unavailable: error.code == ErrorCode::METHOD_NOT_FOUND,
                         }
                     }
                     Err(_) => SteeringOutcome::Uncertain,
@@ -1689,7 +1696,7 @@ impl Actor {
                     Some(SessionCmd::Steer { request_id, turn_id, content }) => {
                         if !steering_supported {
                             self.emit(SessionBody::SteeringResult { request_id, outcome: SteeringOutcome::Rejected {
-                                reason: "This adapter does not support steering.".into()
+                                reason: "This adapter does not support steering.".into(), steering_unavailable: true
                             }});
                         } else if turn.as_ref().is_none_or(|current| current.id != turn_id) {
                             self.emit(SessionBody::SteeringResult {request_id, outcome: SteeringOutcome::PromptRequired});
@@ -3302,6 +3309,7 @@ mod tests {
         let (commands, receiver) = mpsc::unbounded_channel();
         (
             SessionHandle {
+                cwd: PathBuf::from("/test"),
                 mcp_source_policy: None,
                 hook_set_hashes: vec![],
                 attach_generation: Some(1),

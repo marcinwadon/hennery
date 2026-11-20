@@ -40,30 +40,40 @@ async fn queued_steering_injects_once_and_late_ack_survives_disconnect() {
 }
 
 #[tokio::test]
-async fn queued_steering_idle_race_restores_fifo() {
+async fn default_steering_idle_race_restores_fifo() {
     exercise_steering(Scenario::Idle).await;
 }
 
 #[tokio::test]
-async fn queued_steering_refuses_unsupported_adapter() {
+async fn default_steering_queues_for_unsupported_adapter() {
     exercise_steering(Scenario::Unsupported).await;
 }
 
 #[tokio::test]
-async fn queued_steering_internal_errors_preserve_uncertainty() {
+async fn default_steering_internal_errors_preserve_uncertainty() {
     exercise_steering(Scenario::InternalError).await;
 }
 #[tokio::test]
-async fn queued_steering_parameter_rejections_preserve_the_reason() {
+async fn default_steering_parameter_rejections_preserve_the_reason() {
     exercise_steering(Scenario::InvalidParams).await;
 }
+#[tokio::test]
+async fn default_steering_falls_back_if_advertised_extension_is_missing() {
+    exercise_steering(Scenario::MethodNotFound).await;
+}
+
+#[tokio::test]
+async fn queued_steering_reports_rejection_if_advertised_extension_is_missing() {
+    exercise_steering(Scenario::ManualMethodNotFound).await;
+}
+
 #[tokio::test]
 async fn queued_steering_lost_adapter_connection_preserves_uncertainty() {
     exercise_steering(Scenario::Disconnect).await;
 }
 
 #[tokio::test]
-async fn queued_steering_admission_keeps_current_turn_and_permission() {
+async fn default_steering_admission_keeps_current_turn_and_permission() {
     exercise_steering(Scenario::Active).await;
 }
 
@@ -87,6 +97,8 @@ enum Scenario {
     Unsupported,
     InternalError,
     InvalidParams,
+    MethodNotFound,
+    ManualMethodNotFound,
     Disconnect,
 }
 
@@ -98,6 +110,7 @@ async fn exercise_steering(scenario: Scenario) {
         Unsupported => None,
         InternalError => Some("internal_error"),
         InvalidParams => Some("invalid_params"),
+        MethodNotFound | ManualMethodNotFound => Some("method_not_found"),
         Disconnect => Some("disconnect"),
     };
     hennery_testkit::first_exec(env!("CARGO_BIN_EXE_hennery-fake-acp"));
@@ -121,21 +134,61 @@ async fn exercise_steering(scenario: Scenario) {
     let base = collector.url(&format!("/api/sessions/{session}"));
     let queue = || collector.state.store.operator_prompt_queue(&session).unwrap();
     let log = || recorded_requests(&std::fs::read(&log).unwrap());
-    let (_, first) = post_json(&c, format!("{base}/prompt"), json!({"content":text("first")})).await;
-    let selected =
+    let enqueue = |content: &Value| {
+        let checked = hennery_sessions::content::check(content.as_array().unwrap().clone()).unwrap();
+        collector
+            .state
+            .store
+            .enqueue_operator_prompt(&session, &checked)
+            .unwrap()
+    };
+    let first = enqueue(&text("first"));
+    let mut selected =
         json!([{"type":"text","text":"selected"},{"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}]);
-    let (_, second) = post_json(&c, format!("{base}/prompt"), json!({"content":selected})).await;
+    if scenario == Active {
+        selected
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"file","name":"notes.txt","mimeType":"text/plain","data":"aGVsbG8="}));
+    }
+    let submit = || {
+        post_json(
+            &c,
+            format!("{base}/prompt"),
+            json!({"content":selected,"request_key":"follow-up"}),
+        )
+    };
+    let automatic = matches!(
+        scenario,
+        Active | Idle | InternalError | Unsupported | MethodNotFound | InvalidParams
+    );
+    let second = if automatic {
+        let (first_submit, retry) = tokio::join!(submit(), submit());
+        assert_eq!(first_submit.0, 202);
+        assert_eq!(retry, first_submit);
+        first_submit.1
+    } else {
+        json!({"queue_id":enqueue(&selected)})
+    };
     let url = format!("{base}/queue/{}", second["queue_id"].as_str().unwrap());
     let steer = || c.post(format!("{url}/steer")).send();
     if scenario == Unsupported {
-        let status = steer().await.unwrap().status();
-        assert_eq!(status, 409);
-        assert_eq!(queue().len(), 2);
+        assert_eq!(steer().await.unwrap().status(), 409);
+        assert_eq!(queue()[1].state, "queued");
+        assert_eq!(log().iter().filter(|r| r["method"] == "_session/steering").count(), 0);
     } else {
-        let (a, b) = tokio::join!(steer(), steer());
-        let mut statuses = [a.unwrap().status().as_u16(), b.unwrap().status().as_u16()];
-        statuses.sort();
-        assert_eq!(statuses, [200, 409]);
+        if automatic {
+            assert_eq!(
+                queue()[1].state,
+                "delivering",
+                "ordinary send should steer the live turn"
+            );
+        } else {
+            let (a, b) = tokio::join!(steer(), steer());
+            let mut statuses = [a.unwrap().status().as_u16(), b.unwrap().status().as_u16()];
+            statuses.sort();
+            assert_eq!(statuses, [200, 409]);
+        }
         wait_for("adapter recorded steering", || async {
             log().into_iter().find(|r| r["method"] == "_session/steering")
         })
@@ -153,7 +206,13 @@ async fn exercise_steering(scenario: Scenario) {
             409
         );
         let steered = log().into_iter().find(|r| r["method"] == "_session/steering").unwrap();
-        assert_eq!(steered["params"]["prompt"], selected);
+        if scenario == Active {
+            let prompt = &steered["params"]["prompt"];
+            assert_eq!(&prompt.as_array().unwrap()[..2], &selected.as_array().unwrap()[..2]);
+            assert!(prompt[2]["text"].as_str().unwrap().contains("notes.txt"));
+        } else {
+            assert_eq!(steered["params"]["prompt"], selected);
+        }
         assert_eq!(steered["params"]["_meta"]["steering"]["idleBehavior"], "promptRequired");
         assert_eq!(open_question(&c, &collector, &session).await, pending);
 
@@ -163,11 +222,13 @@ async fn exercise_steering(scenario: Scenario) {
                 (queue().len() == 1).then_some(())
             })
             .await;
-            assert_eq!(queue()[0].id, first["queue_id"]);
+            assert_eq!(queue()[0].id, first);
             assert_eq!(open_question(&c, &collector, &session).await, pending);
             let facts = events(&c, &collector, &session).await;
             assert!(turn_ends(&facts).is_empty());
-            assert_eq!(facts.iter().filter(|e| e.kind == "user_steering").count(), 1);
+            let admitted: Vec<_> = facts.iter().filter(|e| e.kind == "user_steering").collect();
+            assert_eq!(admitted.len(), 1);
+            assert_eq!(admitted[0].body["content"][2]["name"], "notes.txt");
             assert_eq!(log().iter().filter(|r| r["method"] == "session/prompt").count(), 1);
             assert_eq!(facts.iter().filter(|e| e.kind == "user_turn").count(), 1);
         } else if matches!(scenario, DismissedInjected | DismissedIdle) {
@@ -225,7 +286,7 @@ async fn exercise_steering(scenario: Scenario) {
                 assert!(admitted.is_empty());
             }
             assert_eq!(queue().len(), 1);
-            assert_eq!(queue()[0].id, first["queue_id"]);
+            assert_eq!(queue()[0].id, first);
             assert_eq!(log().iter().filter(|r| r["method"] == "session/prompt").count(), 1);
             // Session deletion removes the attempt, the admission and their shared bytes.
             let judged = hennery_sessions::store::Unattached {
@@ -394,6 +455,20 @@ async fn exercise_steering(scenario: Scenario) {
                     .status(),
                 200
             );
+        } else if matches!(scenario, MethodNotFound | ManualMethodNotFound) {
+            std::fs::write(&gate, "").unwrap();
+            let item = wait_for("method not found reply", || async {
+                queue()
+                    .into_iter()
+                    .find(|item| item.id == second["queue_id"] && item.state != "delivering")
+            })
+            .await;
+            if automatic {
+                assert_eq!(item.state, "queued");
+                assert_eq!(submit().await.1, second);
+            } else {
+                assert_eq!(item.state, "failed");
+            }
         } else if matches!(outcome, Some("internal_error" | "invalid_params" | "disconnect")) {
             std::fs::write(&gate, "").unwrap();
             let wanted = if outcome == Some("invalid_params") {
@@ -407,6 +482,10 @@ async fn exercise_steering(scenario: Scenario) {
                     .find(|i| i.id == second["queue_id"] && i.state == wanted)
             })
             .await;
+            if scenario == InternalError {
+                assert_eq!(submit().await.1, second);
+                assert_eq!(queue()[1].state, "uncertain");
+            }
             if wanted == "failed" {
                 assert!(item.reason.unwrap().contains("Rejected input"));
             }
@@ -423,6 +502,14 @@ async fn exercise_steering(scenario: Scenario) {
             .await;
             std::fs::write(&gate, "").unwrap();
             let question = open_question(&c, &collector, &session).await;
+            wait_for("steering restored to the ordinary queue", || async {
+                queue()
+                    .into_iter()
+                    .find(|item| item.id == second["queue_id"] && item.state == "queued")
+            })
+            .await;
+            assert_eq!(submit().await.1, second);
+            assert_eq!(queue()[0].state, "queued");
             assert_eq!(
                 answer(&c, &collector, &session, &question, json!({"option_id":"allow"}))
                     .await

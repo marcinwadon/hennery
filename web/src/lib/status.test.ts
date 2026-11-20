@@ -59,7 +59,7 @@ describe('statusOf', () => {
   })
 
   it('a lifecycle it does not know: shown by name', () => {
-    expect(of({ lifecycle: 'archived', activity: undefined })).toEqual({ tone: 'idle', label: 'archived', resume: false })
+    expect(of({ lifecycle: 'future-state', activity: undefined })).toEqual({ tone: 'idle', label: 'future-state', resume: false })
     expect(of({ lifecycle: '', activity: undefined }).label).toBe('Unknown')
   })
 })

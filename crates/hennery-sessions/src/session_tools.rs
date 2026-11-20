@@ -99,7 +99,30 @@ pub async fn execute(
                 state.hub.runtime_ids(caller.host_id()).contains(&agent.to_string()),
                 "runtime_unavailable"
             );
-            let cwd = checked_cwd(state, caller.host_id(), caller.hat_id(), &args.cwd).await?;
+            let mut cwd = checked_cwd(state, caller.host_id(), caller.hat_id(), &args.cwd).await?;
+            if let Some(base) = args.worktree_base.clone() {
+                cwd = crate::workspaces::provision(
+                    state,
+                    crate::workspaces::CreateRequest {
+                        id: {
+                            use sha2::Digest;
+                            Some(hex::encode(sha2::Sha256::digest(format!(
+                                "{}:{}:{}",
+                                caller.session_id(),
+                                args.operation_key,
+                                digest
+                            ))))
+                        },
+                        host_id: caller.host_id().to_owned(),
+                        cwd,
+                        base,
+                        files: vec![],
+                        command: None,
+                    },
+                )
+                .await?;
+                cwd = checked_cwd(state, caller.host_id(), caller.hat_id(), &cwd).await?;
+            }
             state.store.precheck_spawn(identity, revision, Some(&cwd))?;
             // Reserve admission before discovery so this fresh result can also
             // authorize the first attach without another disposable process.

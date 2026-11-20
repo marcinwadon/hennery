@@ -20,7 +20,7 @@ const enc = encodeURIComponent
  *  as base64 (ACP core §7). */
 export type PromptBlock = { type: 'text'; text: string } | { type: 'image'; mimeType: string; data: string } | { type: 'file'; name: string; mimeType: string; data: string }
 
-/** `POST /api/sessions/{id}/prompt` → 202 `{turn_id}`. */
+/** An immediate turn returns its turn ID. A durable follow-up returns its queue ID. */
 export function prompt(client: Client, id: string, content: PromptBlock[], requestKey?: string): Promise<PromptResponse | QueuedPromptResponse> {
   return client.request<PromptResponse | QueuedPromptResponse>('POST', `/api/sessions/${enc(id)}/prompt`, { content, ...(requestKey === undefined ? {} : { request_key: requestKey }) })
 }

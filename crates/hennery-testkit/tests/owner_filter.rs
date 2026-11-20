@@ -76,6 +76,11 @@ const SOURCES: &[(&str, &str, usize)] = &[
         8,
     ),
     (
+        "hennery-sessions/src/workspaces.rs",
+        include_str!("../../hennery-sessions/src/workspaces.rs"),
+        22,
+    ),
+    (
         "hennery-sessions/src/mcp_source.rs",
         include_str!("../../hennery-sessions/src/mcp_source.rs"),
         8,
@@ -89,6 +94,11 @@ const SOURCES: &[(&str, &str, usize)] = &[
         "hennery-sessions/src/prompt_receipts.rs",
         include_str!("../../hennery-sessions/src/prompt_receipts.rs"),
         2,
+    ),
+    (
+        "hennery-sessions/src/external_steering.rs",
+        include_str!("../../hennery-sessions/src/external_steering.rs"),
+        8,
     ),
     (
         "hennery-sessions/src/steering.rs",
@@ -524,6 +534,10 @@ struct Touched {
     returned: Vec<String>,
 }
 
+/// These trigger bodies are audited separately against the same owner rules.
+/// Other trigger writes remain part of their invoking statement's audit.
+const WORKSPACE_MEMBERSHIP_TRIGGERS: &[&str] = &["workspace_existing_users", "workspace_session_admission"];
+
 /// The audit's connection to the migrated `db`, with SQLite's legacy
 /// double-quoted string literals turned off (3b-iii final re-review, N1).
 /// With them on, a `"…"` that names nothing falls back to a string, and
@@ -567,7 +581,11 @@ fn touched(conn: &mut rusqlite::Connection, sql: &str) -> Touched {
             AuthAction::Update { table_name, .. } | AuthAction::Delete { table_name } => {
                 t.changed.insert(table_name.to_string());
             }
-            AuthAction::Insert { table_name } => {
+            AuthAction::Insert { table_name }
+                if !ctx
+                    .accessor
+                    .is_some_and(|name| WORKSPACE_MEMBERSHIP_TRIGGERS.contains(&name)) =>
+            {
                 t.inserted.insert(table_name.to_string());
             }
             _ => {}
@@ -872,6 +890,48 @@ fn problems(conn: &mut rusqlite::Connection, sql: &str) -> Vec<String> {
     out
 }
 
+/// A trigger receives its owner's identity from the inserted row rather
+/// than a caller's parameter. Audit its actual installed body with those
+/// row references bound as parameters; the owner must still be inserted
+/// explicitly and compared when reading another table. These two triggers
+/// have no table reads in their WHEN clauses.
+fn workspace_membership_trigger_problems(conn: &mut rusqlite::Connection, name: &str) -> Vec<String> {
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let (header, body) = sql.split_once("\nBEGIN\n").expect("membership trigger body");
+    assert!(
+        !has_word(header, "select"),
+        "audit table reads in the trigger's WHEN clause: {sql}"
+    );
+    let mut body = body.strip_suffix("\nEND").expect("membership trigger end").to_owned();
+    assert_eq!(
+        body.matches(';').count(),
+        1,
+        "audit every statement in the trigger body: {body}"
+    );
+    for (field, parameter) in [
+        ("owner_id", "?1"),
+        ("id", "?2"),
+        ("host_id", "?3"),
+        ("root", "?4"),
+        ("cwd", "?5"),
+    ] {
+        body = body.replace(&format!("NEW.{field}"), parameter);
+    }
+    assert!(
+        !has_word(&body, "new") && !has_word(&body, "old"),
+        "unbound trigger row reference: {body}"
+    );
+    // The textual audit requires spaces around a parameter comparison.
+    body = body.replace("=?", " = ?");
+    problems(conn, &body)
+}
+
 #[test]
 fn every_query_of_the_stores_filters_by_the_owner() {
     let dir = tempfile::tempdir().unwrap();
@@ -882,6 +942,11 @@ fn every_query_of_the_stores_filters_by_the_owner() {
     GatewayStore::open(&db).unwrap();
     let mut conn = audit_connection(&db);
     let mut found = Vec::new();
+    for name in WORKSPACE_MEMBERSHIP_TRIGGERS {
+        for problem in workspace_membership_trigger_problems(&mut conn, name) {
+            found.push(format!("trigger {name}: {problem}"));
+        }
+    }
     for (path, source, at_least) in SOURCES {
         let sql = statements(source);
         if sql.len() < *at_least {
@@ -894,6 +959,53 @@ fn every_query_of_the_stores_filters_by_the_owner() {
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn membership_triggers_cannot_bypass_the_owner_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    Store::open(&db).unwrap();
+    let mut conn = audit_connection(&db);
+    for name in WORKSPACE_MEMBERSHIP_TRIGGERS {
+        assert_eq!(
+            workspace_membership_trigger_problems(&mut conn, name),
+            Vec::<String>::new()
+        );
+    }
+    conn.execute_batch("DROP TRIGGER workspace_session_admission").unwrap();
+    for bad_body in [
+        // The target's owner column is required even with a scoped read.
+        "INSERT INTO session_workspace_members(workspace_id,session_id)
+         SELECT w.id,NEW.id FROM session_workspaces w WHERE w.owner_id=NEW.owner_id;",
+        // Copying the row's owner into the insert cannot scope the read.
+        "INSERT INTO session_workspace_members(owner_id,workspace_id,session_id)
+         SELECT NEW.owner_id,w.id,NEW.id FROM session_workspaces w WHERE w.host_id=NEW.host_id;",
+    ] {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER workspace_session_admission AFTER INSERT ON sessions\nBEGIN\n{bad_body}\nEND;"
+        ))
+        .unwrap();
+        assert!(!workspace_membership_trigger_problems(&mut conn, "workspace_session_admission").is_empty());
+        conn.execute_batch("DROP TRIGGER workspace_session_admission").unwrap();
+    }
+    // An unlisted trigger cannot acquire the two known triggers' treatment.
+    conn.execute_batch(
+        "CREATE TRIGGER unknown_workspace_insert AFTER INSERT ON sessions
+         BEGIN INSERT INTO workspace_profiles(host_id,source) VALUES(NEW.host_id,NEW.cwd); END;",
+    )
+    .unwrap();
+    let issues = problems(
+        &mut conn,
+        "INSERT INTO sessions(id,owner_id,host_id,agent,cwd,lifecycle,created_at,last_event_at)
+         VALUES(?1,?2,?3,?4,?5,'starting',?6,?6)",
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue == "an INSERT INTO workspace_profiles names no owner_id"),
+        "{issues:?}"
+    );
 }
 
 /// Every `*.rs` under `dir`, as paths relative to `root` with `/` between

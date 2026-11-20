@@ -24,6 +24,7 @@ mod external_control_store;
 pub mod external_mcp;
 pub mod external_oauth;
 mod external_oauth_store;
+mod external_steering;
 mod external_tools;
 pub mod family;
 pub mod files;
@@ -69,6 +70,7 @@ pub mod tool_args;
 pub mod unseen;
 pub mod view;
 pub mod work;
+pub mod workspaces;
 pub mod ws;
 mod ws_transport;
 

@@ -71,7 +71,7 @@ pub struct PromptResponse {
     pub turn_id: String,
 }
 
-/// An accepted durable prompt, delivered after earlier turns finish.
+/// Receipt for a durable operator prompt accepted for steering or queued delivery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct QueuedPromptResponse {
     pub queue_id: String,

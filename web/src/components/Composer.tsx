@@ -75,7 +75,7 @@ export interface ComposerProps {
   sessionId: string
   /** The session as the list shows it, null while unknown. A turn in
    *  flight (`activity` is `running` or `blocked`) offers Cancel alongside
-   *  Send, which queues input; while `starting`, a refusal never offers a resume. */
+   *  Send. While `starting`, a refusal never offers a resume. */
   session: Pick<SessionSummary, 'activity' | 'lifecycle'> | null
   /** The session's host's capabilities (`HostItem.capabilities`), null
    *  while unknown. Images are hidden only when they are known and lack
@@ -184,6 +184,8 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
   }, [text])
 
   const inFlight = session?.activity === 'running' || session?.activity === 'blocked'
+  const canSteer = capabilities?.includes('steering') === true && catalog?.steering_supported === true && session?.lifecycle === 'active' && inFlight
+  const sendLabel = session?.lifecycle === 'parked' ? 'Resume and send' : 'Send'
   const hostImages = capabilities === null || capabilities.includes('images')
   const hostFiles = capabilities === null || capabilities.includes('files')
   // A session still starting refuses a resume too: it runs soon on its own.
@@ -467,7 +469,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
             {label}
           </p>
         )}
-        <PromptQueue sessionId={sessionId} items={queue} changed={onQueueChange} canSteer={catalog?.steering_supported === true && session?.lifecycle === 'active' && (session.activity === 'running' || session.activity === 'blocked')} />
+        <PromptQueue sessionId={sessionId} items={queue} changed={onQueueChange} canSteer={canSteer} />
         {(configuration.pending || configuration.error) && <div className="composer-config-status" role="status">
           {configuration.pending ? 'Applying session settings…' : <><span>Settings need attention.</span><button type="button" className="btn btn-ghost btn-sm" onClick={e => onSettings(e.currentTarget)}>Check settings</button></>}
         </div>}
@@ -568,7 +570,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
               </button>
             )}
             {
-              <button className="send-btn" type="button" aria-label={session?.lifecycle === 'parked' ? 'Resume and send' : 'Send'} title={session?.lifecycle === 'parked' ? 'Resume and send' : 'Send'} disabled={!canSend} onClick={send}>
+              <button className="send-btn" type="button" aria-label={sendLabel} title={canSteer ? 'Send to the current turn if it is still running' : sendLabel} disabled={!canSend} onClick={send}>
                 <Icon.ArrowUp size={18} />
               </button>
             }

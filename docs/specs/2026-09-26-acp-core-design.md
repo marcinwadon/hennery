@@ -909,11 +909,16 @@ leaves the session `failed` like a failed start, and `failed` is resumable.
   item instead returns to its original FIFO position after that proof of
   non-delivery. It is never shown as failed merely for non-delivery.
 - **One turn at a time; durable queued input (operator, 2026-10-21).**
-  Sending while a turn is running or waiting on the operator accepts the
-  checked prompt into the collector's durable FIFO. A pending permission or
-  question, including one outside a turn, never consumes a queued prompt.
+  Sending while a turn is running or waiting on the operator durably accepts
+  the checked prompt. If the attached host and adapter support steering, the
+  collector attempts to deliver it into the open turn. The operator can also
+  select a queued message for manual steering. External MCP and delegated
+  sends retain their existing authorization and queue semantics. Pending permissions
+  and questions stay open. When steering is unavailable or the adapter
+  reports `promptRequired`, the message keeps its FIFO position. Uncertain
+  steering delivery awaits confirmation or operator recovery.
   After the turn ends and all pending requests resolve, the worker reserves
-  one next turn and sends the head as ordinary operator input. No adapter
+  one next turn and sends the queue head as ordinary operator input. No adapter
   `promptQueueing` support is required. Cancel leaves the queue intact; the
   next message follows the cancelled turn's end. A parked session is resumed
   through the existing automatic attach/configuration gate before delivery.

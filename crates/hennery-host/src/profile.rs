@@ -256,7 +256,11 @@ impl Secrets {
             SessionBody::SteeringResult { request_id, outcome } => {
                 use hennery_proto::frames::SteeringOutcome;
                 let outcome = match outcome {
-                    SteeringOutcome::Rejected { reason } => SteeringOutcome::Rejected {
+                    SteeringOutcome::Rejected {
+                        reason,
+                        steering_unavailable,
+                    } => SteeringOutcome::Rejected {
+                        steering_unavailable,
                         reason: crate::adapter::scrub(&self.redact(&reason)).chars().take(512).collect(),
                     },
                     other => other,
