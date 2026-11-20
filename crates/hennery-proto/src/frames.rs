@@ -1179,6 +1179,7 @@ impl CollectorFrame {
             | Self::AnswerPermission { .. }
             | Self::AnswerElicitation { .. }
             | Self::Ack { .. }
+            | Self::Workspace { .. }
             | Self::ResolvePath { .. }
             | Self::ParkSession { .. }
             | Self::CloseSession { .. }
