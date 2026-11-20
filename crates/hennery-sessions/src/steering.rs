@@ -1,9 +1,9 @@
-//! Durable delivery of operator input into the current turn.
+//! Durable delivery of scoped input into the current turn.
 //! The operation owns a distinct request id. It never owns the running turn.
 use crate::{hub::Hub, store::Store};
 use anyhow::{Context, Result, ensure};
 use hennery_proto::{
-    frames::{Capability, CollectorFrame, SteeringOutcome},
+    frames::{Capabilities, Capability, CollectorFrame, SteeringOutcome},
     rest::{EventDto, StoredBlock},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -22,11 +22,17 @@ impl SteeringMode {
     }
 }
 
+pub(super) struct SteeringTarget {
+    pub host: String,
+    pub turn: String,
+    pub capabilities: Capabilities,
+}
+
 pub(super) struct SteeringHandoff {
     attempt: EventDto,
     host: String,
     turn: String,
-    request_id: String,
+    pub request_id: String,
     content: Vec<serde_json::Value>,
 }
 
@@ -76,30 +82,10 @@ impl Store {
         hub: &Hub,
         mode: SteeringMode,
     ) -> Result<Option<SteeringHandoff>> {
-        let target: Option<(String, Option<String>, bool, bool)> = tx
-            .query_row(
-                "SELECT s.host_id,s.open_turn_id,s.steering_supported,h.revoked_at IS NOT NULL
-             FROM sessions s JOIN hosts h ON h.owner_id=s.owner_id AND h.id=s.host_id
-             WHERE s.owner_id = ?1 AND s.id=?2 AND s.lifecycle='active' AND s.activity IN ('running','blocked') AND s.presumed_parked=0
-               AND s.close_requested=0 AND s.configuration_error IS NULL AND s.prompt_queue_held=0
-               AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id=s.owner_id AND p.hat_id=s.hat_id)",
-                params![self.owner_id(), session],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let Some((host, turn, supported, revoked)) = target else {
-            return mode.unavailable("steering_unavailable");
+        let target = match self.steering_target_in(tx, session, hub)? {
+            Ok(target) => target,
+            Err(reason) => return mode.unavailable(reason),
         };
-        ensure!(!revoked, "host_revoked");
-        let Some(turn) = turn else {
-            return mode.unavailable("steering_unavailable");
-        };
-        let Some(capabilities) = hub.ready_capabilities(&host) else {
-            return mode.unavailable("host_offline");
-        };
-        if !supported || !capabilities.has(Capability::Steering) {
-            return mode.unavailable("steering_unsupported");
-        }
         let payload: String = tx
             .query_row(
                 "SELECT payload FROM session_dispatch_queue WHERE owner_id = ?1 AND target_id=?2 AND operation_id=?3
@@ -114,17 +100,88 @@ impl Store {
             self.fail_operator_item_in(tx, id, "image_unavailable")?;
             return Ok(None);
         };
-        if !crate::hub::supports_steering_content(&capabilities, &content) {
+        if !crate::hub::supports_steering_content(&target.capabilities, &content) {
             if matches!(mode, SteeringMode::Required) {
                 self.fail_operator_item_in(tx, id, "image_unavailable")?;
             }
             return Ok(None);
         }
+        let handoff = self.steering_attempt_in(
+            tx,
+            session,
+            target,
+            &stored,
+            content,
+            hennery_proto::plugin::InputOrigin::Operator {},
+            matches!(mode, SteeringMode::WhenAvailable),
+        )?;
+        tx.execute(
+            "UPDATE session_operations SET state='steering',request_id=?3,turn_id=NULL,code=NULL
+             WHERE owner_id = ?1 AND operation_id=?2",
+            params![self.owner_id(), id, handoff.request_id],
+        )?;
+        tx.execute(
+            "UPDATE session_dispatch_queue SET state='steering',steering_deadline=unixepoch()+30,steering_failure=NULL
+             WHERE owner_id = ?1 AND operation_id=?2",
+            params![self.owner_id(), id],
+        )?;
+        Ok(Some(handoff))
+    }
+
+    pub(super) fn steering_target_in(
+        &self,
+        tx: &Connection,
+        session: &str,
+        hub: &Hub,
+    ) -> Result<Result<SteeringTarget, &'static str>> {
+        let target: Option<(String, Option<String>, bool, bool)> = tx
+            .query_row(
+                "SELECT s.host_id,s.open_turn_id,s.steering_supported,h.revoked_at IS NOT NULL
+             FROM sessions s JOIN hosts h ON h.owner_id=s.owner_id AND h.id=s.host_id
+             WHERE s.owner_id = ?1 AND s.id=?2 AND s.lifecycle='active' AND s.activity IN ('running','blocked') AND s.presumed_parked=0
+               AND s.close_requested=0 AND s.configuration_error IS NULL AND s.prompt_queue_held=0
+               AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id=s.owner_id AND p.hat_id=s.hat_id)",
+                params![self.owner_id(), session],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((host, turn, supported, revoked)) = target else {
+            return Ok(Err("steering_unavailable"));
+        };
+        ensure!(!revoked, "host_revoked");
+        let Some(turn) = turn else {
+            return Ok(Err("steering_unavailable"));
+        };
+        let Some(capabilities) = hub.ready_capabilities(&host) else {
+            return Ok(Err("host_offline"));
+        };
+        if !supported || !capabilities.has(Capability::Steering) {
+            return Ok(Err("steering_unsupported"));
+        }
+        Ok(Ok(SteeringTarget {
+            host,
+            turn,
+            capabilities,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn steering_attempt_in(
+        &self,
+        tx: &Transaction<'_>,
+        session: &str,
+        target: SteeringTarget,
+        stored: &[StoredBlock],
+        content: Vec<serde_json::Value>,
+        origin: hennery_proto::plugin::InputOrigin,
+        automatic: bool,
+    ) -> Result<SteeringHandoff> {
         let request_id = uuid::Uuid::now_v7().to_string();
         // A dispatched attempt belongs to the session history even if its
         // recovery row is dismissed before the host can report admission.
-        let mut body = serde_json::json!({"request_id":request_id,"turn_id":turn,"content":stored});
-        if matches!(mode, SteeringMode::WhenAvailable) {
+        let mut body = serde_json::json!({"request_id":request_id,"turn_id":target.turn,"content":stored});
+        body["origin"] = serde_json::to_value(origin)?;
+        if automatic {
             body["automatic"] = true.into();
         }
         let attempt = crate::store::collector_event(
@@ -136,23 +193,13 @@ impl Store {
             &crate::store::now(),
         )?;
         crate::store::link_attachments(tx, self.owner_id(), attempt.event_id, &attempt.body["content"])?;
-        tx.execute(
-            "UPDATE session_operations SET state='steering',request_id=?3,turn_id=NULL,code=NULL
-             WHERE owner_id = ?1 AND operation_id=?2",
-            params![self.owner_id(), id, request_id],
-        )?;
-        tx.execute(
-            "UPDATE session_dispatch_queue SET state='steering',steering_deadline=unixepoch()+30,steering_failure=NULL
-             WHERE owner_id = ?1 AND operation_id=?2",
-            params![self.owner_id(), id],
-        )?;
-        Ok(Some(SteeringHandoff {
+        Ok(SteeringHandoff {
             attempt,
-            host,
-            turn,
+            host: target.host,
+            turn: target.turn,
             request_id,
             content,
-        }))
+        })
     }
 
     pub(crate) fn settle_steering_in(
@@ -178,6 +225,7 @@ impl Store {
             None
         };
         let Some((id, prior_failure)) = row else {
+            self.settle_external_steering_in(tx, session, request, outcome)?;
             // Dismissal released the queue slot. A late admission belongs in
             // history, while an idle reply must leave the item dismissed.
             return Ok(admitted);
@@ -246,7 +294,9 @@ impl Store {
         body.as_object_mut()
             .context("invalid steering attempt")?
             .remove("automatic");
-        body["origin"] = serde_json::json!({"kind":"operator"});
+        if body.get("origin").is_none() {
+            body["origin"] = serde_json::json!({"kind":"operator"});
+        }
         if late {
             body["display_at"] = anchor.into();
         }
@@ -271,7 +321,9 @@ impl Store {
         let tx = conn.transaction()?;
         let session: Option<String> = tx.query_row(
             "SELECT s.id FROM session_operations o JOIN sessions s ON s.owner_id=o.owner_id AND s.id=o.child_id
-             WHERE o.owner_id = ?1 AND s.host_id=?2 AND o.request_id=?3 AND o.tool='operator_prompt' AND o.state='steering'",
+             WHERE o.owner_id = ?1 AND s.host_id=?2 AND o.request_id=?3 AND o.tool='operator_prompt' AND o.state='steering'
+             UNION ALL SELECT s.id FROM external_operations o JOIN sessions s ON s.owner_id=o.owner_id AND s.id=o.session_id
+             WHERE o.owner_id = ?1 AND s.host_id=?2 AND o.request_id=?3 AND o.steering_turn IS NOT NULL AND o.state IN ('running','uncertain')",
             params![self.owner_id(),host,request], |r| r.get(0)
         ).optional()?;
         let Some(session) = session else {
@@ -291,18 +343,26 @@ impl Store {
     }
 
     pub(crate) fn uncertain_steering_for_host(&self, host: &str) -> Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE external_operations SET state='uncertain',code='delivery_unknown',steering_deadline=NULL WHERE owner_id = ?1 AND steering_deadline IS NOT NULL AND session_id IN (SELECT id FROM sessions WHERE owner_id = ?1 AND host_id=?2)",params![self.owner_id(),host])?;
+        tx.execute(
             "UPDATE session_dispatch_queue SET state='uncertain',steering_deadline=NULL WHERE owner_id = ?1 AND state='steering'
              AND target_id IN (SELECT id FROM sessions WHERE owner_id = ?1 AND host_id=?2)",params![self.owner_id(),host])?;
+        tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn expire_steering(&self, now: i64) -> Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE external_operations SET state='uncertain',code='delivery_unknown',steering_deadline=NULL WHERE owner_id = ?1 AND steering_deadline<=?2",params![self.owner_id(),now])?;
+        tx.execute(
             "UPDATE session_dispatch_queue SET state='uncertain',steering_deadline=NULL
              WHERE owner_id = ?1 AND state='steering' AND steering_deadline<=?2",
             params![self.owner_id(), now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 }

@@ -116,6 +116,24 @@ impl Store {
         )?)
     }
 
+    /// Materialize a validated attachment under the same lock and transaction as its queue or event link.
+    pub(super) fn store_queued_attachment_in(&self, tx: &Transaction<'_>, image: &crate::content::Image) -> Result<()> {
+        tx.execute(
+            "INSERT INTO attachments(owner_id,sha256,mime,size,created_at) VALUES (?1,?2,?3,?4,?5)
+                 ON CONFLICT(owner_id,sha256) DO NOTHING",
+            params![
+                self.owner_id(),
+                image.sha256,
+                image.mime,
+                image.bytes.len() as i64,
+                now()
+            ],
+        )?;
+        let dir = self.attachments.as_deref().context("attachment storage unavailable")?;
+        crate::attachments::write(dir, &image.sha256, &image.bytes)?;
+        Ok(())
+    }
+
     pub fn enqueue_operator_prompt(&self, session: &str, prompt: &Checked) -> Result<String> {
         match self.enqueue_operator_prompt_with_key(session, prompt, None)? {
             crate::prompt_receipts::PromptReceipt::Queued { queue_id } => Ok(queue_id),
@@ -176,19 +194,7 @@ impl Store {
              VALUES (?1,?2,?3,?3,0,?4,?5,'operator',?6)", params![self.owner_id(),id,session,payload,config,image_bytes],
         )?;
         for (position, image) in prompt.images.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO attachments(owner_id,sha256,mime,size,created_at) VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT(owner_id,sha256) DO NOTHING",
-                params![
-                    self.owner_id(),
-                    image.sha256,
-                    image.mime,
-                    image.bytes.len() as i64,
-                    now()
-                ],
-            )?;
-            let dir = self.attachments.as_deref().context("attachment storage unavailable")?;
-            crate::attachments::write(dir, &image.sha256, &image.bytes)?;
+            self.store_queued_attachment_in(&tx, image)?;
             tx.execute(
                 "INSERT INTO prompt_queue_attachments(owner_id,operation_id,sha256,position) VALUES (?1,?2,?3,?4)",
                 params![self.owner_id(), id, image.sha256, position as i64],

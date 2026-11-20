@@ -30,6 +30,14 @@ pub(crate) struct Command {
     pub tool: String,
     pub session_id: String,
     pub turn_id: Option<String>,
+    pub resolved_prompt: Option<ResolvedPrompt>,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedPrompt {
+    pub host: String,
+    pub cwd: String,
+    pub root: String,
+    pub hat: String,
 }
 impl Command {
     pub fn origin(&self) -> InputOrigin {
@@ -143,13 +151,42 @@ struct CloneSession {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Prompt {
+pub(super) struct Prompt {
     request_key: String,
     session_id: String,
     #[serde(default)]
     text: String,
     #[serde(default)]
     attachments: Vec<String>,
+    #[serde(default, rename = "delivery")]
+    _delivery: Delivery,
+}
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Delivery {
+    #[default]
+    Auto,
+    Queue,
+}
+impl Prompt {
+    pub(super) fn content(
+        &self,
+        conn: &rusqlite::Connection,
+        store: &crate::store::Store,
+        command: &Command,
+    ) -> Result<Vec<Value>> {
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(json!({"type":"text","text":self.text}));
+        }
+        content.extend(crate::external_attachments::prompt_images_in(
+            conn,
+            store,
+            command,
+            &self.attachments,
+        )?);
+        Ok(content)
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,8 +283,8 @@ pub(crate) fn tools(identity: &ExternalIdentity) -> Vec<Value> {
             ),
             (
                 "session_prompt",
-                "Send text to an authorized session. Busy sessions queue durably; parked sessions resume with current grant and source-policy checks. Acceptance is not completion.",
-                json!({"request_key":id,"session_id":id,"text":{"type":"string","maxLength":32768},"attachments":{"type":"array","items":id,"maxItems":20}}),
+                "Send text or sealed image uploads. Default auto can steer the current attached turn. Queue waits for a new turn. Parked sessions resume with current grant and source-policy checks. Poll operation_get for the actual turn_id and result.delivery (steering or turn). Confirmed steering admission stays running until the target turn ends.",
+                json!({"request_key":id,"session_id":id,"delivery":{"type":"string","enum":["auto","queue"],"default":"auto"},"text":{"type":"string","maxLength":32768},"attachments":{"type":"array","items":id,"maxItems":20}}),
                 vec!["request_key", "session_id"],
                 false,
             ),
@@ -334,13 +371,7 @@ pub(crate) async fn invoke(state: &AppState, identity: &ExternalIdentity, tool: 
             let deadline = tokio::time::Instant::now() + Duration::from_millis(q.timeout_ms);
             let mut changes = state.hub.subscribe();
             loop {
-                let receipt = state.store.external_operation(identity, Some(&q.operation_id), None)?;
-                let waiting = !receipt.session_id.is_empty()
-                    && (state
-                        .store
-                        .find_session(&receipt.session_id)?
-                        .is_some_and(|s| s.activity.as_deref() == Some("blocked"))
-                        || !state.store.open_pending(&receipt.session_id)?.is_empty());
+                let (receipt, waiting) = state.store.external_wait_snapshot(identity, &q.operation_id)?;
                 if waiting
                     || matches!(
                         receipt.state.as_str(),
@@ -578,7 +609,7 @@ pub fn after_startup(state: &AppState) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            for (command, args) in pending {
+            for (mut command, args) in pending {
                 let runtime = state.external_commands.clone();
                 let Ok(permit) = runtime.permits.clone().try_acquire_owned() else {
                     break;
@@ -598,7 +629,7 @@ pub fn after_startup(state: &AppState) {
                         runtime,
                         id: command.operation_id.clone(),
                     };
-                    tokio::select! {biased;()=state.shutdown.cancelled()=>{},result=execute(&state,&command,args)=>{
+                    tokio::select! {biased;()=state.shutdown.cancelled()=>{},result=execute(&state,&mut command,args)=>{
                         if let Err(error)=result {let _=state.store.external_finish(&command,"failed",Some(&error_code(&error)),None);}
                     }}
                 });
@@ -613,7 +644,7 @@ async fn resolved(state: &AppState, host: &str, path: &str) -> Result<()> {
     ensure!(p.is_dir && p.exists && p.canonical == path, "cwd_moved");
     Ok(())
 }
-async fn preflight(state: &AppState, command: &Command, args: &Value) -> Result<()> {
+async fn preflight(state: &AppState, command: &mut Command, args: &Value) -> Result<()> {
     let client = state.store.external_execution_client(command)?;
     let (host, cwd, hat) = if matches!(command.tool.as_str(), "session_create" | "session_clone") {
         (
@@ -653,6 +684,14 @@ async fn preflight(state: &AppState, command: &Command, args: &Value) -> Result<
         if root != cwd {
             resolved(state, &host, root).await?;
         }
+        if command.tool == "session_prompt" {
+            command.resolved_prompt = Some(ResolvedPrompt {
+                host,
+                cwd,
+                hat,
+                root: root.into(),
+            });
+        }
     }
     Ok(())
 }
@@ -662,14 +701,26 @@ pub(crate) async fn response_value(response: Response) -> Result<(bool, Value)> 
     let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"code":"operation_failed"}));
     Ok((success, value))
 }
-async fn execute(state: &AppState, command: &Command, args: Value) -> Result<()> {
+async fn execute(state: &AppState, command: &mut Command, args: Value) -> Result<()> {
     if command.tool == "session_prompt" {
         let s = state
             .store
             .find_session(&command.session_id)?
             .ok_or_else(|| anyhow::anyhow!("not_found"))?;
+        if s.open_turn_id.is_some() {
+            if state.store.external_steering_candidate(command, &state.hub)? {
+                if let Err(error) = preflight(state, command, &args).await {
+                    if error.to_string() == "resolve_unavailable" {
+                        state.store.defer_external_steering_in(&state.store.conn(), command)?;
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                state.store.dispatch_external_steering(command, &state.hub)?;
+            }
+            return Ok(());
+        }
         if s.lifecycle == "starting"
-            || s.open_turn_id.is_some()
             || s.activity.as_deref() == Some("blocked")
             || !state.store.open_pending(&s.id)?.is_empty()
         {
@@ -738,15 +789,11 @@ async fn execute(state: &AppState, command: &Command, args: Value) -> Result<()>
         }
         "session_prompt" => {
             let q: Prompt = decode(args)?;
-            let mut content = Vec::new();
-            if !q.text.is_empty() {
-                content.push(json!({"type":"text","text":q.text}));
-            }
-            content.extend(crate::external_attachments::prompt_images(
-                state,
-                command,
-                &q.attachments,
-            )?);
+            let content = {
+                let conn = state.store.conn();
+                state.store.external_guard_in(&conn, command, None)?;
+                q.content(&conn, &state.store, command)?
+            };
             crate::api::prompt_authorized(
                 state_,
                 id,
@@ -1117,6 +1164,219 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_steering_leaves_queue_before_reconciliation_and_pagination() {
+        use hennery_proto::frames::{
+            AgentIsolation, Capabilities, Capability, CollectorFrame, SteeringOutcome, TurnOutcome,
+        };
+        for end_first in [false, true] {
+            let (_dir, state, identity) = world();
+            let (mailbox, mut frames) = tokio::sync::mpsc::unbounded_channel();
+            let socket = state
+                .hub
+                .register(
+                    "host",
+                    mailbox,
+                    Capabilities(vec![Capability::Steering]),
+                    AgentIsolation::default(),
+                )
+                .unwrap();
+            state.hub.mark_ready("host", socket.conn_id);
+            state
+                .store
+                .conn()
+                .execute(
+                    "UPDATE sessions SET steering_supported=1 WHERE owner_id=?1 AND id='session'",
+                    [state.store.owner_id()],
+                )
+                .unwrap();
+            state
+                .store
+                .open_turn("session", "target", &[json!({"type":"text","text":"first"})])
+                .unwrap();
+            state
+                .store
+                .ingest(
+                    "session",
+                    2,
+                    &SessionBody::TurnStarted {
+                        turn_id: "target".into(),
+                        request_id: "start".into(),
+                    },
+                )
+                .unwrap();
+            let args = json!({"request_key":"hint","session_id":"session","text":"hint"});
+            let hint = state
+                .store
+                .external_admit(&identity, "session_prompt", "hint", &args)
+                .unwrap();
+            let (command, _) = state.store.external_pending().unwrap().remove(0);
+            state.store.dispatch_external_steering(&command, &state.hub).unwrap();
+            let CollectorFrame::Steer { request_id, .. } = frames.try_recv().unwrap() else {
+                panic!("expected steering")
+            };
+            let tail = state
+                .store
+                .external_admit(&identity, "session_prompt", "tail", &args)
+                .unwrap();
+            let mut facts = [
+                SessionBody::SteeringResult {
+                    request_id,
+                    outcome: SteeringOutcome::Injected,
+                },
+                SessionBody::TurnEnded {
+                    turn_id: "target".into(),
+                    outcome: TurnOutcome::Completed,
+                    error: None,
+                    usage: None,
+                    stop_reason: None,
+                },
+            ];
+            if end_first {
+                facts.reverse();
+            }
+            state.store.ingest("session", 3, &facts[0]).unwrap();
+            let list = || {
+                crate::external_tools::invoke(
+                    &state,
+                    &identity,
+                    "session_queue",
+                    json!({"session_id":"session","limit":1}),
+                )
+            };
+            assert_eq!(
+                list().await.unwrap()["data"]["operations"][0]["operation_id"],
+                hint.operation_id
+            );
+            state.store.ingest("session", 4, &facts[1]).unwrap();
+            let receipt = state
+                .store
+                .external_operation(&identity, Some(&hint.operation_id), None)
+                .unwrap();
+            assert_eq!(receipt.state, "completed");
+            let page = list().await.unwrap();
+            assert_eq!(
+                page["data"]["operations"][0]["operation_id"], tail.operation_id,
+                "{page}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_steering_rechecks_authority_and_target_after_realpath_preflight() {
+        use hennery_proto::frames::{AgentIsolation, Capabilities, Capability};
+        for change in [
+            "grant",
+            "cwd",
+            "policy",
+            "new_turn",
+            "host_capability",
+            "unsent_mailbox",
+            "settlement_failure",
+            "deadline",
+        ] {
+            let (_dir, state, identity) = world();
+            let (mailbox, mut frames) = tokio::sync::mpsc::unbounded_channel();
+            let caps = if change == "host_capability" {
+                vec![]
+            } else {
+                vec![Capability::Steering]
+            };
+            let socket = state
+                .hub
+                .register("host", mailbox, Capabilities(caps), AgentIsolation::default())
+                .unwrap();
+            state.hub.mark_ready("host", socket.conn_id);
+            let conn = state.store.conn();
+            conn.execute("UPDATE sessions SET open_turn_id='target',activity='running',steering_supported=1 WHERE owner_id=?1 AND id='session'",[state.store.owner_id()]).unwrap();
+            drop(conn);
+            let args = json!({"request_key":"test","session_id":"session","text":"live"});
+            state
+                .store
+                .external_admit(&identity, "session_prompt", "test", &args)
+                .unwrap();
+            let (mut command, _) = state.store.external_pending().unwrap().remove(0);
+            command.resolved_prompt = Some(ResolvedPrompt {
+                host: "host".into(),
+                cwd: "/project".into(),
+                root: "/project".into(),
+                hat: state.hosts.host("host").unwrap().unwrap().default_hat_id,
+            });
+            if change == "grant" {
+                state.store.revoke_external_client(&command.client_id).unwrap();
+            }
+            let conn = state.store.conn();
+            match change {
+                "cwd" => {
+                    conn.execute(
+                        "UPDATE sessions SET cwd='/project/moved' WHERE owner_id=?1 AND id='session'",
+                        [state.store.owner_id()],
+                    )
+                    .unwrap();
+                }
+                "policy" => {
+                    conn.execute("UPDATE hats SET mcp_source_policy='managed_only',mcp_policy_revision=mcp_policy_revision+1 WHERE owner_id=?1",[state.store.owner_id()]).unwrap();
+                }
+                "new_turn" => {
+                    conn.execute(
+                        "UPDATE sessions SET open_turn_id='successor' WHERE owner_id=?1 AND id='session'",
+                        [state.store.owner_id()],
+                    )
+                    .unwrap();
+                }
+                "unsent_mailbox" => frames.close(),
+                "settlement_failure" => {
+                    frames.close();
+                    conn.execute_batch("CREATE TEMP TRIGGER force_settlement_failure BEFORE UPDATE OF state ON external_operations WHEN OLD.state='running' AND NEW.state='queued' BEGIN SELECT RAISE(ABORT,'unsent settlement failed'); END;").unwrap();
+                }
+                _ => {}
+            }
+            drop(conn);
+            let result = state.store.dispatch_external_steering(&command, &state.hub);
+            if matches!(change, "policy" | "cwd") {
+                assert!(result.is_err(), "{change}");
+            } else {
+                result.unwrap();
+            }
+            if change == "settlement_failure" {
+                state.store.expire_steering(i64::MAX).unwrap();
+                assert_eq!(
+                    state
+                        .store
+                        .external_operation(&identity, Some(&command.operation_id), None)
+                        .unwrap()
+                        .state,
+                    "delivery_unknown"
+                );
+            }
+            if change == "deadline" {
+                assert!(matches!(
+                    frames.try_recv(),
+                    Ok(hennery_proto::frames::CollectorFrame::Steer { .. })
+                ));
+                state.store.expire_steering(i64::MAX).unwrap();
+                let receipt = state
+                    .store
+                    .external_operation(&identity, Some(&command.operation_id), None)
+                    .unwrap();
+                assert_eq!(receipt.state, "delivery_unknown");
+                assert_eq!(receipt.turn_id.as_deref(), Some("target"));
+                assert!(state.store.external_pending().unwrap().is_empty());
+            } else {
+                assert!(frames.try_recv().is_err(), "{change}");
+            }
+            if matches!(change, "new_turn" | "host_capability" | "unsent_mailbox") {
+                let receipt = state
+                    .store
+                    .external_operation(&identity, Some(&command.operation_id), None)
+                    .unwrap();
+                assert_eq!(receipt.state, "queued");
+                assert_eq!(receipt.turn_id, None);
+                assert!(state.store.external_pending().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn revocation_at_final_handoff_does_not_send_or_leave_an_unsent_turn_open() {
         let (_dir, state, identity) = world();
         state
@@ -1128,7 +1388,8 @@ mod tests {
                 &json!({"request_key":"prompt","session_id":"session","text":"test"}),
             )
             .unwrap();
-        let (command, _) = state.store.external_pending().unwrap().remove(0);
+        let (mut command, _) = state.store.external_pending().unwrap().remove(0);
+        command.turn_id = Some("turn".into());
         state.store.external_begin(&command).unwrap();
         let prompt = crate::content::check(vec![json!({"type":"text","text":"test"})]).unwrap();
         state
@@ -1281,14 +1542,7 @@ mod tests {
         assert!(
             state
                 .store
-                .open_prompt_authorized(
-                    "session",
-                    command.turn_id.as_deref().unwrap(),
-                    &prompt,
-                    &mut None,
-                    None,
-                    Some(&command)
-                )
+                .open_prompt_authorized("session", "turn", &prompt, &mut None, None, Some(&command))
                 .is_err()
         );
         assert!(

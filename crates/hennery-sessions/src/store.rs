@@ -484,6 +484,7 @@ END;",
     include_str!("files.sql"),
     // The hook sets the latest start or resume applied (skills spec §8).
     "ALTER TABLE sessions ADD COLUMN hook_sets_applied TEXT NOT NULL DEFAULT '[]';",
+    include_str!("external_steering.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -3085,8 +3086,8 @@ impl Store {
             // prompt was sent. Only the final synchronous handoff sets it.
             if let Some(command) = external {
                 tx.execute(
-                    "UPDATE external_operations SET request_id=NULL WHERE owner_id = ?1 AND id=?2",
-                    params![self.owner_id(), command.operation_id],
+                    "UPDATE external_operations SET request_id=NULL,turn_id=?3,steering_turn=NULL,result=json_object('delivery','turn','turn_id',?3) WHERE owner_id = ?1 AND id=?2",
+                    params![self.owner_id(), command.operation_id,turn_id],
                 )?;
             }
         }

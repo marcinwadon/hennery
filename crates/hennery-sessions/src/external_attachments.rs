@@ -234,7 +234,7 @@ pub(crate) async fn invoke(state: &AppState, identity: &ExternalIdentity, name: 
                 .try_acquire_owned()
                 .map_err(|_| anyhow::anyhow!("operation_limit"))?;
             tokio::task::spawn_blocking(move||->Result<Value>{let _permit=permit;let conn=state.store.conn();state.store.external_read_in(&conn,&identity,&q.session_id,true)?;
-                let mime:Option<String>=conn.query_row("SELECT a.mime FROM attachments a WHERE a.owner_id = ?1 AND a.sha256=?3 AND EXISTS(SELECT 1 FROM turn_attachments ta JOIN turns t ON t.owner_id=ta.owner_id AND t.turn_id=ta.turn_id WHERE ta.owner_id = ?1 AND ta.sha256=a.sha256 AND t.session_id=?2)",params![state.store.owner_id(),q.session_id,q.sha256],|r|r.get(0)).optional()?;
+                let mime:Option<String>=conn.query_row("SELECT a.mime FROM attachments a WHERE a.owner_id = ?1 AND a.sha256=?3 AND (EXISTS(SELECT 1 FROM turn_attachments ta JOIN turns t ON t.owner_id=ta.owner_id AND t.turn_id=ta.turn_id WHERE ta.owner_id = ?1 AND ta.sha256=a.sha256 AND t.session_id=?2) OR EXISTS(SELECT 1 FROM event_attachments ea JOIN events e ON e.owner_id=ea.owner_id AND e.event_id=ea.event_id WHERE ea.owner_id = ?1 AND ea.sha256=a.sha256 AND e.session_id=?2 AND e.kind='user_steering'))",params![state.store.owner_id(),q.session_id,q.sha256],|r|r.get(0)).optional()?;
                 let mime=mime.ok_or_else(||anyhow::anyhow!("not_found"))?;let dir=state.store.attachments.as_deref().ok_or_else(||anyhow::anyhow!("not_found"))?;let bytes=crate::attachments::read(dir,&q.sha256)?.ok_or_else(||anyhow::anyhow!("not_found"))?;
                 ensure!(bytes.len()<=crate::content::MAX_IMAGE_BYTES&&q.offset<=bytes.len(),"invalid_arguments");let end=q.offset.saturating_add(q.limit).min(bytes.len());Ok(json!({"sha256":q.sha256,"mime_type":mime,"size":bytes.len(),"offset":q.offset,"data_base64":STANDARD.encode(&bytes[q.offset..end]),"next_offset":if end<bytes.len(){Some(end)}else{None}}))}).await??
         }
@@ -386,16 +386,18 @@ pub(crate) fn bind_in(
     }
     Ok(())
 }
-pub(crate) fn prompt_images(state: &AppState, command: &Command, ids: &[String]) -> Result<Vec<Value>> {
-    let conn = state.store.conn();
-    state.store.external_guard_in(&conn, command, None)?;
+pub(crate) fn prompt_images_in(
+    conn: &Connection,
+    store: &crate::store::Store,
+    command: &Command,
+    ids: &[String],
+) -> Result<Vec<Value>> {
     let mut images = Vec::new();
     for id in ids {
-        let mime:Option<String>=conn.query_row("SELECT u.mime FROM external_uploads u JOIN external_operation_uploads b ON b.owner_id=u.owner_id AND b.upload_id=u.id WHERE u.owner_id = ?1 AND u.id=?2 AND b.operation_id=?3 AND u.client_id=?4 AND u.session_id=?5 AND u.sealed=1",params![state.store.owner_id(),id,command.operation_id,command.client_id,command.session_id],|r|r.get(0)).optional()?;
+        let mime:Option<String>=conn.query_row("SELECT u.mime FROM external_uploads u JOIN external_operation_uploads b ON b.owner_id=u.owner_id AND b.upload_id=u.id WHERE u.owner_id = ?1 AND u.id=?2 AND b.operation_id=?3 AND u.client_id=?4 AND u.session_id=?5 AND u.sealed=1",params![store.owner_id(),id,command.operation_id,command.client_id,command.session_id],|r|r.get(0)).optional()?;
         let mime = mime.ok_or_else(|| anyhow::anyhow!("not_found"))?;
-        images.push(
-            json!({"type":"image","mimeType":mime,"data":STANDARD.encode(assemble(&conn,state.store.owner_id(),id)?)}),
-        );
+        images
+            .push(json!({"type":"image","mimeType":mime,"data":STANDARD.encode(assemble(conn,store.owner_id(),id)?)}));
     }
     Ok(images)
 }

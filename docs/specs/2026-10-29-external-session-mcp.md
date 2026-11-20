@@ -330,7 +330,7 @@ integration and acceptance above require no desktop binary.
 | Tool | Contract |
 | --- | --- |
 | `session_create(request_key, host_id, cwd, agent, config?)` | Durable creation of one standalone session; optional model, mode, axes and cache retention. A model, mode or axis left unset takes the hat’s saved default for that agent, exactly as the operator launcher prefills it; named values win. |
-| `session_prompt(request_key, session_id, text?, attachments?)` | Durable text/image admission, queues while busy and auto-resumes a parked session. |
+| `session_prompt(request_key, session_id, text?, attachments?, delivery?)` | Accept text and sealed images durably. Default auto steers a compatible active turn. Queue waits for a new turn. A parked session resumes first. |
 | `operation_get(operation_id? or request_key?)` | Recover this client's operation, delivery state, session/turn IDs and outcome. Supply exactly one lookup key. |
 | `session_wait(operation_id, timeout_ms?)` | Bounded wait, up to ten seconds, returning operation state and whether operator input is needed. |
 | `session_read(session_id, cursor?, before_turn?, max_items?)` | Canonical transcript excerpts, up to ten items, with opaque continuation and explicit resync on revision changes. |
@@ -367,8 +367,22 @@ code and cannot be raised by configuration. Refusals are tool results:
 `session_rate_limit` (`.limit`, `.window_secs`, `.used`, `.retry_after`),
 wrapped in `data` like every tool result, with the same numbers in the text. `hennery_capabilities.limits` reports both, the pending-operation
 cap (32), the receipt cap (4096) and the page size (50).
-Busy external prompts use a
-durable FIFO per session and yield to the existing session dispatch queue.
+External prompts retain FIFO order within each session across clients. Default
+`delivery: "auto"` can add input to the turn active at admission once earlier
+inputs have reached the agent. Explicit `delivery: "queue"` and a confirmed
+unavailable steering route use an ordinary new turn and yield to the existing
+session dispatch queue. A queued operation has no promised turn ID. After
+dispatch, poll `operation_get` or `session_wait` for its actual `turn_id` and
+`result.delivery` (`turn` or `steering`). For steering, `result.admission`
+is `pending` until the adapter confirms or rejects the input. A definitive
+refusal reports code `steering_rejected` and a bounded `result.reason`. Confirmation
+allows further hints and the operation completes when that target turn ends.
+For a steered prompt, `session_wait.waiting_on_operator` refers to the actual
+steering target. A permission request stays with the operator. If an attempted steering
+delivery remains unknown, later external prompts to that session stay queued
+until a definitive host fact arrives. An edit or withdrawal is possible only
+before handoff. Replay the original key to read the same receipt.
+
 Authority is checked again at dispatch and auto-resume. Grant revocation cancels
 queued payloads; it does not claim to recall an already-handed agent action.
 Unsent cleanup is fenced by operation/turn/intent generation so it cannot undo

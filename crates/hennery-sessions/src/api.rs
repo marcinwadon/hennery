@@ -1128,7 +1128,7 @@ pub(crate) async fn prompt_authorized(
     state: AppState,
     id: String,
     req: PromptRequest,
-    external: Option<crate::external_control::Command>,
+    mut external: Option<crate::external_control::Command>,
 ) -> Response {
     let mut checked = match content::check(req.content) {
         Ok(checked) => checked,
@@ -1222,6 +1222,9 @@ pub(crate) async fn prompt_authorized(
         .as_ref()
         .and_then(|c| c.turn_id.clone())
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    if let Some(command) = external.as_mut() {
+        command.turn_id = Some(turn_id.clone());
+    }
     let Some(_admission) = state.store.reserve_prompt(&id) else {
         return external_queue_or_operator(&state, &id, &checked, key.as_ref(), external.as_ref());
     };

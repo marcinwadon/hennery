@@ -91,6 +91,11 @@ const SOURCES: &[(&str, &str, usize)] = &[
         2,
     ),
     (
+        "hennery-sessions/src/external_steering.rs",
+        include_str!("../../hennery-sessions/src/external_steering.rs"),
+        8,
+    ),
+    (
         "hennery-sessions/src/steering.rs",
         include_str!("../../hennery-sessions/src/steering.rs"),
         13,

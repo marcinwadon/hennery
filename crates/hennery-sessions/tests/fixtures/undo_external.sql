@@ -1,3 +1,8 @@
+DROP VIEW external_steering_receipts;
+DROP TRIGGER external_steering_deleted;
+DROP VIEW external_prompt_heads;
+DROP TRIGGER external_steering_detached;
+DROP TRIGGER external_steering_endpoint_end;
 -- Rewind hook set acknowledgements (v47) before rebuilding a historical fixture.
 ALTER TABLE sessions DROP COLUMN hook_sets_applied;
 -- Rewind session files (v46) before rebuilding a historical fixture.

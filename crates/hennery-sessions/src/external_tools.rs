@@ -290,32 +290,50 @@ pub(crate) async fn invoke(state: &AppState, identity: &ExternalIdentity, name: 
             ensure!(identity.client.control_sessions, "external_control_forbidden");
             let conn = state.store.conn();
             state.store.external_read_in(&conn, identity, &q.session_id, false)?;
-            let mut stmt=conn.prepare("SELECT position,id,tool,state,turn_id,args,request_id IS NULL FROM external_operations WHERE owner_id = ?1 AND client_id=?2 AND session_id=?3 AND position>?4 AND state IN ('queued','running','uncertain') ORDER BY position LIMIT ?5")?;
-            let rows = stmt
-                .query_map(
-                    params![
-                        state.store.owner_id(),
-                        identity.client.client_id,
-                        q.session_id,
-                        q.after,
-                        q.limit
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, Option<String>>(4)?,
-                            r.get::<_, String>(5)?,
-                            r.get::<_, bool>(6)?,
-                        ))
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let next = rows.last().filter(|_| rows.len() == q.limit as usize).map(|r| r.0);
-            let rows=rows.into_iter().map(|(position,id,tool,status,turn,args,unhanded)| { let args:Value=serde_json::from_str(&args).unwrap_or(Value::Null); {let full=args["text"].as_str();let excerpt=full.map(|s|{let mut end=s.len().min(512);while !s.is_char_boundary(end){end-=1;} &s[..end]});json!({"position":position,"operation_id":id,"tool":tool,"state":status,"turn_id":turn,"withdrawable":status=="queued"&&unhanded,"text":if identity.client.read_transcript {json!(excerpt)}else{Value::Null},"text_truncated":identity.client.read_transcript&&full.is_some_and(|s|s.len()>512)})}}).collect::<Vec<_>>();
-            json!({"operations":rows,"next_cursor":next})
+            let mut stmt = conn.prepare(
+                "SELECT o.position,o.id,o.tool,COALESCE(steer.state,o.state),COALESCE(steer.turn_id,o.turn_id),
+                   o.args,o.request_id IS NULL,json_extract(o.result,'$.delivery'),json_extract(o.result,'$.admission')
+                 FROM external_operations o LEFT JOIN external_steering_receipts steer
+                   ON steer.owner_id=o.owner_id AND steer.id=o.id
+                 WHERE o.owner_id = ?1 AND o.client_id=?2 AND o.session_id=?3 AND o.position>?4
+                   AND o.state IN ('queued','running','uncertain')
+                   AND (steer.id IS NULL OR steer.state IN ('running','delivery_unknown'))
+                 ORDER BY o.position LIMIT ?5",
+            )?;
+            let mut rows = stmt.query(params![
+                state.store.owner_id(),
+                identity.client.client_id,
+                q.session_id,
+                q.after,
+                q.limit
+            ])?;
+            let mut operations = Vec::new();
+            let mut position = None;
+            while let Some(row) = rows.next()? {
+                let pos: i64 = row.get(0)?;
+                let status: String = row.get(3)?;
+                let args: Value = serde_json::from_str(&row.get::<_, String>(5)?)?;
+                let full = args["text"].as_str().filter(|_| identity.client.read_transcript);
+                let excerpt = full.map(|s| {
+                    let mut end = s.len().min(512);
+                    while !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &s[..end]
+                });
+                let turn = row.get::<_, Option<String>>(4)?;
+                let tool: String = row.get(2)?;
+                let delivery = row.get::<_, Option<String>>(7)?.or_else(|| {
+                    (tool == "session_prompt" && turn.is_some() && status != "queued").then(|| "turn".into())
+                });
+                operations.push(json!({"position":pos,"operation_id":row.get::<_,String>(1)?,"tool":tool,
+                    "state":status,"turn_id":turn,
+                    "delivery":delivery,"admission":row.get::<_,Option<String>>(8)?,
+                    "withdrawable":status=="queued"&&row.get::<_,bool>(6)?,"text":excerpt,"text_truncated":full.is_some_and(|s|s.len()>512)}));
+                position = Some(pos);
+            }
+            let next = position.filter(|_| operations.len() == q.limit as usize);
+            json!({"operations":operations,"next_cursor":next})
         }
         "runtime_catalog" => {
             let q: Catalog = decode(args)?;
@@ -596,6 +614,7 @@ pub(crate) fn dispatch_answers(state: &AppState) -> Result<()> {
                     tool: r.get(3)?,
                     session_id: r.get(4)?,
                     turn_id: r.get(5)?,
+                    resolved_prompt: None,
                 },
                 r.get::<_, String>(6)?,
                 r.get::<_, String>(7)?,
