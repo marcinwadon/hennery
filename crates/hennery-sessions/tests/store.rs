@@ -3175,6 +3175,8 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
              source_events,kind,incident,accepted_revision,created_at,deadline,required_config)
              SELECT owner_id, 'delete-delivery', 'family-child', 's1', 's1', hat_id, 0, '[0]', 'turn_ended',
              'delete-incident', 1, 0, 300, '{}' FROM sessions WHERE id = 's1';
+         INSERT INTO session_workspaces(owner_id,host_id,id,root,repository,branch,base_commit)
+             SELECT owner_id,host_id,'shared-workspace',cwd,cwd,'workspace-branch','base' FROM sessions WHERE id='s1';
          INSERT INTO runtime_catalog(owner_id,host_id,hat_id,cwd,agent,adapter_revision,catalog,saved_at,observation,source_session_id,defaults_source_session_id)
              SELECT owner_id,host_id,hat_id,cwd || '/' || id,agent,'pin',
              json_object('agent',agent,'adapter_revision','pin','config_options',json_array(json_object('id','model','type','select','currentValue','small','options',json_array(json_object('value','small')))),
@@ -3216,6 +3218,7 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         "session_operations",
         "session_dispatch_queue",
         "session_attach_evidence",
+        "session_workspace_members",
         "external_client_sessions",
         "external_operations",
         "external_uploads",
@@ -3271,6 +3274,16 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         assert_eq!(*n, left, "{table}: {after:?}");
     }
     assert_eq!(event_kinds(&conn, "s1"), ["session_deleted"]);
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM session_workspaces WHERE id='shared-workspace'",
+            [],
+            |row| { row.get::<_, i64>(0) }
+        )
+        .unwrap(),
+        1,
+        "shared workspace ownership survives transcript deletion"
+    );
     assert_eq!(
         conn.query_row("SELECT lifecycle FROM sessions WHERE id = 'family-child'", [], |row| {
             row.get::<_, String>(0)

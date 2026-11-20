@@ -1,3 +1,4 @@
+import WorkspaceInventory from '../components/WorkspaceInventory'
 import { hats as listHats } from '../api/manage'
 import { useClient } from '../app-client'
 import AccountSettings, { AccountLogins } from '../components/AccountSettings'
@@ -19,6 +20,7 @@ export default function Settings({ push, sessions }: { push: boolean; sessions: 
     <header className="manage-head"><h1>Settings</h1></header>
     <p className="manage-subtitle">Your account, browser and collector preferences.</p>
     <AccountSettings />
+    {sessions && <WorkspaceInventory />}
     {sessions && <p><Link to="/external-mcp">Manage external MCP client access</Link></p>}
     {push && <NotificationSettings push={push} sessions={sessions} />}
     <CollectorSettings push={push} sessions={sessions} hats={hats.data} />

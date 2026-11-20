@@ -566,6 +566,7 @@ async fn serve(mut socket: WebSocket, state: AppState, nonce: [u8; 32], permit: 
             | HostFrame::Directory { .. }
             | HostFrame::File { .. }
             | HostFrame::FilesForgotten { .. }
+            | HostFrame::WorkspaceResult { .. }
             | HostFrame::ResolvedPath { .. }
             | HostFrame::SessionForgotten { .. }) => {
                 state.hub.probe_reply(&host_id, conn_id, frame);

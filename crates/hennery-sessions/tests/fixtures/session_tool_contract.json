@@ -27,7 +27,7 @@
     },
     {
       "name": "session_spawn",
-      "description": "Spawn one direct child in a selected runtime. With Delegation on, you may pick any model, mode and option in the child runtime's catalog (session_capabilities), including modes that don't ask for permission (Claude bypassPermissions, Codex agent-full-access). If mode is omitted, inherit the parent's mode for the same runtime, or map installed Claude bypassPermissions to Codex agent-full-access (and vice versa) across runtimes when offered; otherwise use the runtime default. No provider or model substitute is used. The brief waits for confirmed configuration. Permission requests raised by a child go to the operator; the parent cannot answer them. Children cannot spawn grandchildren. Mutations use a durable operation_key scoped to this caller session across tool names, including token rotation. Retry the same canonical typed request with the same key to retrieve its receipt; changed requests return operation_conflict. Delivery is not completion.",
+      "description": "Spawn one direct child in a selected runtime. Shares cwd by default; worktree_base explicitly creates an isolated worktree from that committed revision without local changes. With Delegation on, you may pick any model, mode and option in the child runtime's catalog (session_capabilities), including modes that don't ask for permission (Claude bypassPermissions, Codex agent-full-access). If mode is omitted, inherit the parent's mode for the same runtime, or map installed Claude bypassPermissions to Codex agent-full-access (and vice versa) across runtimes when offered; otherwise use the runtime default. No provider or model substitute is used. The brief waits for confirmed configuration. Permission requests raised by a child go to the operator; the parent cannot answer them. Children cannot spawn grandchildren. Mutations use a durable operation_key scoped to this caller session across tool names, including token rotation. Retry the same canonical typed request with the same key to retrieve its receipt; changed requests return operation_conflict. Delivery is not completion.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "SpawnArgs",
@@ -57,6 +57,12 @@
           },
           "config": {
             "$ref": "#/$defs/ConfigFields"
+          },
+          "worktree_base": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false,

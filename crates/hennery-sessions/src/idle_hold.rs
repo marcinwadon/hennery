@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 
 const STATE: &str = "SELECT s.idle_pinned,
  EXISTS(SELECT 1 FROM session_families f JOIN sessions c ON c.owner_id = ?1 AND c.id=f.child_id
-        WHERE f.owner_id = ?1 AND f.parent_id=s.id AND c.lifecycle NOT IN ('parked','closed','failed','deleted')),
+        WHERE f.owner_id = ?1 AND f.parent_id=s.id AND c.lifecycle NOT IN ('parked','closed','archived','failed','deleted')),
  EXISTS(SELECT 1 FROM delegation_notices n WHERE n.owner_id = ?1 AND n.parent_id=s.id
         AND n.state IN ('parent_queued','waiting_config','awaiting_reconciliation'))
  FROM sessions s WHERE s.owner_id = ?1 AND s.id=?2 AND s.lifecycle<>'deleted'

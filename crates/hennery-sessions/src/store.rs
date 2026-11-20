@@ -485,6 +485,7 @@ END;",
     // The hook sets the latest start or resume applied (skills spec §8).
     "ALTER TABLE sessions ADD COLUMN hook_sets_applied TEXT NOT NULL DEFAULT '[]';",
     include_str!("external_steering.sql"),
+    include_str!("workspaces.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -1249,7 +1250,7 @@ fn close_session_in(tx: &Transaction<'_>, owner: &str, session_id: &str) -> Resu
         .optional()?;
     let mut events = Vec::new();
     if let Some((lifecycle, close_requested, open_turn)) = row
-        && lifecycle != "closed"
+        && !matches!(lifecycle.as_str(), "closed" | "archived")
     {
         let ts = now();
         if let Some(turn) = open_turn.as_deref() {
@@ -1422,7 +1423,7 @@ pub(crate) fn read_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionItem> 
 }
 
 /// Every lifecycle a session can be in (ACP core §4.2).
-pub const LIFECYCLES: [&str; 5] = ["starting", "active", "parked", "closed", "failed"];
+pub const LIFECYCLES: [&str; 6] = ["starting", "active", "parked", "closed", "failed", "archived"];
 
 /// The session list's page size when none is asked for, and the largest
 /// it serves (plan 6b decision 8).
@@ -1508,7 +1509,7 @@ fn like_pattern(search: &str) -> String {
 /// owner's sessions after the cursor `(?2, ?3)`, in one of the lifecycles
 /// `?4`…`?8` (a NULL slot matches nothing), matching the pattern `?9`
 /// unless it is NULL.
-const LIST_FILTERS: &str = "owner_id = ?1 AND (last_event_at, id) < (?2, ?3) AND lifecycle IN (?4, ?5, ?6, ?7, ?8)
+const LIST_FILTERS: &str = "owner_id = ?1 AND (last_event_at, id) < (?2, ?3) AND lifecycle IN (?4, ?5, ?6, ?7, ?8, ?12)
              AND (?9 IS NULL OR title LIKE ?9 ESCAPE '\\' OR cwd LIKE ?9 ESCAPE '\\'
                   OR git_branch LIKE ?9 ESCAPE '\\' OR id LIKE ?9 ESCAPE '\\'
                   OR agent_session_id LIKE ?9 ESCAPE '\\')";
@@ -2590,7 +2591,7 @@ impl Store {
             None => ("\u{10FFFF}", ""),
         };
         let pattern = query.search.map(like_pattern);
-        let slots: [Option<&str>; 5] = match query.lifecycles.filter(|_| pattern.is_none()) {
+        let slots: [Option<&str>; 6] = match query.lifecycles.filter(|_| pattern.is_none()) {
             Some(named) => std::array::from_fn(|i| named.get(i).copied()),
             None => LIFECYCLES.map(Some),
         };
@@ -2608,7 +2609,8 @@ impl Store {
                 slots[4],
                 pattern,
                 limit + 1,
-                query.hat
+                query.hat,
+                slots[5]
             ],
             read_item,
         )?;
@@ -3383,7 +3385,7 @@ impl Store {
         let mcp = self.mcp();
         let mut cut = Cut::default();
         let mut unconfirmed = false;
-        if lifecycle != "closed" {
+        if !matches!(lifecycle.as_str(), "closed" | "archived") {
             match unattached {
                 Some(judged) if judged.lifecycle == lifecycle && judged.presumed_parked == presumed => {
                     cut = close_in(&tx, &self.owner, mcp.as_ref(), session_id)?.1;
@@ -3491,7 +3493,7 @@ impl Store {
         )?;
         let event = collector_event(&tx, &self.owner, session_id, "session_deleted", json!({}), &now())?;
         let scrubbed = tx.execute(
-            "UPDATE sessions SET lifecycle = 'deleted', cwd = '', agent = '', title = NULL,
+            "UPDATE sessions SET lifecycle = 'deleted', managed_workspace_id = NULL, cwd = '', agent = '', title = NULL,
              agent_title = NULL, prompt_title = NULL, title_source = NULL, configuration_error = NULL, git_branch = NULL, project_root = NULL,
                  git_dirty = NULL, git_worktree = NULL, base_commit = NULL, model = NULL, mode = NULL,
                  config_axes = NULL, agent_session_id = NULL, failure_reason = NULL, hat_rule_id = NULL,
@@ -4413,7 +4415,7 @@ impl Store {
                 )?;
                 // A presumed-parked session is still attached as far as its
                 // host's facts go (ACP core §5.3).
-                let terminal_operator: bool = matches!(lifecycle.as_str(), "closed" | "failed") && tx.query_row(
+                let terminal_operator: bool = matches!(lifecycle.as_str(), "closed" | "archived" | "failed") && tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM session_operations WHERE owner_id = ?1 AND child_id=?2 AND turn_id=?3 AND tool='operator_prompt' AND state='failed')",
                     params![self.owner_id(), session_id, turn_id], |r| r.get(0),
                 )?;
@@ -4970,7 +4972,7 @@ impl Store {
         let rows: Vec<(String, String, Option<String>, bool, bool)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, lifecycle, open_turn_id, close_requested, presumed_parked FROM sessions
-                 WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed', 'deleted') OR presumed_parked = 1)
+                 WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed', 'archived', 'deleted') OR presumed_parked = 1)
                      AND owner_id = ?2
                  ORDER BY id",
             )?;
@@ -5065,7 +5067,7 @@ impl Store {
                 // Nothing is written for a tombstone (plan 9a decision 4): its
                 // host is told to close the adapter, and its answer, a
                 // `session_closed` or `not_attached`, changes nothing.
-                ("closed" | "deleted", Some(_)) => out.close.push(id),
+                ("closed" | "archived" | "deleted", Some(_)) => out.close.push(id),
                 _ => {}
             }
         }
@@ -5805,7 +5807,8 @@ mod tests {
                     None::<String>,
                     pattern,
                     50,
-                    by_hat.then_some("hat-1")
+                    by_hat.then_some("hat-1"),
+                    None::<String>
                 ],
                 |r| r.get(3),
             )

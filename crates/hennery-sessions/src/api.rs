@@ -75,6 +75,17 @@ const _: () = assert!(
 /// Every route here is an operator's (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
+        .route("/api/workspaces", get(crate::workspaces::inventory))
+        .route(
+            "/api/workspaces/{id}/discard",
+            post(crate::workspaces::discard.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
+        )
+        .route("/api/workspace-preview", post(crate::workspaces::preview))
+        .route(
+            "/api/workspace-profile",
+            get(crate::workspaces::read_profile)
+                .put(crate::workspaces::save_profile.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
+        )
         .route("/api/sessions", post(start_session).get(list_sessions))
         // Step-up is layered on `delete` alone (`Handler::layer`, as in
         // hats.rs), so GET and PATCH are as they were; PATCH checks it
@@ -85,6 +96,8 @@ pub fn router(state: AppState) -> Router {
                 .patch(update_session)
                 .delete(delete_session.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
         )
+        .route("/api/sessions/{id}/workspace", get(crate::workspaces::detail))
+        .route("/api/sessions/{id}/archive", post(crate::workspaces::archive))
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/new-like-this", post(new_like_this))
         // The one route that reads more than axum's default 2 MB (plan 6a).
@@ -362,13 +375,65 @@ const NEVER_CONNECTED: &str = "the host has not connected since it was paired; o
      agents (a few hundred MB) before it connects, which can take minutes, so try again once the Hosts view shows it \
      connected";
 
-async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<StartSessionRequest>) -> Response {
-    start_in_hat(state, req, None, None).await
+#[derive(serde::Deserialize)]
+struct WorkspaceStart {
+    #[serde(flatten)]
+    session: StartSessionRequest,
+    workspace: Option<WorkspaceOptions>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceOptions {
+    base: String,
+    #[serde(default)]
+    files: Vec<String>,
+    command: Option<String>,
+}
+async fn start_session(
+    State(state): State<AppState>,
+    Extension(auth): Extension<Authenticated>,
+    ApiJson(mut req): ApiJson<WorkspaceStart>,
+) -> Response {
+    if let Some(workspace) = req.workspace {
+        if workspace.command.is_some() && !auth.stepped_up(hennery_kernel::secret::unix_now()) {
+            return hennery_kernel::auth::step_up_required();
+        }
+        match crate::workspaces::provision(
+            &state,
+            crate::workspaces::CreateRequest {
+                id: None,
+                host_id: req.session.host_id.clone(),
+                cwd: req.session.cwd.clone(),
+                base: workspace.base,
+                files: workspace.files,
+                command: workspace.command,
+            },
+        )
+        .await
+        {
+            Ok(cwd) => req.session.cwd = cwd,
+            Err(err) => return error(StatusCode::CONFLICT, "workspace_failed", err.to_string()),
+        }
+    }
+    start_in_hat(state, req.session, None, None).await
 }
 
 /// Copy only the last reported launch settings. Normal creation gives this
 /// session its own history, family identity, MCP delivery, title and idle hold.
-async fn new_like_this(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn new_like_this(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Extension(auth): Extension<Authenticated>,
+    body: axum::body::Bytes,
+) -> Response {
+    let options: Option<WorkspaceOptions> = if body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(options) => options,
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid", "invalid workspace options"),
+        }
+    };
     let source = match state.store.find_session(&id) {
         Ok(Some(source)) => source,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
@@ -381,12 +446,35 @@ async fn new_like_this(State(state): State<AppState>, Path(id): Path<String>) ->
             "the source session has no reported configuration to copy; start a session with reviewed settings instead",
         );
     }
+    let cwd = if let Some(options) = options {
+        if options.command.is_some() && !auth.stepped_up(hennery_kernel::secret::unix_now()) {
+            return hennery_kernel::auth::step_up_required();
+        }
+        match crate::workspaces::provision(
+            &state,
+            crate::workspaces::CreateRequest {
+                id: None,
+                host_id: source.host_id.clone(),
+                cwd: source.cwd.clone(),
+                base: options.base,
+                files: options.files,
+                command: options.command,
+            },
+        )
+        .await
+        {
+            Ok(cwd) => cwd,
+            Err(err) => return error(StatusCode::CONFLICT, "workspace_failed", err.to_string()),
+        }
+    } else {
+        source.cwd
+    };
     start_in_hat(
         state,
         StartSessionRequest {
             host_id: source.host_id,
             agent: source.agent,
-            cwd: source.cwd,
+            cwd,
             config: source.config,
         },
         Some(source.hat_id),
@@ -1804,7 +1892,7 @@ async fn close_through_host_authorized(
     };
     let reachable = state.hub.is_ready(&session.host_id);
     match session.lifecycle.as_str() {
-        "closed" => return Closing::Closed,
+        "closed" | "archived" => return Closing::Closed,
         "starting" if reachable => {
             return Closing::Answer(error(
                 StatusCode::CONFLICT,

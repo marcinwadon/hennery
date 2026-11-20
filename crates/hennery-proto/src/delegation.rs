@@ -101,6 +101,8 @@ tool_args! {
 tool_args! {
     /// Start one independently configured direct child, without provider fallback.
     pub struct SpawnArgs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub worktree_base: Option<String>,
         pub operation_key: String,
         pub cwd: String,
         pub brief: String,

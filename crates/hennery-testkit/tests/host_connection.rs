@@ -836,6 +836,7 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
             Capability::Files,
             Capability::Projects,
             Capability::ResolvePath,
+            Capability::Workspaces,
             Capability::ForgetSession,
             Capability::McpServers,
             Capability::McpSourcePolicy,

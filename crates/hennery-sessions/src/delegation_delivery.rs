@@ -8,7 +8,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 pub(crate) fn record_in(tx: &Transaction<'_>, owner: &str, event: &EventDto) -> Result<()> {
     let closing: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sessions WHERE owner_id = ?1 AND id=?2
-        AND (close_requested=1 OR lifecycle IN ('closed','deleted')))",
+        AND (close_requested=1 OR lifecycle IN ('closed','archived','deleted')))",
         params![owner, event.session_id],
         |r| r.get(0),
     )?;
@@ -84,7 +84,7 @@ pub(crate) fn record_in(tx: &Transaction<'_>, owner: &str, event: &EventDto) -> 
     };
     let parent_closed: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sessions WHERE owner_id = ?1 AND id=?2
-        AND (close_requested=1 OR lifecycle IN ('closed','deleted')))",
+        AND (close_requested=1 OR lifecycle IN ('closed','archived','deleted')))",
         params![owner, parent],
         |r| r.get(0),
     )?;

@@ -402,6 +402,12 @@
       "description": "A feature a host implements, announced in `hello` (ACP core §3.3). The\ncollector never sends a frame that needs a capability to a host that\nlacks it.",
       "oneOf": [
         {
+          "enum": [
+            "workspaces"
+          ],
+          "type": "string"
+        },
+        {
           "const": "plugin_context",
           "description": "Optional typed context in the same ACP prompt as user input.",
           "type": "string"
@@ -742,6 +748,24 @@
     "CollectorFrame": {
       "description": "Collector -> host.",
       "oneOf": [
+        {
+          "properties": {
+            "operation": true,
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "workspace",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "operation"
+          ],
+          "type": "object"
+        },
         {
           "properties": {
             "request_id": {
@@ -2893,6 +2917,24 @@
     "HostFrame": {
       "description": "Host -> collector.",
       "oneOf": [
+        {
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "result": true,
+            "type": {
+              "const": "workspace_result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "result"
+          ],
+          "type": "object"
+        },
         {
           "description": "Negotiated by HELLO_AUTH_HEADER=1; followed by the ordinary full Hello.",
           "properties": {
@@ -7813,6 +7855,12 @@
         },
         "operation_key": {
           "type": "string"
+        },
+        "worktree_base": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

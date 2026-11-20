@@ -33,7 +33,7 @@ impl std::error::Error for LimitRefusal {}
 pub(crate) fn live_sessions_in(conn: &Connection, owner: &str, client_id: &str) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM external_client_sessions x JOIN sessions s ON s.owner_id=x.owner_id AND s.id=x.session_id
-         WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','deleted','failed') AND s.close_requested = 0",
+         WHERE x.owner_id = ?1 AND x.client_id=?2 AND s.lifecycle NOT IN ('closed','archived','deleted','failed') AND s.close_requested = 0",
         params![owner, client_id],
         |r| r.get(0),
     )?)

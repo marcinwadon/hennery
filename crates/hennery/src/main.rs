@@ -534,6 +534,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     hennery_sessions::sweep::after_startup(&state);
     hennery_sessions::files::start_cleanup(&state);
     hennery_sessions::delegation_worker::after_startup(&state);
+    hennery_sessions::workspaces::after_startup(&state);
     hennery_sessions::external_control::after_startup(&state);
     let listeners = listeners
         .into_iter()

@@ -416,6 +416,7 @@ async fn handshake(
                 Capability::Files,
                 Capability::Projects,
                 Capability::ResolvePath,
+                Capability::Workspaces,
                 Capability::ForgetSession,
                 Capability::McpServers,
                 Capability::McpSourcePolicy,
@@ -864,6 +865,34 @@ fn handle(
     frame: CollectorFrame,
 ) -> Result<()> {
     match frame {
+        CollectorFrame::Workspace { request_id, operation } => {
+            if operation["kind"] == "cleanup"
+                && sessions
+                    .lock()
+                    .expect("sessions lock")
+                    .handles
+                    .values()
+                    .any(|h| !h.is_ended() && operation["root"].as_str().is_none_or(|root| h.cwd.starts_with(root)))
+            {
+                uplink.reply(HostFrame::WorkspaceResult {
+                    request_id,
+                    result: serde_json::json!({"error":"host has attached sessions; cleanup deferred"}),
+                });
+                return Ok(());
+            }
+            let uplink = uplink.clone();
+            let roots = cfg.workspace_roots.clone();
+            tokio::spawn(async move {
+                let result = crate::workspace::operate(operation, &roots).await;
+                uplink.reply(HostFrame::WorkspaceResult {
+                    request_id,
+                    result: match result {
+                        Ok(value) => value,
+                        Err(err) => serde_json::json!({"error":err.to_string()}),
+                    },
+                });
+            });
+        }
         CollectorFrame::SetIdleTimeout { seconds } => {
             let mut map = sessions.lock().expect("sessions lock");
             map.idle_timeout_secs = seconds;

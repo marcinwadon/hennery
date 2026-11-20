@@ -220,9 +220,9 @@ impl Store {
         )?;
         let operation = uuid::Uuid::now_v7().to_string();
         tx.execute("INSERT INTO session_operations(owner_id,caller_id,operation_key,operation_id,digest,tool,child_id,request_id,state)
-            VALUES (?1,?2,?3,?4,?5,'session_close',?6,?4,?7)",params![self.owner_id(),caller.session_id(),key,operation,digest,child,if lifecycle=="closed" {"completed"}else{"awaiting_reconciliation"}])?;
-        tx.execute("UPDATE sessions SET close_requested = 1 WHERE owner_id = ?1 AND id = ?2 AND lifecycle NOT IN ('closed','deleted')",params![self.owner_id(),child])?;
-        let event = if lifecycle != "closed" {
+            VALUES (?1,?2,?3,?4,?5,'session_close',?6,?4,?7)",params![self.owner_id(),caller.session_id(),key,operation,digest,child,if matches!(lifecycle.as_str(),"closed"|"archived") {"completed"}else{"awaiting_reconciliation"}])?;
+        tx.execute("UPDATE sessions SET close_requested = 1 WHERE owner_id = ?1 AND id = ?2 AND lifecycle NOT IN ('closed','archived','deleted')",params![self.owner_id(),child])?;
+        let event = if !matches!(lifecycle.as_str(), "closed" | "archived") {
             Some(crate::store::collector_event(
                 &tx,
                 self.owner_id(),

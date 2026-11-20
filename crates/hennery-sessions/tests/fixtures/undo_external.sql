@@ -1,3 +1,19 @@
+-- Rewind managed workspaces (v49) before rebuilding a historical fixture.
+DROP TRIGGER workspace_member_admission;
+DROP TRIGGER workspace_remember_member;
+DROP TRIGGER workspace_member_immutable;
+DROP TRIGGER workspace_cleanup_fence;
+DROP TRIGGER workspace_member_release;
+DROP TRIGGER workspace_existing_users;
+DROP TRIGGER workspace_session_admission;
+DROP TRIGGER workspace_archive_terminal;
+DROP TRIGGER workspace_archive_cleanup;
+DROP TRIGGER workspace_archive_notices;
+DROP TABLE session_workspace_members;
+DROP TABLE session_workspaces;
+DROP TABLE workspace_provisioning;
+DROP TABLE workspace_profiles;
+ALTER TABLE sessions DROP COLUMN managed_workspace_id;
 DROP VIEW external_steering_receipts;
 DROP TRIGGER external_steering_deleted;
 DROP VIEW external_prompt_heads;

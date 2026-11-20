@@ -279,6 +279,7 @@ pub struct Launch {
 /// The connection task's handle on a session actor.
 #[derive(Clone)]
 pub struct SessionHandle {
+    pub(crate) cwd: PathBuf,
     mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     /// The `content_hash` of each hook set the actor was launched with, in
     /// delivery order: a live actor keeps its adapter's hooks.
@@ -576,12 +577,14 @@ fn launch_inner(
     };
     let done = CancellationToken::new();
     let mcp_source_policy = launch.mcp_source_policy.clone();
+    let cwd = launch.cwd.clone();
     let finished = done.clone().drop_guard();
     tokio::spawn(async move {
         let _finished = finished;
         actor.run(launch, rx).await;
     });
     SessionHandle {
+        cwd,
         mcp_source_policy,
         hook_set_hashes,
         attach_generation,
@@ -3306,6 +3309,7 @@ mod tests {
         let (commands, receiver) = mpsc::unbounded_channel();
         (
             SessionHandle {
+                cwd: PathBuf::from("/test"),
                 mcp_source_policy: None,
                 hook_set_hashes: vec![],
                 attach_generation: Some(1),

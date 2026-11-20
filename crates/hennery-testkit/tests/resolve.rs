@@ -168,12 +168,12 @@ async fn new_like_this_copies_reported_configuration_into_a_fresh_empty_session(
     );
     let mut host = ScriptedHost::connect(&collector).await;
     let source = collector.state.store.find_session("like-source").unwrap().unwrap();
-    let call = send(
-        &collector,
-        "POST",
-        "/api/sessions/like-source/new-like-this",
-        json!({"model":"ignored","cwd":"/elsewhere"}),
-    );
+    let client = hennery_testkit::operator_client(&collector.state.operator);
+    let url = collector.url("/api/sessions/like-source/new-like-this");
+    let call = tokio::spawn(async move {
+        let resp = client.post(url).timeout(Duration::from_secs(15)).send().await.unwrap();
+        (resp.status().as_u16(), resp.json::<Value>().await.unwrap())
+    });
     assert_eq!(host.answer("/work/project", true).await, "/work/project");
     let CollectorFrame::StartSession {
         request_id,
@@ -252,6 +252,25 @@ async fn new_like_this_copies_reported_configuration_into_a_fresh_empty_session(
         collector.state.store.find_session("like-source").unwrap().unwrap(),
         source
     );
+}
+
+#[tokio::test]
+async fn new_like_this_refuses_unsupported_workspace_fields_without_allocating() {
+    let collector = Collector::start().await;
+    let hat = collector.hat("Project");
+    rule(&collector, "/work", &hat, true);
+    like_source(&collector, &hat);
+    let _host = ScriptedHost::connect(&collector).await;
+    for options in [
+        json!({"model":"ignored","cwd":"/elsewhere"}),
+        json!({"base":"main","cwd":"/elsewhere"}),
+    ] {
+        let (status, body) = send(&collector, "POST", "/api/sessions/like-source/new-like-this", options)
+            .await
+            .unwrap();
+        assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+        assert_eq!(session_count(&collector), 1);
+    }
 }
 
 #[tokio::test]
