@@ -12,7 +12,7 @@ repository = "https://github.com/marcinwadon/hennery"
 homepage = "https://github.com/marcinwadon/hennery"
 
 [workspace.dependencies]
-agent-client-protocol = { version = "=5.2.0", features = ["stdio", "unstable_end_turn_token_usage"] }
+agent-client-protocol = { version = "=5.4.0", features = ["stdio", "unstable_end_turn_token_usage"] }
 anyhow = "1"
 # Images in prompts (plan 6a): decoded at the collector.
 base64 = "=0.23.1"
@@ -45,7 +45,7 @@ p256 = { version = "=0.14.0", features = ["ecdsa", "ecdh"] }
 # Web Push: RFC 8188 records; RFC 8291 key agreement uses the patched p256.
 ece-native = "=0.5.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -69,11 +69,11 @@ ts-rs = { version = "12", features = ["serde-json-impl"] }
 url = "=2.5.8"
 uuid = { version = "1", features = ["v7", "serde"] }
 # Passkeys (plan 3c). Default features off: passkeys ask for no attestation.
-webauthn-rs = { version = "=0.5.5", default-features = false }
+webauthn-rs = { version = "=0.6.2", default-features = false }
 # The VAPID key's bytes (plan 10a) are wiped from memory once read.
-zeroize = "=1.9.1"
+zeroize = "=1.9.2"
 # Tests only: a software passkey, so no browser is needed.
-webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { version = "=0.6.2", features = ["softpasskey"] }
 # Report the actual linked crypto library; source installs use platform OpenSSL.
 openssl = "=0.10.82"
 hennery-proto = { path = "crates/hennery-proto", version = "=0.6.0" }
