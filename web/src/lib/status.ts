@@ -4,7 +4,7 @@
 // questions. Older summaries without counts retain their original marker.
 
 /** Operator attention is strongest; `fail` is a hollow red ring. */
-export type Tone = 'attn' | 'run' | 'wait' | 'idle' | 'fail'
+export type Tone = 'attn' | 'run' | 'wait' | 'idle' | 'fail' | 'background'
 
 export interface Marker {
   tone: Tone
@@ -23,6 +23,7 @@ export interface StatusInput {
   unseen?: { event_id: number }
   parent_handled_questions?: number
   family?: { child_counts: { active: number } }
+  background?: { active: number; done: number; all: number; stale?: boolean } | null
 }
 
 /**
@@ -54,6 +55,8 @@ export function statusOf(s: StatusInput): Marker {
     case 'starting':
       return { tone: 'wait', label: 'Starting', resume: false }
     case 'active':
+      if (s.activity === 'unknown' || s.activity === 'busy') return { tone: 'run', label: 'Busy', resume: false }
+      if (s.activity !== 'running' && (s.background?.active ?? 0) > 0) return { tone: 'background', label: 'Background', resume: false }
       return s.activity === 'running'
         ? { tone: 'run', label: 'Running', resume: false }
         : { tone: 'idle', label: 'Idle', resume: false }
@@ -63,9 +66,9 @@ export function statusOf(s: StatusInput): Marker {
   }
 }
 
-export const STATUS_FILTERS = ['all', 'attention', 'unseen', 'running', 'idle', 'parked', 'failed'] as const
+export const STATUS_FILTERS = ['all', 'attention', 'unseen', 'running', 'background', 'idle', 'parked', 'failed'] as const
 export type StatusFilter = typeof STATUS_FILTERS[number]
-export const STATUS_LABEL: Record<StatusFilter, string> = { all: 'All', attention: 'Needs you', unseen: 'Unseen', running: 'Running', idle: 'Idle', parked: 'Parked / offline', failed: 'Failed' }
+export const STATUS_LABEL: Record<StatusFilter, string> = { all: 'All', attention: 'Needs you', unseen: 'Unseen', running: 'Running', background: 'Background', idle: 'Idle', parked: 'Parked / offline', failed: 'Failed' }
 /** Modern operator counts are authoritative, including closed status-only work. */
 export function needsOperator(s: StatusInput): boolean { return (s.operator_attention ?? 0) > 0 }
 export function matchesStatus(s: StatusInput, filter: StatusFilter): boolean {
@@ -73,8 +76,9 @@ export function matchesStatus(s: StatusInput, filter: StatusFilter): boolean {
     case 'all': return true
     case 'attention': return needsOperator(s)
     case 'unseen': return !!s.unseen
-    case 'running': return s.lifecycle === 'active' && s.activity === 'running'
-    case 'idle': return s.lifecycle === 'active' && s.activity === 'idle'
+    case 'running': return s.lifecycle === 'active' && ['running', 'busy', 'unknown'].includes(s.activity ?? '')
+    case 'background': return s.lifecycle === 'active' && (s.activity === 'idle' || s.activity === 'background') && (s.background?.active ?? 0) > 0
+    case 'idle': return s.lifecycle === 'active' && s.activity === 'idle' && (s.background?.active ?? 0) === 0
     case 'parked': return s.lifecycle === 'parked' || s.presumed_parked
     case 'failed': return s.lifecycle === 'failed'
   }

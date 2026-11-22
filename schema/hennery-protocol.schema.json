@@ -1,5 +1,14 @@
 {
   "$defs": {
+    "AcpProtocolPreference": {
+      "description": "Requested ACP wire protocol. Existing records remain on v1.",
+      "enum": [
+        "v1",
+        "v2",
+        "v2-v1"
+      ],
+      "type": "string"
+    },
     "AgentHome": {
       "description": "Where an agent keeps its own data for a session, as its host resolved\nit from the adapter's environment (plan 9d decision 1): `root` is\nClaude's `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `CODEX_HOME` or\n`~/.codex`; `sqlite_root` is Codex's `CODEX_SQLITE_HOME` if set.\nCanonical, its bytes as the filesystem gave them (O11). A host's report\nis not verified by the collector beyond its shape (`is_well_formed`).",
       "properties": {
@@ -285,6 +294,66 @@
         "last_seen_at",
         "expires_at",
         "current"
+      ],
+      "type": "object"
+    },
+    "BackgroundInfo": {
+      "description": "One session as the session list shows it (ACP core §8, §9; frontend\n§5), read from `sessions` alone: never the catalogue, commands or plan\n(P-23). The detail serves it as stored; the list, `bounded`.",
+      "properties": {
+        "active": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "all": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "done": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/BackgroundItem"
+          },
+          "type": "array"
+        },
+        "stale": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "active",
+        "done",
+        "all",
+        "stale",
+        "items"
+      ],
+      "type": "object"
+    },
+    "BackgroundItem": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "kind"
       ],
       "type": "object"
     },
@@ -886,6 +955,9 @@
               "description": "A collector-accepted operator queue resume uses ordinary operator\npath authorization, while retaining the attach/configuration fence.",
               "type": "boolean"
             },
+            "protocol": {
+              "$ref": "#/$defs/AcpProtocolPreference"
+            },
             "request_id": {
               "type": "string"
             },
@@ -1064,6 +1136,9 @@
                 "null"
               ]
             },
+            "protocol": {
+              "$ref": "#/$defs/AcpProtocolPreference"
+            },
             "request_id": {
               "type": "string"
             },
@@ -1160,6 +1235,9 @@
                 "string",
                 "null"
               ]
+            },
+            "protocol": {
+              "$ref": "#/$defs/AcpProtocolPreference"
             },
             "request_id": {
               "type": "string"
@@ -3610,6 +3688,21 @@
     "Indexed": {
       "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).\n\nThe catalogue extracts (`config_options`, `current_model`,\n`current_mode`, `current_axes`) travel together: when `config_options`\nis present and not empty, the four are one snapshot of the adapter's\nconfig. An absent or empty `config_options` means \"no read-back\", never\n\"the adapter has no config\" (a response that failed to parse looks\nempty). A live `current_mode` without a snapshot is a mode-only delta;\nit never clears the model, other axes or option inventory. Early/replayed\nmode deltas are ignored.",
       "properties": {
+        "acp_fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acp_protocol": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "cache_retention": {
           "anyOf": [
             {
@@ -6956,6 +7049,9 @@
             "null"
           ]
         },
+        "protocol": {
+          "$ref": "#/$defs/AcpProtocolPreference"
+        },
         "session_id": {
           "type": "string"
         },
@@ -6994,6 +7090,9 @@
             "string",
             "null"
           ]
+        },
+        "protocol": {
+          "$ref": "#/$defs/AcpProtocolPreference"
         }
       },
       "type": "object"
@@ -7001,6 +7100,21 @@
     "SessionDetail": {
       "description": "`GET /api/sessions/{id}` (ACP core §9): the list item, as stored, the\nopen turn and the pending requests still open.",
       "properties": {
+        "acp_fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acp_protocol": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "activity": {
           "type": [
             "string",
@@ -7015,6 +7129,16 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundInfo"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "configuration_error": {
@@ -7215,8 +7339,22 @@
       "type": "object"
     },
     "SessionItem": {
-      "description": "One session as the session list shows it (ACP core §8, §9; frontend\n§5), read from `sessions` alone: never the catalogue, commands or plan\n(P-23). The detail serves it as stored; the list, `bounded`.",
       "properties": {
+        "acp_fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acp_protocol": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "activity": {
           "type": [
             "string",
@@ -7225,6 +7363,16 @@
         },
         "agent": {
           "type": "string"
+        },
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "created_at": {
           "description": "RFC 3339, UTC.",
@@ -7903,6 +8051,9 @@
             "string",
             "null"
           ]
+        },
+        "protocol": {
+          "$ref": "#/$defs/AcpProtocolPreference"
         }
       },
       "required": [

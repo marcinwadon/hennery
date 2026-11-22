@@ -17,6 +17,15 @@ function loaded(items: Item[], older = false): ItemsState {
 }
 
 describe('itemsReducer', () => {
+  it('keeps the newest cross-turn entity and pages by an explicit boundary', () => {
+    const state = itemsReducer(EMPTY_ITEMS, { type: 'loaded', page: {
+      ...page([message('entity', 'old', 1), message('entity', 'old', 8)], true),
+      before_turn: 'selected-page-group',
+    } })
+    expect(state.items).toHaveLength(1)
+    expect(state.items[0].version).toBe(8)
+    expect(beforeTurnOf(state)).toBe('selected-page-group')
+  })
   it('pins an older linked question, fences HTTP/SSE in both orders and deduplicates paging', () => {
     const question = (version: number) => ({ ...message('question:p', 'old', version, '2020-01-01T00:00:00Z'), kind: 'question' } as Item)
     let state = loaded([message('tail', 'new')], true)

@@ -425,6 +425,7 @@ pub fn launch_configuration(catalog: &HostCatalog, requested: &SessionConfig) ->
         required.mode.clone_from(&requested.mode);
     }
     required.axes.extend(requested.axes.clone());
+    required.protocol = requested.protocol;
     required
 }
 pub fn evidence_satisfies(
@@ -453,6 +454,7 @@ pub fn evidence_satisfies(
         && config_offered(
             catalog,
             &SessionConfig {
+                protocol: Default::default(),
                 cache_retention: Default::default(),
                 // Unrequested, nonsecurity settings may have current values outside
                 // an adapter's option list. They are not part of the release proof.

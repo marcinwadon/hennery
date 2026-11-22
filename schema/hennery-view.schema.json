@@ -47,6 +47,66 @@
       ],
       "type": "object"
     },
+    "BackgroundInfo": {
+      "description": "One session as the session list shows it (ACP core §8, §9; frontend\n§5), read from `sessions` alone: never the catalogue, commands or plan\n(P-23). The detail serves it as stored; the list, `bounded`.",
+      "properties": {
+        "active": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "all": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "done": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/BackgroundItem"
+          },
+          "type": "array"
+        },
+        "stale": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "active",
+        "done",
+        "all",
+        "stale",
+        "items"
+      ],
+      "type": "object"
+    },
+    "BackgroundItem": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "status",
+        "kind"
+      ],
+      "type": "object"
+    },
     "BackgroundWork": {
       "oneOf": [
         {
@@ -621,6 +681,51 @@
           "type": "object"
         },
         {
+          "properties": {
+            "command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "exit_code": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "terminal",
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "signal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "terminal_id",
+            "output"
+          ],
+          "type": "object"
+        },
+        {
           "description": "The agent's plan, as its latest update in the group left it.",
           "properties": {
             "entries": {
@@ -718,6 +823,13 @@
     "ItemPage": {
       "description": "`GET /api/view/sessions/{id}`: whole groups of a session's items,\noldest first.",
       "properties": {
+        "before_turn": {
+          "description": "Pagination boundary independent of cross-turn entity placement.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "epoch": {
           "description": "The collector's epoch: `?after=<epoch>:<revision>` on the item stream.",
           "type": "string"
@@ -1259,6 +1371,21 @@
     "SessionSummary": {
       "description": "One session in the view's list: the list item, bounded, and whether a\nquestion waits for the operator.",
       "properties": {
+        "acp_fallback": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "acp_protocol": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "activity": {
           "type": [
             "string",
@@ -1267,6 +1394,16 @@
         },
         "agent": {
           "type": "string"
+        },
+        "background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "configuration_error": {
           "type": [

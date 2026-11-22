@@ -486,6 +486,17 @@ END;",
     "ALTER TABLE sessions ADD COLUMN hook_sets_applied TEXT NOT NULL DEFAULT '[]';",
     include_str!("external_steering.sql"),
     include_str!("workspaces.sql"),
+    "ALTER TABLE sessions ADD COLUMN background_state TEXT;
+     ALTER TABLE sessions ADD COLUMN background_info TEXT;
+     ALTER TABLE sessions ADD COLUMN acp_protocol INTEGER;
+     ALTER TABLE sessions ADD COLUMN acp_fallback TEXT;
+     CREATE TABLE acp_view_entities(owner_id TEXT NOT NULL, session_id TEXT NOT NULL, entity_key TEXT NOT NULL, item TEXT NOT NULL, terminal_bytes TEXT NOT NULL, last_event INTEGER NOT NULL, PRIMARY KEY(owner_id,session_id,entity_key), FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE);
+     CREATE TABLE acp_view_refs(event_id INTEGER PRIMARY KEY REFERENCES events(event_id) ON DELETE CASCADE,owner_id TEXT NOT NULL,session_id TEXT NOT NULL,entity_key TEXT NOT NULL,group_id TEXT NOT NULL,prefix TEXT NOT NULL,seed TEXT,terminal_bytes TEXT);
+     CREATE INDEX acp_view_group ON acp_view_refs(owner_id,session_id,entity_key,group_id);
+     CREATE TRIGGER acp_view_scrub AFTER UPDATE OF lifecycle ON sessions WHEN NEW.lifecycle='deleted' BEGIN
+       DELETE FROM acp_view_entities WHERE owner_id=NEW.owner_id AND session_id=NEW.id;
+       DELETE FROM acp_view_refs WHERE owner_id=NEW.owner_id AND session_id=NEW.id;
+     END;",
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -1365,6 +1376,16 @@ pub(crate) fn one_line(raw: &str, max_chars: usize, max_json_bytes: usize) -> Op
 /// (decision 2). The commands replace the stored list, and never touch the
 /// config catalogue (decision 3).
 fn store_state(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed: &Indexed, ts: &str) -> Result<()> {
+    if let Some(version) = indexed.acp_protocol {
+        tx.execute(
+            "UPDATE sessions SET acp_protocol=?3,acp_fallback=?4,
+            background_info=json_set(background_info,'$.stale',json('true')),
+            background_state=json_set(background_state,'$.reported',json('false'))
+            WHERE owner_id=?1 AND id=?2",
+            params![owner, session_id, version, indexed.acp_fallback],
+        )?;
+    }
+
     if let Some(title) = indexed.title.as_deref() {
         let title = one_line(title, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES);
         tx.execute(
@@ -1390,11 +1411,24 @@ fn store_state(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed: &In
 
 /// The columns of a list item, in `read_item`'s order.
 const SESSION_ITEM_COLUMNS: &str = "id, host_id, agent, cwd, title, lifecycle, activity, failure_reason,
-     presumed_parked, git_branch, git_dirty, model, mode, created_at, last_event_at, hat_id, title_source, project_root, sidebar_pinned";
+     presumed_parked, git_branch, git_dirty, model, mode, created_at, last_event_at, hat_id, title_source, project_root, sidebar_pinned, background_info, acp_protocol, acp_fallback";
 
 /// A row of `SESSION_ITEM_COLUMNS` as a list item, as stored.
 pub(crate) fn read_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionItem> {
     Ok(SessionItem {
+        background: {
+            let mut info = r
+                .get::<_, Option<String>>(19)?
+                .and_then(|s| serde_json::from_str::<hennery_proto::rest::BackgroundInfo>(&s).ok());
+            if (r.get::<_, String>(5)? != "active" || r.get::<_, bool>(8)?)
+                && let Some(info) = &mut info
+            {
+                info.stale = true;
+            }
+            info
+        },
+        acp_protocol: r.get(20)?,
+        acp_fallback: r.get(21)?,
         session_id: r.get(0)?,
         sidebar_pinned: r.get(18)?,
         host_id: r.get(1)?,
@@ -1599,6 +1633,7 @@ fn resolve_pending(
     tx.execute(
         "UPDATE sessions SET activity = 'running'
          WHERE id = ?1 AND activity = 'blocked' AND owner_id = ?2
+             AND COALESCE(acp_protocol,1)<>2
              AND NOT EXISTS (SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open' AND owner_id = ?2)",
         [session_id, owner],
     )?;
@@ -2475,6 +2510,7 @@ impl Store {
             return Ok(None);
         };
         row.config = stored_config(config)?;
+        row.config.protocol = crate::background::requested_protocol(&self.conn(), &self.owner, id)?;
         row.config.cache_retention = self.requested_retention(id)?;
         Ok(Some(row))
     }
@@ -2736,7 +2772,11 @@ impl Store {
             session_id: session_id.to_string(),
             config_options: list(options)?,
             commands: list(commands)?,
-            current: stored_config(config)?,
+            current: {
+                let mut config = stored_config(config)?;
+                config.protocol = crate::background::requested_protocol(conn, &self.owner, session_id)?;
+                config
+            },
         }))
     }
 
@@ -3032,6 +3072,7 @@ impl Store {
         let changed = tx.execute(
             "UPDATE sessions SET open_turn_id = ?2
              WHERE id = ?1 AND lifecycle = 'active' AND open_turn_id IS NULL AND owner_id = ?3
+             AND COALESCE(activity,'idle') NOT IN ('running','blocked')
              AND close_requested = 0 AND prompt_queue_held=0
              AND NOT EXISTS(SELECT 1 FROM hosts h WHERE h.owner_id = ?3 AND h.id=sessions.host_id AND h.revoked_at IS NOT NULL)
              AND NOT EXISTS(SELECT 1 FROM purged_hats p
@@ -3497,6 +3538,7 @@ impl Store {
              agent_title = NULL, prompt_title = NULL, title_source = NULL, configuration_error = NULL, git_branch = NULL, project_root = NULL,
                  git_dirty = NULL, git_worktree = NULL, base_commit = NULL, model = NULL, mode = NULL,
                  config_axes = NULL, agent_session_id = NULL, failure_reason = NULL, hat_rule_id = NULL,
+                 background_state = NULL, background_info = NULL, acp_protocol = NULL, acp_fallback = NULL,
                  open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0, agent_home = NULL,
                  mcp_delivery_mode = NULL, mcp_delivery_servers = NULL, mcp_delivery_at = NULL,
                  mcp_source_requested = NULL, mcp_source_applied = NULL,
@@ -3879,6 +3921,7 @@ impl Store {
         )?;
         let config = stored_config(config)?;
         let mut config = config;
+        config.protocol = crate::background::requested_protocol(&tx, &self.owner, session_id)?;
         config.cache_retention = crate::usage::retention_in(&tx, &self.owner, session_id)?;
         let (given, cut) = self.deliver_in(&tx, session_id, &host_id, &stored_hat, mcp, &ts)?;
         if let Some(command) = external {
@@ -4335,6 +4378,7 @@ impl Store {
                     )?;
                     // The catalogue after the start's switches (P-13).
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
+                    store_state(&tx, &self.owner, session_id, indexed, &ts)?;
                     tx.execute(
                         "UPDATE sessions SET cache_retention_attached=?3 WHERE owner_id = ?1 AND id=?2",
                         params![
@@ -4532,7 +4576,7 @@ impl Store {
                 // §4.4) must never be pushed to a caller — only the store
                 // knows whether the transition actually applied.
                 let applied = tx.execute(
-                    "UPDATE sessions SET open_turn_id = NULL, activity = 'idle'
+                    "UPDATE sessions SET open_turn_id = NULL, activity = CASE WHEN acp_protocol=2 THEN activity ELSE 'idle' END
                      WHERE id = ?1 AND open_turn_id = ?2 AND owner_id = ?3",
                     params![session_id, turn_id, self.owner],
                 )?;
@@ -4620,12 +4664,13 @@ impl Store {
                 if !fact_applies(&tx, &self.owner, session_id, indexed.turn_id.as_deref())? {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
-                } else {
+                } else if crate::background::root_payload(&tx, &self.owner, session_id, payload)? {
                     // A live `config_option_update` (the agent changed its
                     // own config); the host never sends a replayed one
                     // with extracts.
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
                     store_state(&tx, &self.owner, session_id, indexed, &ts)?;
+                    created.extend(crate::background::apply(&tx, &self.owner, session_id, payload, &ts)?);
                     crate::usage::observe_context_in(&tx, &self.owner, session_id, payload, indexed.early, &ts)?;
                 }
             }
@@ -4685,7 +4730,7 @@ impl Store {
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
                     let blocked = tx.execute(
-                        "UPDATE sessions SET activity = 'blocked' WHERE id = ?1 AND activity = 'running' AND owner_id = ?2",
+                        "UPDATE sessions SET activity = 'blocked' WHERE id = ?1 AND activity = 'running' AND owner_id = ?2 AND COALESCE(acp_protocol,1)<>2",
                         [session_id, &self.owner],
                     )?;
                     // Edge-triggered: only the question that blocks the
@@ -4923,6 +4968,9 @@ impl Store {
                 crate::delegation_delivery::record_in(&tx, &self.owner, event)?;
             }
         }
+        for event in &mut created {
+            crate::acp_view::project(&tx, &self.owner, event)?;
+        }
         commit_then_cut(tx, mcp.as_ref(), cut)?;
         Ok(Ingested { events: created, edge })
     }
@@ -5094,7 +5142,9 @@ impl Store {
         let rows = stmt.query_map(params![session_id, after, limit, self.owner], EventRow::read)?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?.event(session_id)?);
+            let mut event = row?.event(session_id)?;
+            crate::acp_view::enrich(conn, &self.owner, &mut event)?;
+            out.push(event);
         }
         Ok(out)
     }
@@ -5322,7 +5372,9 @@ impl Store {
         )?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?.event(session_id)?);
+            let mut event = row?.event(session_id)?;
+            crate::acp_view::enrich(&conn, &self.owner, &mut event)?;
+            out.push(event);
         }
         Ok(out)
     }

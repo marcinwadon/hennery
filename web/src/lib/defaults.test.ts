@@ -107,3 +107,13 @@ it('keeps every offered mode for unknown-security runtimes, including modes adde
   expect(result.sources.mode).toBe('Hat override')
   expect(result.blocked).toBe(false)
 })
+
+it('keeps host protocol preference outside adapter axes', async () => {
+  const { flatConfig, sparseConfig, resolveDefaults } = await import('./defaults')
+  expect(sparseConfig({ protocol: 'v2-v1', fast: false })).toEqual({ protocol: 'v2-v1', axes: { fast: false } })
+  expect(flatConfig({ protocol: 'v2' })).toEqual({ protocol: 'v2' })
+  const host = { agent: 'custom', adapter_revision: 'one', freshness: 'fresh', defaults: {}, config_options: [], security: { known: true, axes: {} } } as const
+  const result = resolveDefaults({ ...host, config_options: [] }, { protocol: 'v2' }, { protocol: 'v2-v1' })
+  expect(result.config).toEqual({ protocol: 'v2-v1' })
+  expect(result.blocked).toBe(false)
+})

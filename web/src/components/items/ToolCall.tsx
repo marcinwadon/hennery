@@ -16,6 +16,8 @@ const STATUS_WORDS: Record<string, string> = {
   pending: 'Pending',
   in_progress: 'Running',
   completed: 'Completed',
+  paused: 'Paused',
+  cancelled: 'Cancelled',
   failed: 'Failed',
 }
 
@@ -23,6 +25,8 @@ const STATUS_COLOUR: Record<string, string> = {
   pending: 'var(--fg-quiet)',
   in_progress: 'var(--st-wait)',
   completed: 'var(--st-run)',
+  paused: 'var(--st-wait)',
+  cancelled: 'var(--hn-fg-3)',
   failed: 'var(--st-attn)',
 }
 

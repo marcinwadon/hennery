@@ -146,8 +146,8 @@ describe('tool_call', () => {
   })
 
   it('shows a status it does not know as sent', () => {
-    show(item('tool_call', { tool_call_id: 'x', status: 'paused' }))
-    expect(screen.getByText('paused')).toBeInTheDocument()
+    show(item('tool_call', { tool_call_id: 'x', status: 'future-status' }))
+    expect(screen.getByText('future-status')).toBeInTheDocument()
   })
 
   function expanded(content: ToolContent[]) {
@@ -480,4 +480,10 @@ describe('an item of a kind this client does not know', () => {
     const { container } = show({ id: 'x', version: 1, ts: TS, kind: 'hologram' } as unknown as Item)
     expect(container.textContent).toContain('Unsupported item (hologram)')
   })
+})
+
+it('shows a closed background group summary directly in history', () => {
+  show(item('marker', { marker: 'host_note', reason: 'Background tasks finished', text: '4 succeeded · 1 failed · 0 cancelled · 0 unknown' }))
+  expect(screen.getByText('Background tasks finished')).toBeVisible()
+  expect(screen.getByText('4 succeeded · 1 failed · 0 cancelled · 0 unknown')).toBeVisible()
 })

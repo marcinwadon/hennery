@@ -47,7 +47,7 @@ export default function HatDefaultsSummary({ hatId, agents, compact = false }: {
     {!agent && <p className="hint">Choose a configured agent to inspect its saved overrides.</p>}
     {agent && !current && <p role="status">Loading saved defaults…</p>}
     {current?.error && <p role="alert">Unable to load saved defaults. <Text>{current.error}</Text> <button type="button" className="btn btn-ghost btn-sm" onClick={() => setRefresh(value => value + 1)}>Retry saved defaults</button></p>}
-    {entries && (entries.length ? <dl className="facts">{entries.map(([key, value]) => <Fragment key={key}><dt><Text>{key === 'model' ? 'Model' : key === 'mode' ? 'Permission mode' : key}</Text></dt><dd><Text>{valueLabel(null, key, value)}</Text></dd></Fragment>)}</dl> : <p>No saved overrides for this agent.</p>)}
+    {entries && (entries.length ? <dl className="facts">{entries.map(([key, value]) => <Fragment key={key}><dt><Text>{key === 'protocol' ? 'ACP protocol' : key === 'model' ? 'Model' : key === 'mode' ? 'Permission mode' : key}</Text></dt><dd><Text>{valueLabel(null, key, value)}</Text></dd></Fragment>)}</dl> : <p>No saved overrides for this agent.</p>)}
     <p className="hint">Saved overrides only. Availability and inherited values depend on the host; preview them in Defaults.</p>
     <Link className="defaults-link" to={`/defaults?hat=${encodeURIComponent(hatId)}${agent ? `&agent=${encodeURIComponent(agent)}` : ''}`}>Session defaults <span aria-hidden="true">→</span></Link>
   </div>

@@ -94,12 +94,13 @@ export function markerLabel(kind: string): string {
 export default function Marker({ item, env }: { item: MarkerItem; env: ItemEnv }) {
   const clock = clockTime(item.ts)
   const known = Object.hasOwn(MARKER_LABEL, item.marker)
+  const backgroundSummary = item.marker === 'host_note' && item.reason === 'Background tasks finished'
   const hat = (id: string | undefined) => (id ? (env.hatName?.(id) ?? id) : 'no hat')
   return (
     <div className={'marker fade-in marker-' + (known ? item.marker : 'unknown')}>
       <div className="divider">
         <span>
-          {markerLabel(item.marker)}
+          {backgroundSummary ? 'Background tasks finished' : markerLabel(item.marker)}
           {!known && (
             <>
               {' '}
@@ -111,7 +112,7 @@ export default function Marker({ item, env }: { item: MarkerItem; env: ItemEnv }
               : from <bdi>{hat(item.from)}</bdi> to <bdi>{hat(item.to)}</bdi>
             </>
           )}
-          {item.reason && (
+          {item.reason && !backgroundSummary && (
             <>
               {' '}
               (<bdi>{reasonWords(item.marker, item.reason)}</bdi>)
@@ -125,7 +126,8 @@ export default function Marker({ item, env }: { item: MarkerItem; env: ItemEnv }
           </button>
         )}
       </div>
-      {item.text && (
+      {backgroundSummary && item.text && <p className="background-summary">{item.text}</p>}
+      {item.text && !backgroundSummary && (
         <details className="marker-text">
           <summary>Details</summary>
           <pre>{item.text}</pre>

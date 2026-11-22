@@ -88,3 +88,20 @@ it('filters only actual operator work and keeps lifecycle/status predicates sepa
   expect(statusOf({ ...unseen, question_waits: false, parent_handled_questions: 0, lifecycle: 'active', activity: 'running' }).label).toBe('Running')
   expect(needsOperator({ ...unseen, operator_attention: 1 })).toBe(true)
 })
+
+it('shows background independently of foreground and filters quiet idle only', async () => {
+  const { matchesStatus } = await import('./status')
+  const work = { ...base, background: { active: 2, done: 3, all: 5 } }
+  expect(statusOf(work)).toEqual({ tone: 'background', label: 'Background', resume: false })
+  expect(statusOf({ ...work, activity: 'running' }).label).toBe('Running')
+  expect(statusOf({ ...work, operator_attention: 1 }).label).toBe('Waiting on you')
+  expect(statusOf({ ...work, lifecycle: 'parked', presumed_parked: true }).label).toBe('Host offline')
+  expect(matchesStatus(work, 'background')).toBe(true)
+  expect(matchesStatus(work, 'idle')).toBe(false)
+  expect(matchesStatus({ ...work, background: { active: 0, done: 5, all: 5 } }, 'idle')).toBe(true)
+})
+
+it('never presents an unrecognized foreground state as confirmed idle', () => {
+  expect(of({ activity: 'unknown' })).toEqual({ tone: 'run', label: 'Busy', resume: false })
+  expect(of({ activity: 'busy' }).label).toBe('Busy')
+})

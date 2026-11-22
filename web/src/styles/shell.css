@@ -382,3 +382,14 @@
 
 .session-list-menu:not(:empty) { position:fixed; right:16px; bottom:calc(76px + env(safe-area-inset-bottom)); max-width:calc(100vw - 32px); padding:12px; background:var(--hn-surface); border:1px solid var(--hn-control-strong); border-radius:6px; box-shadow:var(--hn-pop-shadow); z-index:45; }
 .session-list-menu > .form-error { margin:0; }
+
+/* Background work has a distinct open ring as well as a semantic color. */
+.background-ring { display:inline-block; width:12px; height:12px; flex:none; border:2px solid currentColor; border-top-color:transparent; border-radius:50%; }
+.led-background,.row-status-background,.sess-flag-background { color:var(--st-background-fg); }
+.background-count { display:inline-flex; align-items:center; gap:5px; color:var(--hn-fg-2); font-size:11px; white-space:nowrap; }
+.background-count b { color:var(--st-background-fg); font-variant-numeric:tabular-nums; font-weight:600; }
+.background-stale { color:var(--hn-fg-3); }.background-stale b { color:inherit; }
+.background-tasks { position:relative; font-size:12px; }.background-tasks summary { cursor:pointer; list-style:none; padding:5px 7px; border:1px solid var(--hn-line); border-radius:6px; }
+.background-tasks summary::-webkit-details-marker { display:none; }
+.background-task-list { position:absolute; z-index:20; top:100%; right:0; width:min(340px,85vw); padding:14px; border:1px solid var(--hn-control); border-radius:8px; background:var(--hn-panel); box-shadow:var(--hn-pop-shadow); }
+.background-task-list ul { padding:0; margin:0; list-style:none; }.background-task-list li { display:flex; justify-content:space-between; gap:12px; padding:8px 0; border-top:1px solid var(--hn-line); }.background-task-list li bdi { overflow-wrap:anywhere; }.background-task-list li span { color:var(--hn-fg-3); }

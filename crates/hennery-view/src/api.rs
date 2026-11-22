@@ -30,6 +30,10 @@ use ts_rs::TS;
 /// oldest first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct ItemPage {
+    /// Pagination boundary independent of cross-turn entity placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub before_turn: Option<String>,
     pub items: Vec<Item>,
     /// The session's greatest event id when the page was read: no item
     /// here is from a later event. The item stream resumes after it.
@@ -281,6 +285,9 @@ mod tests {
     #[test]
     fn a_summary_is_the_list_item_flattened() {
         let session = SessionItem {
+            acp_protocol: None,
+            acp_fallback: None,
+            background: None,
             sidebar_pinned: false,
             session_id: "s".into(),
             host_id: "h".into(),

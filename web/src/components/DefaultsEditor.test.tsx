@@ -62,3 +62,13 @@ it('pins the edited revision when a later record arrives instead of silently reb
   await waitFor(() => expect(server.sent).toHaveLength(1))
   expect(server.sent[0].body).toEqual({ revision: 1, config: { mode: 'bypass' } })
 })
+
+it('saves a protocol preference without a host catalog or adapter axis', async () => {
+  const f = mount({}, null)
+  fireEvent.change(screen.getByRole('combobox', { name: 'ACP protocol' }), { target: { value: 'v2-v1' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save defaults' }))
+  expect(screen.getByRole('dialog', { name: 'Save defaults for Research' })).toHaveTextContent('ACP protocol: Inherits → v2-v1')
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm save' }))
+  await waitFor(() => expect(f.saved).toHaveBeenCalled())
+  expect(f.sent[0].body).toEqual({ revision: 1, config: { protocol: 'v2-v1' } })
+})

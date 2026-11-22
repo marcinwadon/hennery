@@ -144,3 +144,13 @@ it('shortens model ids and retains complete host/model tooltips', () => {
   expect(screen.getByTitle('claude-haiku-4-5-20251001')).toHaveTextContent('Claude · Haiku 4.5')
   expect(screen.getByTitle('a-very-long-development-hostname')).toHaveClass('sess-cell-truncate')
 })
+
+it('keeps the background counter beside the status when attention takes priority', () => {
+  const row = summary({ background: { active: 2, done: 3, all: 5, stale: false, items: [] } })
+  const view = render(<SessionRow now={NOW} session={row} selected={false} />)
+  expect(screen.getByRole('img', { name: 'Background' })).toBeVisible()
+  expect(screen.getByText('2 / 3 / 5')).toBeVisible()
+  view.rerender(<SessionRow now={NOW} session={{ ...row, operator_attention: 1 }} selected={false} />)
+  expect(screen.getByRole('img', { name: 'Waiting on you' })).toBeVisible()
+  expect(screen.getByText('2 / 3 / 5')).toBeVisible()
+})

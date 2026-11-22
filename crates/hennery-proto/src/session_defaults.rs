@@ -30,6 +30,8 @@ fn strict_config<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Se
     #[serde(deny_unknown_fields)]
     struct Strict {
         #[serde(default)]
+        protocol: crate::frames::AcpProtocolPreference,
+        #[serde(default)]
         model: Option<String>,
         #[serde(default)]
         mode: Option<String>,
@@ -38,6 +40,7 @@ fn strict_config<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Se
     }
     let value = Strict::deserialize(deserializer)?;
     Ok(SessionConfig {
+        protocol: value.protocol,
         cache_retention: Default::default(),
         model: value.model,
         mode: value.mode,

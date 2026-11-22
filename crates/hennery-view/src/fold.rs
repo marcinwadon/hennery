@@ -31,7 +31,9 @@ pub const PREAMBLE: &str = "start";
 
 /// ACP updates that make no item: each is served elsewhere (the catalogue,
 /// the session list) and none breaks a chunk run.
-pub const SILENT_UPDATES: [&str; 5] = [
+pub const SILENT_UPDATES: [&str; 7] = [
+    "state_update",
+    "replay_complete",
     "available_commands_update",
     "usage_update",
     "session_info_update",
@@ -156,6 +158,14 @@ pub fn weight(item: &Item) -> usize {
             Body::Message(text) | Body::Thinking(text) => text.text.len(),
             Body::PluginContext { startup } => serde_json::to_vec(startup).map_or(8192, |b| b.len()),
             Body::ToolCall(call) => tool::weight(call),
+            Body::Terminal {
+                terminal_id,
+                command,
+                cwd,
+                output,
+                signal,
+                ..
+            } => terminal_id.len() + opt(command) + opt(cwd) + output.len() + opt(signal),
             Body::Plan { entries, .. } => entries
                 .iter()
                 .map(|e| e.content.len() + opt(&e.priority) + opt(&e.status) + 16)
@@ -191,6 +201,7 @@ pub struct Fold {
     run: Option<String>,
     /// The group's tool calls: `toolCallId` to item id.
     tools: HashMap<String, String>,
+    terminal_bytes: HashMap<String, Vec<u8>>,
     /// The group's plan's item id.
     plan: Option<String>,
     /// Ids changed since the last `take`, in the order each first changed.
@@ -232,6 +243,7 @@ impl Fold {
             elided: false,
             run: None,
             tools: HashMap::new(),
+            terminal_bytes: HashMap::new(),
             plan: None,
             dirty: Vec::new(),
             dirty_set: HashSet::new(),
@@ -254,6 +266,7 @@ impl Fold {
     /// changed any item.
     pub fn apply(&mut self, event: &EventDto, answerable: &dyn Answerable) -> bool {
         self.touched.clear();
+        self.hydrate(event);
         self.event(event, answerable);
         // Only an event that makes or changes an item breaks a run: one
         // that changes the run's own item continues it.
@@ -273,7 +286,13 @@ impl Fold {
             }
         }
         self.dirty_set.clear();
-        out
+        let mut merged = Items::default();
+        for item in out {
+            if merged.get(&item.id).is_none_or(|old| old.version <= item.version) {
+                merged.upsert(item);
+            }
+        }
+        merged.into_vec()
     }
 
     fn event(&mut self, event: &EventDto, answerable: &dyn Answerable) {
@@ -304,6 +323,21 @@ impl Fold {
         match kind {
             "user_steering" if self.turn.as_deref() == str_at(body, "turn_id") => self.user_content(event),
             "user_steering" => {}
+            "background_tasks_finished" => {
+                let count = |key: &str| body.get(key).and_then(Value::as_u64).unwrap_or(0);
+                self.marker(
+                    event,
+                    MarkerKind::HostNote,
+                    Some("Background tasks finished".into()),
+                    Some(format!(
+                        "{} succeeded · {} failed · {} cancelled · {} unknown",
+                        count("succeeded"),
+                        count("failed"),
+                        count("cancelled"),
+                        count("unknown")
+                    )),
+                );
+            }
             "acp_update" => self.acp_update(event),
             kind if SILENT_EVENTS.contains(&kind) => {}
             "turn_ended" => match str_at(body, "outcome") {
@@ -343,6 +377,7 @@ impl Fold {
         self.elided = false;
         self.run = None;
         self.tools.clear();
+        self.terminal_bytes.clear();
         self.plan = None;
         self.user_content(event);
     }
@@ -489,6 +524,29 @@ impl Fold {
         let kind = str_at(update, "sessionUpdate").unwrap_or_default();
         let label = format!("acp_update/{kind}");
         match kind {
+            "user_message" | "user_message_chunk"
+                if event.body.pointer("/indexed/acp_protocol").and_then(Value::as_u64) == Some(2) => {}
+            "agent_message" | "agent_thought" => {
+                if update.get("content").is_none() {
+                    return;
+                }
+                if let Some(id) = str_at(update, "messageId").filter(|id| !id.is_empty() && id.len() <= ID_MAX_BYTES) {
+                    let text: String = update
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .filter(|p| str_at(p, "type") == Some("text"))
+                                .filter_map(|p| str_at(p, "text"))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.identified_text(event, id, kind == "agent_thought", &text, true);
+                } else {
+                    self.unrecognised(event, &label);
+                }
+            }
             "agent_message_chunk" | "agent_thought_chunk" => {
                 let content = update.get("content");
                 let text = content
@@ -498,19 +556,31 @@ impl Fold {
                     None => self.unrecognised(event, &label),
                     // An empty chunk changes nothing.
                     Some("") => {}
-                    Some(text) => self.chunk(event, kind == "agent_thought_chunk", text),
+                    Some(text) => {
+                        if let Some(id) = str_at(update, "messageId").filter(|id| {
+                            !id.is_empty()
+                                && id.len() <= ID_MAX_BYTES
+                                && event.body.pointer("/indexed/acp_protocol").and_then(Value::as_u64) == Some(2)
+                        }) {
+                            self.identified_text(event, id, kind == "agent_thought_chunk", text, false);
+                        } else {
+                            self.chunk(event, kind == "agent_thought_chunk", text);
+                        }
+                    }
                 }
             }
-            "tool_call" | "tool_call_update" => {
+            "terminal_update" | "terminal_output_chunk" => self.terminal(event, update),
+            "tool_call" | "tool_call_update" | "tool_call_content_chunk" => {
                 let Some(call_id) =
                     str_at(update, "toolCallId").filter(|id| !id.is_empty() && id.len() <= ID_MAX_BYTES)
                 else {
                     return self.unrecognised(event, &label);
                 };
-                let id = match self.tools.get(call_id) {
+                let tool_key = self.entity_id(event, "tool", call_id);
+                let id = match self.tools.get(&tool_key) {
                     Some(id) => id.clone(),
                     None => {
-                        let id = format!("{}:tool:{call_id}", self.group);
+                        let id = self.entity_id(event, "tool", call_id);
                         let body = Body::ToolCall(ToolCall {
                             tool_call_id: call_id.to_string(),
                             ..ToolCall::default()
@@ -518,17 +588,33 @@ impl Fold {
                         if !self.create(event, id.clone(), body, false) {
                             return;
                         }
-                        self.tools.insert(call_id.to_string(), id.clone());
+                        self.tools.insert(tool_key, id.clone());
                         id
                     }
                 };
                 self.change(event, &id, |body| match body {
-                    Body::ToolCall(call) => tool::merge(call, update),
+                    Body::ToolCall(call) => {
+                        if kind == "tool_call_content_chunk" {
+                            return update
+                                .get("content")
+                                .is_some_and(|content| tool::append_content(call, content));
+                        }
+                        if event.body.pointer("/indexed/acp_protocol").and_then(Value::as_u64) == Some(2) {
+                            tool::merge_v2(call, update)
+                        } else {
+                            tool::merge(call, update)
+                        }
+                    }
                     _ => false,
                 });
             }
-            "plan" => {
-                let Some(entries) = update.get("entries").and_then(Value::as_array) else {
+            "plan" | "plan_update" => {
+                let plan = if kind == "plan_update" {
+                    update.get("plan").unwrap_or(update)
+                } else {
+                    update
+                };
+                let Some(entries) = plan.get("entries").and_then(Value::as_array) else {
                     return self.unrecognised(event, &label);
                 };
                 // A step with no text is still a step: dropping it would
@@ -547,7 +633,10 @@ impl Fold {
                         }
                     })
                     .collect();
-                let id = match &self.plan {
+                let explicit_id = str_at(plan, "planId")
+                    .filter(|id| !id.is_empty() && id.len() <= ID_MAX_BYTES)
+                    .map(|id| format!("{}:plan:{id}", self.group));
+                let id = match explicit_id.as_ref().or(self.plan.as_ref()) {
                     Some(id) => id.clone(),
                     None => {
                         let id = format!("{}:plan", self.group);
@@ -562,6 +651,17 @@ impl Fold {
                         id
                     }
                 };
+                if self.items.get(&id).is_none() {
+                    self.create(
+                        event,
+                        id.clone(),
+                        Body::Plan {
+                            entries: Vec::new(),
+                            truncated: false,
+                        },
+                        false,
+                    );
+                }
                 self.change(event, &id, |body| {
                     let new = Body::Plan { entries, truncated };
                     let changed = *body != new;
@@ -608,6 +708,184 @@ impl Fold {
         };
         if let Some(id) = self.create_ordinal(event, body) {
             self.run = Some(id);
+        }
+    }
+
+    fn entity_id(&self, event: &EventDto, kind: &str, wire_id: &str) -> String {
+        let v2 = event.body.pointer("/indexed/acp_protocol").and_then(Value::as_u64) == Some(2);
+        if v2 || kind == "terminal" {
+            let prefix = event
+                .body
+                .get("_view_entity_prefix")
+                .and_then(Value::as_str)
+                .unwrap_or("v2");
+            format!("acp:{prefix}:{kind}:{wire_id}")
+        } else {
+            format!("{}:{kind}:{wire_id}", self.group)
+        }
+    }
+
+    fn hydrate(&mut self, event: &EventDto) {
+        use base64::Engine;
+        let Some(seed) = event.body.get("_view_seed") else {
+            return;
+        };
+        let Ok(item) = serde_json::from_value::<Item>(seed.clone()) else {
+            return;
+        };
+        if self.items.get(&item.id).is_some() {
+            return;
+        }
+        let id = item.id.clone();
+        if let Body::ToolCall(_) = &item.body {
+            self.tools.insert(id.clone(), id.clone());
+        }
+        if !self.create(event, id.clone(), item.body.clone(), false) {
+            return;
+        }
+        if let Some(stored) = self.items.get_mut(&id) {
+            *stored = item;
+        }
+        if let Some(raw) = event.body.get("_view_terminal_bytes").and_then(Value::as_str)
+            && raw.len() <= TEXT_MAX_BYTES * 2
+            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw)
+        {
+            self.terminal_bytes
+                .insert(id, bytes.into_iter().take(TEXT_MAX_BYTES).collect());
+        }
+    }
+
+    /// Complete bounded state for collector entity hydration projections.
+    pub fn entity_state(&self, event: &EventDto) -> Option<(Item, Vec<u8>)> {
+        let update = update_of(&event.body)?;
+        let variant = str_at(update, "sessionUpdate")?;
+        let (kind, field) = match variant {
+            "terminal_update" | "terminal_output_chunk" => ("terminal", "terminalId"),
+            "tool_call_update" | "tool_call_content_chunk" => ("tool", "toolCallId"),
+            "agent_message" | "agent_message_chunk" => ("message", "messageId"),
+            "agent_thought" | "agent_thought_chunk" => ("thought", "messageId"),
+            _ => return None,
+        };
+        let id = self.entity_id(event, kind, str_at(update, field)?);
+        Some((
+            self.items.get(&id)?.clone(),
+            self.terminal_bytes.get(&id).cloned().unwrap_or_default(),
+        ))
+    }
+
+    fn terminal(&mut self, event: &EventDto, update: &Value) {
+        use base64::Engine;
+        let Some(terminal) = str_at(update, "terminalId").filter(|id| !id.is_empty() && id.len() <= ID_MAX_BYTES)
+        else {
+            return self.unrecognised(event, "terminal");
+        };
+        let id = self.entity_id(event, "terminal", terminal);
+        if self.items.get(&id).is_none()
+            && !self.create(
+                event,
+                id.clone(),
+                Body::Terminal {
+                    terminal_id: terminal.into(),
+                    command: None,
+                    cwd: None,
+                    output: String::new(),
+                    exit_code: None,
+                    signal: None,
+                },
+                false,
+            )
+        {
+            return;
+        }
+        let bytes = update
+            .pointer("/output/data")
+            .or_else(|| update.get("data"))
+            .and_then(Value::as_str);
+        let decoded = bytes
+            .filter(|text| text.len() <= TEXT_MAX_BYTES * 2)
+            .and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded).ok());
+        let output_text = if let Some(bytes) = decoded {
+            let retained = self.terminal_bytes.entry(id.clone()).or_default();
+            if str_at(update, "sessionUpdate") != Some("terminal_output_chunk") {
+                retained.clear();
+            }
+            let remaining = TEXT_MAX_BYTES.saturating_sub(retained.len());
+            retained.extend(bytes.into_iter().take(remaining));
+            Some(clip(&String::from_utf8_lossy(retained), TEXT_MAX_BYTES))
+        } else if update.get("output") == Some(&Value::Null) {
+            self.terminal_bytes.remove(&id);
+            Some(String::new())
+        } else {
+            None
+        };
+        self.change(event, &id, |body| {
+            let old = body.clone();
+            if let Body::Terminal {
+                command,
+                cwd,
+                output,
+                exit_code,
+                signal,
+                ..
+            } = body
+            {
+                if update.get("command") == Some(&Value::Null) {
+                    *command = None;
+                }
+                if update.get("cwd") == Some(&Value::Null) {
+                    *cwd = None;
+                }
+                if update.get("exitStatus") == Some(&Value::Null) {
+                    *exit_code = None;
+                    *signal = None;
+                }
+                if let Some(text) = str_at(update, "command") {
+                    *command = Some(clip(text, TEXT_MAX_BYTES));
+                }
+                if let Some(text) = str_at(update, "cwd") {
+                    *cwd = Some(clip(text, LABEL_MAX_BYTES));
+                }
+                if let Some(text) = output_text {
+                    *output = text;
+                }
+                if let Some(status) = update.get("exitStatus").and_then(Value::as_object) {
+                    *exit_code = status.get("exitCode").and_then(Value::as_i64);
+                    *signal = status
+                        .get("signal")
+                        .and_then(Value::as_str)
+                        .map(|text| clip(text, CODE_MAX_BYTES));
+                }
+            }
+            *body != old
+        });
+    }
+
+    fn identified_text(&mut self, event: &EventDto, message_id: &str, thinking: bool, text: &str, replace: bool) {
+        let id = self.entity_id(event, if thinking { "thought" } else { "message" }, message_id);
+        if self.items.get(&id).is_some() {
+            self.change(event, &id, |body| match body {
+                Body::Message(value) | Body::Thinking(value) => {
+                    let old = value.clone();
+                    if replace {
+                        let (text, truncated) = cut(text, TEXT_MAX_BYTES);
+                        *value = Text { text, truncated };
+                    } else if !value.truncated {
+                        let (_, truncated) = append(&mut value.text, text, TEXT_MAX_BYTES);
+                        value.truncated |= truncated;
+                    }
+                    *value != old
+                }
+                _ => false,
+            });
+        } else {
+            let (text, truncated) = cut(text, TEXT_MAX_BYTES);
+            let text = Text { text, truncated };
+            let body = if thinking {
+                Body::Thinking(text)
+            } else {
+                Body::Message(text)
+            };
+            self.create(event, id, body, false);
         }
     }
 

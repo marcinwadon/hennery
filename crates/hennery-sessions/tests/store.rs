@@ -378,6 +378,7 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(concat!(
+            include_str!("fixtures/undo_acp.sql"),
             include_str!("fixtures/undo_external.sql"),
             include_str!("fixtures/undo_usage.sql"),
             include_str!("fixtures/undo_delegation.sql")
@@ -1219,6 +1220,7 @@ fn catalogue(model: &str, mode: &str) -> Indexed {
 
 fn config(model: &str, mode: &str) -> SessionConfig {
     SessionConfig {
+        protocol: Default::default(),
         cache_retention: Default::default(),
         model: Some(model.into()),
         mode: Some(mode.into()),
@@ -2220,6 +2222,9 @@ fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
     assert_eq!(
         item,
         hennery_proto::rest::SessionItem {
+            background: None,
+            acp_protocol: None,
+            acp_fallback: None,
             sidebar_pinned: false,
             session_id: "s1".into(),
             host_id: "h1".into(),
@@ -2724,6 +2729,7 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
     // migration (version 11) and plan 9a's (version 13) undone too.
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(concat!(
+        include_str!("fixtures/undo_acp.sql"),
         include_str!("fixtures/undo_external.sql"),
         include_str!("fixtures/undo_usage.sql"),
         include_str!("fixtures/undo_delegation.sql")
@@ -3106,6 +3112,15 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     prompt_in(&store, "s1", "t2", vec![image(&b)]);
     prompt_in(&store, "s2", "t9", vec![image(&kept)]);
     store.ingest("s2", 5, &turn_started("t9")).unwrap();
+    // Seed the real ACP v2 projection for both the deleted and surviving
+    // sessions, so the deletion walk proves entity snapshots and seed refs
+    // are scrubbed selectively instead of merely observing empty tables.
+    for (session, seq) in [("s1", 9), ("s2", 6)] {
+        store.ingest(session, seq, &SessionBody::AcpUpdate {
+            indexed: Indexed { acp_protocol: Some(2), ..Default::default() },
+            payload: json!({"sessionId":"a0","update":{"sessionUpdate":"terminal_update","terminalId":"fixture-terminal","command":"background fixture","output":{"data":"Zml4dHVyZQ=="}}}),
+        }).unwrap();
+    }
     for id in ["s1", "s2"] {
         let checked = hennery_sessions::content::check(vec![json!({"type":"text","text":"receipt fixture"})]).unwrap();
         let key = hennery_sessions::prompt_receipts::PromptRequestKey::new("delete-receipt", &checked).unwrap();
@@ -3203,6 +3218,8 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     let before = rows_of(&conn, "s1", &events, &turns, &hashes, &s1_uploads);
     let walked: Vec<&str> = before.iter().map(|(t, _)| t.as_str()).collect();
     for table in [
+        "acp_view_entities",
+        "acp_view_refs",
         "answer_queue",
         "attachments",
         "event_attachments",

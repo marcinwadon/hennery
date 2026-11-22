@@ -253,6 +253,9 @@ fn resume_frames_and_host_notes_use_the_spec_field_names() {
 /// A list item with only what every session has.
 fn bare_item() -> hennery_proto::rest::SessionItem {
     hennery_proto::rest::SessionItem {
+        background: None,
+        acp_protocol: None,
+        acp_fallback: None,
         sidebar_pinned: false,
         session_id: "s".into(),
         host_id: "h".into(),
@@ -426,6 +429,9 @@ fn a_listed_item_is_bounded_field_by_field() {
 #[test]
 fn a_listed_item_stays_under_1_kib_with_every_field_at_its_worst() {
     let item = hennery_proto::rest::SessionItem {
+        background: None,
+        acp_protocol: None,
+        acp_fallback: None,
         sidebar_pinned: true,
         session_id: "0199a4c2-7e1f-7c3a-9b2d-4f6e8a0c1d2e".into(),
         // Past their caps (an older row's): cut to 32 bytes each.
@@ -532,6 +538,7 @@ fn session_started_names_the_request_and_the_agents_session() {
 
 fn config() -> SessionConfig {
     SessionConfig {
+        protocol: Default::default(),
         cache_retention: Default::default(),
         model: Some("large".into()),
         mode: Some("plan".into()),
