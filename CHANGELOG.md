@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.0
+
 - Add the Skills catalogue: upload Agent Skills directories once on the
   **Skills** screen, choose the hosts that receive each skill, and the host
   links it into `~/.claude/skills` and `~/.codex/skills` (phase 1, behind the
@@ -16,6 +18,22 @@
 
 - Send operator follow-ups into the current turn automatically when the host
   and adapter support steering. Queued messages still offer manual steering.
+
+- Attach generic files to prompts and publish versioned session artifacts.
+  Download immutable output revisions from the Files panel even when the host
+  is offline or its workspace has been removed.
+- Create sessions in managed Git worktrees or a shared directory. Save explicit
+  preparation profiles, share workspace membership across sessions, archive
+  closed sessions, and inspect retained workspaces in Settings. Automatic
+  cleanup preserves branches and refuses workspaces with local files.
+- Update managed Claude ACP to 0.112.0 with Agent SDK 0.3.332 and Codex ACP to
+  2.12.0 with CLI 0.172.0. Keep Node at 24.22.3 and refresh supported Rust and
+  frontend dependencies, including the URL parsing security fix.
+- Runtime acceptance for this update covers four real Codex checks on macOS
+  arm64. Claude and the full multi-platform/delegation matrix were not rerun.
+- Back up collector data before upgrading; migrations require a compatible
+  backup for downgrade. Update the collector and agent hosts together to use
+  session files, managed workspaces, skills and hook sets.
 
 ## 0.6.0
 
