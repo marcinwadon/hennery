@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.7.1
+
+- Update Claude ACP to 0.113.0 and Codex ACP to 2.12.1. Keep Claude Agent SDK
+  0.3.332, Codex CLI 0.172.0 and Node 24.22.3 unchanged.
+- Add Claude adapter handling for `/plugin` and Remote Control startup according
+  to the CLI's reported settings, policy or rollout. Preserve an explicit
+  `/remote-control off` across query restarts. The update also fixes upstream
+  background-task tracking and aligns Codex's declared CLI dependency range.
+- Qualify this adapter update through package checks, source review and CI;
+  live-agent acceptance was explicitly waived for this update.
+
 ## 0.7.0
 
 - Add the Skills catalogue: upload Agent Skills directories once on the
