@@ -157,8 +157,25 @@ impl Store {
         key: Option<&crate::prompt_receipts::PromptRequestKey>,
         steering: Option<&Hub>,
     ) -> Result<crate::prompt_receipts::PromptReceipt> {
+        self.admit_independent_followup(session, prompt, key, steering, None)
+    }
+
+    pub(crate) fn admit_independent_followup(
+        &self,
+        session: &str,
+        prompt: &Checked,
+        key: Option<&crate::prompt_receipts::PromptRequestKey>,
+        steering: Option<&Hub>,
+        peer: Option<&crate::peer_messages::Admission<'_>>,
+    ) -> Result<crate::prompt_receipts::PromptReceipt> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(peer) = peer {
+            ensure!(session == peer.request.session_id && key.is_none(), "invalid_arguments");
+            if let Some(receipt) = self.peer_message_admission_in(&tx, peer)? {
+                return Ok(receipt);
+            }
+        }
         if let Some(receipt) = crate::prompt_receipts::lookup_in(&tx, self.owner_id(), session, key)? {
             return Ok(receipt);
         }
@@ -193,6 +210,9 @@ impl Store {
             "INSERT INTO session_dispatch_queue(owner_id,operation_id,source_id,target_id,accepted_revision,payload,required_config,origin,image_bytes)
              VALUES (?1,?2,?3,?3,0,?4,?5,'operator',?6)", params![self.owner_id(),id,session,payload,config,image_bytes],
         )?;
+        if let Some(peer) = peer {
+            self.bind_peer_message_in(&tx, peer, &id)?;
+        }
         for (position, image) in prompt.images.iter().enumerate() {
             self.store_queued_attachment_in(&tx, image)?;
             tx.execute(
@@ -200,10 +220,13 @@ impl Store {
                 params![self.owner_id(), id, image.sha256, position as i64],
             )?;
         }
-        tx.execute(
-            "UPDATE sessions SET prompt_queue_held=CASE WHEN lifecycle='active' AND prompt_queue_held<>0 THEN 2 ELSE 0 END WHERE owner_id = ?1 AND id=?2",
-            params![self.owner_id(), session],
-        )?;
+        if peer.is_none() {
+            // Only a new operator follow-up may release an operator queue hold.
+            tx.execute(
+                "UPDATE sessions SET prompt_queue_held=CASE WHEN lifecycle='active' AND prompt_queue_held<>0 THEN 2 ELSE 0 END WHERE owner_id = ?1 AND id=?2",
+                params![self.owner_id(), session],
+            )?;
+        }
         // Only the initial admission can steer. A replay after promptRequired
         // keeps its original queue receipt even if another turn has since begun.
         let handoff = if let Some(hub) = steering {
@@ -289,7 +312,7 @@ impl Store {
         let payload = serde_json::to_string(&content)?;
         bounds(&tx, self.owner_id(), session, id, payload.len() as i64 + image_bytes)?;
         tx.execute(
-            "UPDATE session_dispatch_queue SET payload=?4 WHERE owner_id = ?1 AND target_id=?2 AND operation_id=?3",
+            "UPDATE session_dispatch_queue SET payload=?4,input_origin=json_object('kind','operator') WHERE owner_id = ?1 AND target_id=?2 AND operation_id=?3",
             params![self.owner_id(), session, id, payload],
         )?;
         tx.commit()?;
@@ -464,6 +487,10 @@ impl Store {
                 return Ok(false);
             };
         }
+        let Some(input_origin) = self.independent_origin_in(&tx, session, &id)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
         let stored: Vec<StoredBlock> = serde_json::from_str(&payload)?;
         let Some(sent) = self.queued_content(
             &stored,
@@ -494,8 +521,8 @@ impl Store {
             );
         }
         tx.execute(
-            "INSERT INTO turns(owner_id,session_id,turn_id,content,created_at,operator_queued) VALUES (?1,?2,?3,?4,?5,1)",
-            params![self.owner_id(), session, turn, serde_json::to_string(&content)?, now()],
+            "INSERT INTO turns(owner_id,session_id,turn_id,content,created_at,operator_queued,input_origin) VALUES (?1,?2,?3,?4,?5,1,?6)",
+            params![self.owner_id(), session, turn, serde_json::to_string(&content)?, now(),serde_json::to_string(&input_origin)?],
         )?;
         crate::store::link_turn_attachments(&tx, self.owner_id(), &turn, &content)?;
         tx.execute("UPDATE session_operations SET state='awaiting_reconciliation',turn_id=?3,request_id=?4 WHERE owner_id = ?1 AND operation_id=?2",params![self.owner_id(),id,turn,request])?;

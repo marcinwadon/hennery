@@ -12,6 +12,7 @@ pub mod frames;
 pub mod hooks;
 pub mod mcp_source;
 pub mod paths;
+pub mod peers;
 pub mod plugin;
 pub mod rest;
 pub mod skills;

@@ -3776,6 +3776,27 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
+              "const": "peer",
+              "type": "string"
+            },
+            "operation_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "session_id",
+            "operation_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
               "const": "plugin_context",
               "type": "string"
             },
@@ -5139,6 +5160,31 @@
       },
       "required": [
         "rules"
+      ],
+      "type": "object"
+    },
+    "PeerAccess": {
+      "enum": [
+        "off",
+        "read",
+        "read_write"
+      ],
+      "type": "string"
+    },
+    "PeerPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/PeerAccess"
+        },
+        "revision": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "access",
+        "revision"
       ],
       "type": "object"
     },

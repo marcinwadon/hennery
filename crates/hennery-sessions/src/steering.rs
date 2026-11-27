@@ -95,6 +95,9 @@ impl Store {
             )
             .optional()?
             .context("queue_item_unavailable")?;
+        let Some(input_origin) = self.independent_origin_in(tx, session, id)? else {
+            return Ok(None);
+        };
         let stored: Vec<StoredBlock> = serde_json::from_str(&payload)?;
         let Some(content) = self.queued_content(&stored, true, true)? else {
             self.fail_operator_item_in(tx, id, "image_unavailable")?;
@@ -112,7 +115,7 @@ impl Store {
             target,
             &stored,
             content,
-            hennery_proto::plugin::InputOrigin::Operator {},
+            input_origin,
             matches!(mode, SteeringMode::WhenAvailable),
         )?;
         tx.execute(

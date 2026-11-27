@@ -1009,6 +1009,16 @@ fn validate(item: &PluginActivityItem, epoch: &str) -> Result<()> {
                     "invalid external client evidence"
                 ),
                 InputOrigin::PluginContext { .. } => anyhow::bail!("injected context is not source material"),
+                InputOrigin::Peer {
+                    session_id,
+                    operation_id,
+                } => ensure!(
+                    !session_id.is_empty()
+                        && session_id.len() <= 256
+                        && !operation_id.is_empty()
+                        && operation_id.len() <= 256,
+                    "invalid peer evidence"
+                ),
                 InputOrigin::Parent {
                     session_id,
                     operation_id,

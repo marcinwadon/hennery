@@ -37,6 +37,7 @@ function page(push = true, routes: Record<string, Answer | Answer[]> = {}) {
     'GET /api/hats': json(200, [{ id: 'hat', name: 'Personal', colour: '#000', default_for_new_hosts: true }]),
     'GET /api/hosts': json(200, []),
     'GET /api/hats/hat/session-tools': json(200, { delegation_enabled: false, revision: 1 }),
+    'GET /api/hats/hat/peer-access': json(200, { access: 'off', revision: 0 }),
     'GET /api/settings/delegation-limits': json(200, { children: 8, starts_per_operator_epoch: 32, automatic_wakes_per_operator_epoch: 20 }),
     'GET /api/settings/idle-parking': json(200, { idle_timeout_secs: null }),
     'GET /api/push/policies': json(200, [{ hat_id: 'hat', muted: false, details: false, generic_title: false }]),

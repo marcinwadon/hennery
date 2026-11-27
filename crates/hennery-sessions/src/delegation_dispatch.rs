@@ -198,17 +198,23 @@ impl Store {
     ) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let queue: Option<(String, i64, String, bool)> = tx
+        let queue: Option<(String, String, i64, String, bool)> = tx
             .query_row(
-                "SELECT source_id,accepted_revision,required_config,origin='operator' FROM session_dispatch_queue
+                "SELECT operation_id,source_id,accepted_revision,required_config,origin='operator' FROM session_dispatch_queue
             WHERE owner_id = ?1 AND target_id = ?2 AND state IN ('queued','waiting_config') ORDER BY position LIMIT 1",
                 params![self.owner_id(), target],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((source, revision, required, operator)) = queue else {
+        let Some((operation, source, revision, required, operator)) = queue else {
             return Ok(false);
         };
+        // Catalog and path probes may await I/O after the worker's precheck.
+        // Revalidate peer intent inside the attach writer transaction too.
+        if operator && self.independent_origin_in(&tx, target, &operation)?.is_none() {
+            tx.commit()?;
+            return Ok(false);
+        }
         if !self.queue_transfer_in(&tx, &source, target, revision, operator)? {
             return Ok(false);
         }

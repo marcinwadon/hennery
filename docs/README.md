@@ -13,6 +13,7 @@ state stays outside Git; public issues are separate approved projections.
    — product, topology, protocol principles, sessions, auth, hats, module
    boundaries, testing. Authoritative where subsystem specs disagree.
 2. Subsystem specs:
+   - [Same-hat peer sessions](specs/2026-11-27-peer-sessions.md) — native agent discovery, bounded canonical history reads and attributed messages between independent sessions, with a separate per-hat policy.
    - [Session files](specs/2026-11-18-session-files.md) — generic prompt files and explicitly published immutable artifact revisions.
    - [External OMP adapter proposal](superpowers/specs/2026-10-23-omp-design.md)
      and [implementation plan](superpowers/plans/2026-10-23-omp-adapter.md) —

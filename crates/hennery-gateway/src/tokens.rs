@@ -94,7 +94,7 @@ pub fn mint_delegation_in(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(session_id) DO UPDATE SET host_id = excluded.host_id, hat_id = excluded.hat_id,
              token_hash = excluded.token_hash, created_at = excluded.created_at, last_used_at = NULL,
-             revoked_at = NULL, delivered_delegation_revision = excluded.delivered_delegation_revision
+             revoked_at = NULL, delivered_delegation_revision = excluded.delivered_delegation_revision, delivered_peer_revision = NULL
              WHERE gw_session_tokens.owner_id = excluded.owner_id",
         params![session_id, owner_id, host_id, hat_id, token_hash(&token), now, delivered_revision],
     )?;

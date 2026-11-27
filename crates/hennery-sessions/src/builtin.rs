@@ -26,6 +26,12 @@ use std::sync::Arc;
 
 pub const VERSIONS: &[&str] = &["2025-03-26", "2025-06-18", "2025-11-25"];
 #[derive(Clone)]
+enum BuiltinKind {
+    Delegation,
+    Files,
+    Peers,
+}
+#[derive(Clone)]
 struct BuiltinState {
     app: AppState,
     gateway: GatewayState,
@@ -38,6 +44,7 @@ pub fn router_with_limits(app: AppState, gateway: GatewayState, limits: Limits) 
     Router::new()
         .route("/mcp/builtin/hennery", any(endpoint))
         .route("/mcp/builtin/files", any(endpoint))
+        .route("/mcp/builtin/peers", any(endpoint))
         .with_state(BuiltinState {
             app,
             gateway,
@@ -78,6 +85,7 @@ async fn endpoint(
 ) -> Response {
     let mut body = RequestBody::new(body, &headers);
     let files = uri.path() == "/mcp/builtin/files";
+    let peers = uri.path() == "/mcp/builtin/peers";
     let mut permit = None;
     let origin = state.app.operator.public_url();
     let mut token_watch = None;
@@ -99,7 +107,26 @@ async fn endpoint(
                 if files {
                     tokio::select! { biased;
                         () = cancelled.cancelled() => no_scope(),
-                        response = handle(&state, identity, method, &headers, &mut body, &mut permit, true) => response,
+                        response = handle(&state, identity, method, &headers, &mut body, &mut permit, BuiltinKind::Files) => response,
+                    }
+                } else if peers {
+                    grant_watch = state
+                        .gateway
+                        .runtime
+                        .store
+                        .watch_peers(&identity)
+                        .ok()
+                        .flatten()
+                        .map(|(watch, _)| watch);
+                    if let Some(grant) = &grant_watch {
+                        let grant_cancelled = grant.token();
+                        tokio::select! { biased;
+                            () = cancelled.cancelled() => no_scope(),
+                            () = grant_cancelled.cancelled() => no_scope(),
+                            response = handle(&state, identity, method, &headers, &mut body, &mut permit, BuiltinKind::Peers) => response,
+                        }
+                    } else {
+                        no_scope()
                     }
                 } else {
                     grant_watch = state.gateway.runtime.store.watch_delegation(&identity).ok().flatten();
@@ -108,7 +135,7 @@ async fn endpoint(
                         tokio::select! { biased;
                             () = cancelled.cancelled() => no_scope(),
                             () = grant_cancelled.cancelled() => no_scope(),
-                            response = handle(&state, identity, method, &headers, &mut body, &mut permit, false) => response,
+                            response = handle(&state, identity, method, &headers, &mut body, &mut permit, BuiltinKind::Delegation) => response,
                         }
                     } else {
                         no_scope()
@@ -254,10 +281,14 @@ async fn handle(
     headers: &HeaderMap,
     body: &mut RequestBody,
     permit: &mut Option<hennery_kernel::egress::Permit>,
-    files: bool,
+    kind: BuiltinKind,
 ) -> Response {
+    let files = matches!(kind, BuiltinKind::Files);
+    let peers = matches!(kind, BuiltinKind::Peers);
     let Some(revision) = (if files {
         Some(0)
+    } else if peers {
+        identity.delivered_peer_revision()
     } else {
         identity.delivered_delegation_revision()
     }) else {
@@ -265,6 +296,8 @@ async fn handle(
     };
     let context = if files {
         state.app.store.file_tool_context(&identity, false).ok().flatten()
+    } else if peers {
+        state.app.store.peer_context(&identity, revision, false).ok()
     } else {
         state
             .app
@@ -380,6 +413,17 @@ async fn handle(
         "tools/list" if no_params => {
             if files {
                 crate::files::tools()
+            } else if peers {
+                crate::peers::tools(
+                    state
+                        .gateway
+                        .runtime
+                        .store
+                        .peer_policy(context.hat_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|p| p.access.writable()),
+                )
             } else {
                 crate::tool_args::discovery()
             }
@@ -404,6 +448,8 @@ async fn handle(
                         .ok()
                         .flatten()
                         .is_some()
+                } else if peers {
+                    state.app.store.peer_context(&identity, revision, true).is_ok()
                 } else {
                     state
                         .app
@@ -425,6 +471,15 @@ async fn handle(
                         if files {
                             crate::files::execute(&state.app, &identity, &call.name, Value::Object(call.arguments))
                                 .await
+                        } else if peers {
+                            crate::peers::execute(
+                                &state.app,
+                                &identity,
+                                revision,
+                                &call.name,
+                                Value::Object(call.arguments),
+                            )
+                            .await
                         } else {
                             crate::session_tools::execute(
                                 &state.app,
@@ -462,10 +517,16 @@ async fn handle(
 /// Policy routes use the existing operator Origin/cookie/step-up layers.
 pub fn policy_router(state: AppState) -> Router {
     use axum::{middleware, routing::get};
-    let routes = Router::new().route(
-        "/api/hats/{id}/session-tools",
-        get(get_policy).patch(set_policy.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
-    );
+    let routes = Router::new()
+        .route(
+            "/api/hats/{id}/session-tools",
+            get(get_policy).patch(set_policy.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
+        )
+        .route(
+            "/api/hats/{id}/peer-access",
+            get(get_peer_policy)
+                .patch(set_peer_policy.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
+        );
     hennery_kernel::auth::operator_only(routes, state.operator.clone()).with_state(state)
 }
 async fn get_policy(State(state): State<AppState>, axum::extract::Path(hat): axum::extract::Path<String>) -> Response {
@@ -492,10 +553,85 @@ fn policy_result(result: anyhow::Result<Option<HatSessionTools>>) -> Response {
     }
 }
 
+async fn get_peer_policy(
+    State(state): State<AppState>,
+    axum::extract::Path(hat): axum::extract::Path<String>,
+) -> Response {
+    let Some(store) = state.store.mcp().authenticator() else {
+        return no_scope();
+    };
+    peer_policy_result(store.peer_policy(&hat))
+}
+struct PeerPolicyRequest {
+    access: hennery_gateway::peers::PeerAccess,
+}
+impl<'de> Deserialize<'de> for PeerPolicyRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Object;
+        impl<'de> serde::de::Visitor<'de> for Object {
+            type Value = PeerPolicyRequest;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a peer access policy object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut access = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key != "access" {
+                        return Err(serde::de::Error::unknown_field(&key, &["access"]));
+                    }
+                    if access.is_some() {
+                        return Err(serde::de::Error::duplicate_field("access"));
+                    }
+                    access = Some(map.next_value()?);
+                }
+                Ok(PeerPolicyRequest {
+                    access: access.ok_or_else(|| serde::de::Error::missing_field("access"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(Object)
+    }
+}
+async fn set_peer_policy(
+    State(state): State<AppState>,
+    axum::extract::Path(hat): axum::extract::Path<String>,
+    ApiJson(request): ApiJson<PeerPolicyRequest>,
+) -> Response {
+    let Some(store) = state.store.mcp().authenticator() else {
+        return no_scope();
+    };
+    peer_policy_result(store.set_peer_policy(&hat, request.access))
+}
+fn peer_policy_result(result: anyhow::Result<Option<hennery_gateway::peers::PeerPolicy>>) -> Response {
+    match result {
+        Ok(Some(policy)) => Json(policy).into_response(),
+        Ok(None) => no_scope(),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hennery_gateway::revocation::Revocations;
+    #[test]
+    fn peer_policy_requires_one_explicit_access_field() {
+        for access in ["off", "read", "read_write"] {
+            assert!(serde_json::from_value::<PeerPolicyRequest>(json!({"access":access})).is_ok());
+        }
+        for raw in [
+            "null",
+            "[]",
+            "[\"read\"]",
+            "{}",
+            "{\"access\":null}",
+            "{\"access\":true}",
+            "{\"access\":\"read\",\"hat\":\"another\"}",
+            "{\"access\":\"read\",\"access\":\"off\"}",
+        ] {
+            assert!(serde_json::from_str::<PeerPolicyRequest>(raw).is_err(), "{raw}");
+        }
+    }
     #[tokio::test]
     async fn response_watches_cut_after_acceptance_and_release_on_drop() {
         for grant_cut in [false, true] {

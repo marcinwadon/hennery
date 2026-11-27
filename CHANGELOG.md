@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add independent same-hat session collaboration through native MCP: discover
+  sessions across hosts, read retained canonical histories and send attributed
+  messages through the durable queue and steering transport. A separate per-hat
+  setting permits reads or reads and messages; delegation remains independent.
+
 ## 0.7.1
 
 - Update Claude ACP to 0.113.0 and Codex ACP to 2.12.1. Keep Claude Agent SDK
