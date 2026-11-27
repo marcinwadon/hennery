@@ -26,16 +26,16 @@
   "adapters": {
     "claude": {
       "package": "@agentclientprotocol/claude-agent-acp",
-      "version": "0.112.0",
+      "version": "0.113.0",
       "entry": "node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
       "platforms": {
         "darwin-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/claude-agent-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.112.0.tgz",
-            "integrity": "sha512-T9FrKGd9eDKHNmZE/EfEf01v49UHKeKyGcu91O8sdVc7a9eMEDOGWT/0moWirGHJdBqJ9qPVfqu07IBegJuniA==",
-            "archive_size": 868885,
-            "unpacked_size": 3275066
+            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.113.0.tgz",
+            "integrity": "sha512-fXX8ulGhIg8qHNsy8iQgPV1ZtISwUSqIAmc0/CN2CgiAeMP1wOn0xbzwwOIKLXqoiNoOkvreT2dqvMhwSFKClw==",
+            "archive_size": 893288,
+            "unpacked_size": 3364087
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
@@ -791,10 +791,10 @@
         "linux-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/claude-agent-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.112.0.tgz",
-            "integrity": "sha512-T9FrKGd9eDKHNmZE/EfEf01v49UHKeKyGcu91O8sdVc7a9eMEDOGWT/0moWirGHJdBqJ9qPVfqu07IBegJuniA==",
-            "archive_size": 868885,
-            "unpacked_size": 3275066
+            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.113.0.tgz",
+            "integrity": "sha512-fXX8ulGhIg8qHNsy8iQgPV1ZtISwUSqIAmc0/CN2CgiAeMP1wOn0xbzwwOIKLXqoiNoOkvreT2dqvMhwSFKClw==",
+            "archive_size": 893288,
+            "unpacked_size": 3364087
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
@@ -1550,10 +1550,10 @@
         "linux-x64": [
           {
             "path": "node_modules/@agentclientprotocol/claude-agent-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.112.0.tgz",
-            "integrity": "sha512-T9FrKGd9eDKHNmZE/EfEf01v49UHKeKyGcu91O8sdVc7a9eMEDOGWT/0moWirGHJdBqJ9qPVfqu07IBegJuniA==",
-            "archive_size": 868885,
-            "unpacked_size": 3275066
+            "url": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.113.0.tgz",
+            "integrity": "sha512-fXX8ulGhIg8qHNsy8iQgPV1ZtISwUSqIAmc0/CN2CgiAeMP1wOn0xbzwwOIKLXqoiNoOkvreT2dqvMhwSFKClw==",
+            "archive_size": 893288,
+            "unpacked_size": 3364087
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
@@ -2310,15 +2310,15 @@
     },
     "codex": {
       "package": "@agentclientprotocol/codex-acp",
-      "version": "2.12.0",
+      "version": "2.12.1",
       "entry": "node_modules/@agentclientprotocol/codex-acp/dist/index.js",
       "platforms": {
         "darwin-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.12.0.tgz",
-            "integrity": "sha512-UYZwEZoDUdzre4VG/ECGlAVVWlB4tSuy40WiGGiNcA/t3qx0i2Iz9i1BRgzrFHhq2QgEsxH8c7FFEdRwgLUBvg==",
-            "archive_size": 441712,
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.12.1.tgz",
+            "integrity": "sha512-4RGVK+bI2T7kkcfzj4hkmCtX1bVmoXB1nR2IXmzX9KVCXUY6cj9clHkyuGQBuIs2swr9Tf0AdWcY+5fQaYHpZQ==",
+            "archive_size": 441716,
             "unpacked_size": 2316789
           },
           {
@@ -2494,9 +2494,9 @@
         "linux-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.12.0.tgz",
-            "integrity": "sha512-UYZwEZoDUdzre4VG/ECGlAVVWlB4tSuy40WiGGiNcA/t3qx0i2Iz9i1BRgzrFHhq2QgEsxH8c7FFEdRwgLUBvg==",
-            "archive_size": 441712,
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.12.1.tgz",
+            "integrity": "sha512-4RGVK+bI2T7kkcfzj4hkmCtX1bVmoXB1nR2IXmzX9KVCXUY6cj9clHkyuGQBuIs2swr9Tf0AdWcY+5fQaYHpZQ==",
+            "archive_size": 441716,
             "unpacked_size": 2316789
           },
           {
@@ -2672,9 +2672,9 @@
         "linux-x64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.12.0.tgz",
-            "integrity": "sha512-UYZwEZoDUdzre4VG/ECGlAVVWlB4tSuy40WiGGiNcA/t3qx0i2Iz9i1BRgzrFHhq2QgEsxH8c7FFEdRwgLUBvg==",
-            "archive_size": 441712,
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.12.1.tgz",
+            "integrity": "sha512-4RGVK+bI2T7kkcfzj4hkmCtX1bVmoXB1nR2IXmzX9KVCXUY6cj9clHkyuGQBuIs2swr9Tf0AdWcY+5fQaYHpZQ==",
+            "archive_size": 441716,
             "unpacked_size": 2316789
           },
           {
