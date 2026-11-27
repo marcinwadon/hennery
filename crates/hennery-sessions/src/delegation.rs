@@ -97,7 +97,7 @@ impl Store {
         }
         self.authenticated_session_context_in(tx, identity, 0, mutation)
     }
-    fn authenticated_session_context_in(
+    pub(crate) fn authenticated_session_context_in(
         &self,
         tx: &Transaction<'_>,
         identity: &SessionIdentity,

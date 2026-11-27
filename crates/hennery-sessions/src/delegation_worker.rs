@@ -87,6 +87,8 @@ async fn drain_page(state: &AppState, cursors: &mut Cursors) -> anyhow::Result<(
 }
 
 async fn drain_target(state: &AppState, target: &str) -> anyhow::Result<()> {
+    // Revoke queued peer intent before catalog probes or automatic resumes.
+    state.store.prune_peer_prompts(target)?;
     let Some(session) = state.store.find_session(target)? else {
         return Ok(());
     };

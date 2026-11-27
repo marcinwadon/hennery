@@ -1,3 +1,6 @@
+-- Rewind independent peer messages (v50) before historical fixtures.
+DROP TABLE peer_messages;
+ALTER TABLE session_dispatch_queue DROP COLUMN input_origin;
 -- Rewind managed workspaces (v49) before rebuilding a historical fixture.
 DROP TRIGGER workspace_member_admission;
 DROP TRIGGER workspace_remember_member;

@@ -29,6 +29,7 @@ pub struct SessionIdentity {
     pub principal: Principal,
     generation: TokenGeneration,
     delivered_revision: Option<i64>,
+    delivered_peer_revision: Option<i64>,
 }
 impl SessionIdentity {
     pub fn generation(&self) -> &TokenGeneration {
@@ -36,6 +37,9 @@ impl SessionIdentity {
     }
     pub fn delivered_delegation_revision(&self) -> Option<i64> {
         self.delivered_revision
+    }
+    pub fn delivered_peer_revision(&self) -> Option<i64> {
+        self.delivered_peer_revision
     }
 }
 
@@ -101,7 +105,7 @@ fn grant_key(owner: &str, hat: &str, revision: i64) -> String {
 pub fn resolve_in(tx: &Transaction<'_>, owner: &str, generation: &TokenGeneration) -> Result<Option<SessionIdentity>> {
     Ok(tx
         .query_row(
-            "SELECT t.session_id, t.host_id, t.hat_id, t.delivered_delegation_revision
+            "SELECT t.session_id, t.host_id, t.hat_id, t.delivered_delegation_revision, t.delivered_peer_revision
         FROM gw_session_tokens t JOIN hosts h ON h.id = t.host_id AND h.owner_id = ?1
         WHERE t.owner_id = ?1 AND t.token_hash = ?2 AND t.revoked_at IS NULL AND h.revoked_at IS NULL
         AND NOT EXISTS (SELECT 1 FROM purged_hats p WHERE p.owner_id = ?1 AND p.hat_id = t.hat_id)",
@@ -118,6 +122,7 @@ pub fn resolve_in(tx: &Transaction<'_>, owner: &str, generation: &TokenGeneratio
                     },
                     generation: generation.clone(),
                     delivered_revision: r.get(3)?,
+                    delivered_peer_revision: r.get(4)?,
                 })
             },
         )

@@ -13,6 +13,10 @@ pub enum InputOrigin {
         client_id: String,
         operation_id: String,
     },
+    Peer {
+        session_id: String,
+        operation_id: String,
+    },
     PluginContext {
         request_id: String,
     },

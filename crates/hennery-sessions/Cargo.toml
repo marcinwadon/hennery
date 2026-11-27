@@ -39,5 +39,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

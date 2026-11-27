@@ -157,4 +157,11 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE gw_session_tokens ADD COLUMN delivered_delegation_revision INTEGER;
     ",
+    "ALTER TABLE gw_session_tokens ADD COLUMN delivered_peer_revision INTEGER;
+     CREATE TABLE hat_peer_access (
+       owner_id TEXT NOT NULL, hat_id TEXT NOT NULL,
+       access TEXT NOT NULL DEFAULT 'off' CHECK(access IN ('off','read','read_write')),
+       revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),
+       PRIMARY KEY(owner_id,hat_id),
+       FOREIGN KEY(hat_id,owner_id) REFERENCES hats(id,owner_id) ON DELETE CASCADE);",
 ];

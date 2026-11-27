@@ -486,6 +486,7 @@ END;",
     "ALTER TABLE sessions ADD COLUMN hook_sets_applied TEXT NOT NULL DEFAULT '[]';",
     include_str!("external_steering.sql"),
     include_str!("workspaces.sql"),
+    include_str!("peer_messages.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -3471,6 +3472,26 @@ impl Store {
                      WHERE owner_id = ?1 AND host_id = ?2 AND hat_id = ?3 AND cwd = ?4 AND id <> ?5
                          AND lifecycle <> 'deleted')",
             params![self.owner, host_id, hat_id, cwd, session_id],
+        )?;
+        // Peer input uses the independent scheduler's self-source class. Walk
+        // its real sender/recipient ledger before dropping either endpoint.
+        // An operator edit belongs to the recipient; keep that input when only
+        // its original sender is deleted, but scrub the obsolete peer receipt.
+        tx.execute(
+            "DELETE FROM session_dispatch_queue WHERE owner_id = ?1 AND json_extract(input_origin,'$.kind')='peer' AND operation_id IN
+             (SELECT operation_id FROM peer_messages WHERE owner_id = ?1 AND (source_id=?2 OR target_id=?2))",
+            params![self.owner, session_id],
+        )?;
+        tx.execute(
+            "DELETE FROM session_operations WHERE owner_id = ?1 AND operation_id IN
+             (SELECT p.operation_id FROM peer_messages p WHERE p.owner_id = ?1 AND (p.source_id=?2 OR p.target_id=?2)
+              AND (p.target_id=?2 OR NOT EXISTS(SELECT 1 FROM session_dispatch_queue q
+                WHERE q.owner_id = ?1 AND q.operation_id=p.operation_id AND json_extract(q.input_origin,'$.kind')='operator')))",
+            params![self.owner, session_id],
+        )?;
+        tx.execute(
+            "DELETE FROM peer_messages WHERE owner_id = ?1 AND (source_id=?2 OR target_id=?2)",
+            params![self.owner, session_id],
         )?;
         tx.execute(
             "DELETE FROM session_dispatch_queue WHERE owner_id = ?1 AND (source_id=?2 OR target_id=?2)",

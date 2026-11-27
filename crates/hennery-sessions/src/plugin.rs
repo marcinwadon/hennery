@@ -360,6 +360,15 @@ impl Store {
             InputOrigin::Parent { .. } | InputOrigin::ChildReport { .. } => {
                 self.verified_delegated_input_in(tx, origin, target, turn)
             }
+            InputOrigin::Peer { session_id, operation_id } => Ok(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM peer_messages p
+                 JOIN session_operations o ON o.owner_id = ?1 AND o.operation_id=p.operation_id
+                 JOIN sessions s ON s.owner_id = ?1 AND s.id=p.source_id
+                 JOIN sessions t ON t.owner_id = ?1 AND t.id=p.target_id
+                 WHERE p.owner_id = ?1 AND p.source_id=?2 AND p.operation_id=?3 AND p.target_id=?4 AND o.turn_id=?5
+                 AND s.hat_id=p.hat_id AND t.hat_id=p.hat_id AND s.lifecycle<>'deleted' AND t.lifecycle<>'deleted')",
+                params![self.owner_id(),session_id,operation_id,target,turn],|r|r.get(0),
+            )?),
             InputOrigin::PluginContext { .. } => Ok(false),
         }
     }

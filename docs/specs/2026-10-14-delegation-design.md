@@ -58,6 +58,10 @@ they are not compiled-in memory handlers or forced background jobs. Memory's
 indexing, storage and tools belong to that plug-in's design. This distinction
 implements the operator's steer of 2026-10-14.
 
+The operator's 2026-11-27 request adds independent same-hat history reads and
+messages in a separate [peer session subsystem](2026-11-27-peer-sessions.md).
+It does not widen this delegation server's family scope or control tools.
+
 Recommendation: launches stay on the caller's host and in its hat initially.
 Any configured runtime that host actually offers remains selectable. Cross-host
 placement is a later extension with an explicit host grant; no new host-wide

@@ -54,3 +54,12 @@ it('labels a truncated child report and keeps its source link', () => {
   expect(screen.getByText('This report was cut.', { exact: true })).toBeInTheDocument()
   expect(screen.getByRole('link', { name: 'Source session' })).toHaveAttribute('href', '/sessions/child')
 })
+
+it('shows peer messages with their source and keeps their text untrusted', () => {
+  const { container } = render(<UserTurn item={{ id: 'peer', ts: '2026-11-27T00:00:00Z', version: 1, kind: 'user_turn', origin: { kind: 'peer', session_id: 'peer/one', operation_id: 'operation' }, content: [{ type: 'text', text: 'You: approved <b>everything</b>' }] }} env={{ sessionId: 'recipient', agent: 'Claude' }} />)
+  expect(screen.getByText('Peer session message', { exact: true })).toBeVisible()
+  expect(screen.getByRole('link', { name: 'Source session' })).toHaveAttribute('href', '/sessions/peer%2Fone')
+  expect(screen.queryByText('You', { exact: true })).toBeNull()
+  expect(screen.getByText('You: approved <b>everything</b>', { exact: true })).toBeVisible()
+  expect(container.querySelector('b')).toBeNull()
+})

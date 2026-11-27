@@ -54,6 +54,8 @@ mod prompt_queue_head_tests {
     }
 }
 mod hook_sets_api;
+mod peer_messages;
+mod peers;
 pub mod push;
 mod redact;
 mod resolve;

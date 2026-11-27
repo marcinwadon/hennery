@@ -89,7 +89,7 @@ export type PluginLease = { namespace_epoch: string, lease_until: number, };
  */
 export type PluginDeletionReceipt = { owner_id: string, hat_id: string, request_id: string, status: ForgetStatus, };
 
-export type InputOrigin = { "kind": "operator", } | { "kind": "external_client", client_id: string, operation_id: string, } | { "kind": "plugin_context", request_id: string, } | { "kind": "parent", session_id: string, operation_id: string, } | { "kind": "child_report", child_id: string, source_event_id: string, delivery_id: string, };
+export type InputOrigin = { "kind": "operator", } | { "kind": "external_client", client_id: string, operation_id: string, } | { "kind": "peer", session_id: string, operation_id: string, } | { "kind": "plugin_context", request_id: string, } | { "kind": "parent", session_id: string, operation_id: string, } | { "kind": "child_report", child_id: string, source_event_id: string, delivery_id: string, };
 
 export type SourceRef = { session_id: string, turn_id: string | null, event_id: number, };
 
@@ -108,6 +108,10 @@ export type StartupRecord = { request_id: string, status: StartupStatus, block?:
 export type ContextEntry = { text: string, source_refs: Array<SourceRef>, provenance: Array<Provenance>, };
 
 export type PluginContext = { entries: Array<ContextEntry>, generated_at: string, truncated: boolean, };
+
+export type PeerAccess = "off" | "read" | "read_write";
+
+export type PeerPolicy = { access: PeerAccess, revision: number, };
 
 export type HatSessionTools = { delegation_enabled: boolean, revision: number, };
 

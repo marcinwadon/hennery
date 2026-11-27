@@ -3016,7 +3016,7 @@ fn rows_of(
         let filter = match table.as_str() {
             "sessions" => format!("id = '{id}'"),
             "session_families" => format!("child_id = '{id}' OR parent_id = '{id}' OR root_id = '{id}'"),
-            "session_dispatch_queue" => format!("source_id = '{id}' OR target_id = '{id}'"),
+            "session_dispatch_queue" | "peer_messages" => format!("source_id = '{id}' OR target_id = '{id}'"),
             "session_operations" => format!("caller_id = '{id}' OR child_id = '{id}'"),
             "delegation_start_budgets" => format!("caller_id = '{id}'"),
             "delegation_budgets" => format!("root_id = '{id}'"),
@@ -3147,6 +3147,14 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
          INSERT INTO session_dispatch_queue(owner_id,operation_id,source_id,target_id,accepted_revision,payload,required_config)
              SELECT owner_id, 'delete-operation', 's1', 'family-child', 1, 'queued private brief', '{}'
              FROM sessions WHERE id = 's1';
+         INSERT INTO session_operations(owner_id,caller_id,operation_key,operation_id,digest,tool,child_id,state)
+             SELECT owner_id,'family-child','peer-delete','peer-delete','digest','operator_prompt','family-child','queued'
+             FROM sessions WHERE id='s1';
+         INSERT INTO session_dispatch_queue(owner_id,operation_id,source_id,target_id,accepted_revision,payload,required_config,origin,input_origin)
+             SELECT owner_id,'peer-delete','family-child','family-child',0,'queued peer text','{}','operator',
+                 json_object('kind','peer','session_id','s1','operation_id','peer-delete') FROM sessions WHERE id='s1';
+         INSERT INTO peer_messages(owner_id,source_id,request_key,target_id,hat_id,revision,epoch,digest,operation_id)
+             SELECT owner_id,'s1','peer-delete','family-child',hat_id,1,0,'digest','peer-delete' FROM sessions WHERE id='s1';
          INSERT INTO session_attach_evidence(owner_id,session_id,attach_generation,requested_config)
              SELECT owner_id, 's1', 1, '{}' FROM sessions WHERE id = 's1';
          INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at)
@@ -3217,6 +3225,7 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
         "session_families",
         "session_operations",
         "session_dispatch_queue",
+        "peer_messages",
         "session_attach_evidence",
         "session_workspace_members",
         "external_client_sessions",

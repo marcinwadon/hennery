@@ -703,6 +703,12 @@ the operator's view. The single operator sees all hats; the "All" view stays.
   hat), stored only as hashes and revoked when the session parks, closes or
   loses its adapter, or its host is revoked. The gateway derives scope from the
   token at request time, never from anything the client claims.
+- Independent sessions may discover and read same-owner, same-hat collector
+  history through the opt-in `hennery_peers` server. A separate per-hat policy
+  (`off`, `read`, `read_write`, default `off`) controls this access and peer
+  messages. Policy revisions bind to delivered token generations. This grants
+  no session control, permission answers or parent-child authority; see
+  [peer sessions](2026-11-27-peer-sessions.md).
 
 Side channels that must respect the boundary:
 

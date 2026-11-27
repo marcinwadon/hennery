@@ -33,8 +33,8 @@ export default function UserTurn({ item, env }: { item: ItemOf<'user_turn'>; env
   const [open, setOpen] = useState(false)
   const origin = item.origin
   const familyMessage = origin?.kind === 'parent' || origin?.kind === 'child_report'
-  const source = origin?.kind === 'parent' ? origin.session_id : origin?.kind === 'child_report' ? origin.child_id : undefined
-  const label = origin?.kind === 'external_client' ? 'External MCP client' : origin?.kind === 'parent' ? 'Parent instruction' : origin?.kind === 'child_report' ? 'Child report' : origin?.kind === 'plugin_context' ? 'Plug-in context' : USER_LABEL
+  const source = origin?.kind === 'parent' || origin?.kind === 'peer' ? origin.session_id : origin?.kind === 'child_report' ? origin.child_id : undefined
+  const label = origin?.kind === 'external_client' ? 'External MCP client' : origin?.kind === 'peer' ? 'Peer session message' : origin?.kind === 'parent' ? 'Parent instruction' : origin?.kind === 'child_report' ? 'Child report' : origin?.kind === 'plugin_context' ? 'Plug-in context' : USER_LABEL
   return (
     <Speaker who={source ? 'agent' : 'user'} label={label} ts={item.ts}>
       {source && <Link className="item-note" to={sessionPath(source)}>Source session</Link>}

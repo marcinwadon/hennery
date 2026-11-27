@@ -5,6 +5,7 @@ import AccountSettings, { AccountLogins } from '../components/AccountSettings'
 import CollectorSettings from '../components/CollectorSettings'
 import NotificationSettings from '../components/NotificationSettings'
 import DelegationSettings from '../components/DelegationSettings'
+import PeerAccessSettings from '../components/PeerAccessSettings'
 import DelegationLimitsSettings from '../components/DelegationLimitsSettings'
 import IdleParkingSettings from '../components/IdleParkingSettings'
 import { DefaultsSettings } from '../components/HatDefaultsSummary'
@@ -26,6 +27,7 @@ export default function Settings({ push, sessions }: { push: boolean; sessions: 
     <CollectorSettings push={push} sessions={sessions} hats={hats.data} />
     {hats.error && <p role="alert">Unable to load hats. <button className="btn btn-ghost" onClick={hats.reload}>Retry hats</button></p>}
     {sessions && <DelegationSettings hats={hats.data} />}
+    {sessions && <PeerAccessSettings hats={hats.data} />}
     {sessions && <DelegationLimitsSettings />}
     {sessions && <IdleParkingSettings />}
     {sessions && <DefaultsSettings hats={hats.data} />}

@@ -275,6 +275,13 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
         "invalid_arguments",
         "schema_changed",
         "invalid_cursor",
+        "resync_required",
+        "response_too_large",
+        "peer_message_budget",
+        "peer_access_changed",
+        "queue_unavailable",
+        "invalid_request_key",
+        "request_key_conflict",
     ];
     let message = error.to_string();
     CODES

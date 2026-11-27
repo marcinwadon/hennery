@@ -640,8 +640,8 @@ fn the_store_and_the_kernel_agree_on_the_owner_whichever_opens_first() {
         )
         .unwrap();
     // Connections, session tokens, stdio servers, OAuth clients, then D1's
-    // generation-bound delivered delegation revision.
-    assert_eq!(version, 5);
+    // generation-bound delivered delegation revision, then independent peers.
+    assert_eq!(version, 6);
     let connection = rusqlite::Connection::open(&last).unwrap();
     let columns: Vec<String> = connection
         .prepare("PRAGMA table_info(gw_session_tokens)")
@@ -651,6 +651,7 @@ fn the_store_and_the_kernel_agree_on_the_owner_whichever_opens_first() {
         .map(Result::unwrap)
         .collect();
     assert!(columns.iter().any(|column| column == "delivered_delegation_revision"));
+    assert!(columns.iter().any(|column| column == "delivered_peer_revision"));
 }
 
 /// Plan 8a decision 19 (lane L11): a connection's `Debug` shows only its

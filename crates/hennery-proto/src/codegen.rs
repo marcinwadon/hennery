@@ -2,7 +2,7 @@
 //! with `--check`, fails if the checked-in copies differ.
 
 use crate::plugin_management;
-use crate::{delegation, frames, hooks, plugin, rest};
+use crate::{delegation, frames, hooks, peers, plugin, rest};
 use schemars::generate::SchemaSettings;
 use ts_rs::{Config, TS};
 
@@ -54,6 +54,8 @@ pub fn render_schema() -> String {
         plugin::StartupContext,
         plugin::StartupStatus,
         plugin::StartupRecord,
+        peers::PeerAccess,
+        peers::PeerPolicy,
         delegation::HatSessionTools,
         delegation::SetSessionTools,
         delegation::SessionFamily,
@@ -298,6 +300,8 @@ pub fn render_ts() -> String {
         plugin::StartupRecord,
         plugin::ContextEntry,
         plugin::PluginContext,
+        peers::PeerAccess,
+        peers::PeerPolicy,
         delegation::HatSessionTools,
         delegation::SetSessionTools,
         delegation::SessionFamily,

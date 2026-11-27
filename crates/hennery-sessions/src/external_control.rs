@@ -219,7 +219,7 @@ fn wait_default() -> u64 {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Read {
+pub(crate) struct Read {
     session_id: String,
     item_id: Option<String>,
     offset: Option<usize>,
@@ -486,6 +486,17 @@ fn cut_value(value: &mut Value, budget: &mut usize, truncated: &mut bool) {
     }
 }
 fn read(state: &AppState, identity: &ExternalIdentity, q: Read) -> Result<Value> {
+    read_canonical(state, q, |session| {
+        state
+            .store
+            .external_authorized_read(identity, session, true)
+            .map(|_| ())
+    })
+}
+
+/// Bounded canonical view transport; the caller supplies its own authorization,
+/// rechecked before reading and immediately before returning any content.
+pub(crate) fn read_canonical(state: &AppState, q: Read, authorize: impl Fn(&str) -> Result<()>) -> Result<Value> {
     ensure!(
         short(&q.session_id) && q.before_turn.as_deref().is_none_or(short) && (1..=10).contains(&q.max_items),
         "invalid_arguments"
@@ -496,7 +507,7 @@ fn read(state: &AppState, identity: &ExternalIdentity, q: Read) -> Result<Value>
         "invalid_arguments"
     );
     ensure!(q.offset.is_none() || q.item_id.is_some(), "invalid_arguments");
-    state.store.external_authorized_read(identity, &q.session_id, true)?;
+    authorize(&q.session_id)?;
     let cursor: Option<ReadCursor> = q
         .cursor
         .as_deref()
@@ -544,7 +555,7 @@ fn read(state: &AppState, identity: &ExternalIdentity, q: Read) -> Result<Value>
         while !raw.is_char_boundary(end) {
             end -= 1;
         }
-        state.store.external_authorized_read(identity, &q.session_id, true)?;
+        authorize(&q.session_id)?;
         return Ok(
             json!({"item_id":item.id,"version":item.version,"turn_id":item.turn_id,"epoch":page.epoch,"revision":page.revision,"item_json":&raw[offset..end],"offset":offset,"next_offset":if end<raw.len(){Some(end)}else{None}}),
         );
@@ -575,7 +586,7 @@ fn read(state: &AppState, identity: &ExternalIdentity, q: Read) -> Result<Value>
     } else {
         None
     };
-    state.store.external_authorized_read(identity, &q.session_id, true)?;
+    authorize(&q.session_id)?;
     Ok(
         json!({"items":items,"revision":page.revision,"epoch":page.epoch,"next_cursor":next,"older":page.older||start>0,"before_turn":page.items.first().and_then(|i|i.turn_id.as_deref()),"content_truncated":truncated}),
     )

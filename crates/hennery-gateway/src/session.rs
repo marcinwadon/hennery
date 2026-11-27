@@ -233,7 +233,12 @@ impl SessionMcp for GatewayMcp {
             None
         };
         let mut servers = Vec::with_capacity(slugs.len() + usize::from(builtin.is_some()));
-        if slugs.is_empty() && builtin.is_none() && !files {
+        let peers = if self.builtin {
+            crate::peers::setting_in(tx, owner, session.hat_id)?.filter(|p| p.access.enabled())
+        } else {
+            None
+        };
+        if slugs.is_empty() && builtin.is_none() && !files && peers.is_none() {
             // No connection to reach: no token at all.
             tokens::revoke_in(tx, owner, session.session_id, now)?;
         } else {
@@ -252,6 +257,15 @@ impl SessionMcp for GatewayMcp {
             )?;
             if let Some(builtin) = builtin {
                 servers.push(builtin.server(public.origin(), token.expose()));
+            }
+            if let Some(peers) = peers {
+                tx.execute("UPDATE gw_session_tokens SET delivered_peer_revision=?3 WHERE owner_id = ?1 AND session_id=?2 AND token_hash=?4",
+                    params![owner,session.session_id,peers.revision,crate::tokens::token_hash(token.expose())])?;
+                servers.push(McpServer::Http {
+                    name: "hennery_peers".into(),
+                    url: format!("{}/mcp/builtin/peers", public.origin()),
+                    headers: vec![NameValue::new("Authorization", format!("Bearer {}", token.expose()))],
+                });
             }
             if files {
                 servers.push(McpServer::Http {
