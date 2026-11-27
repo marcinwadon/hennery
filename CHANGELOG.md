@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.0
+
 - Add independent same-hat session collaboration through native MCP: discover
   sessions across hosts, read retained canonical histories and send attributed
   messages through the durable queue and steering transport. A separate per-hat
